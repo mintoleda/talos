@@ -1,0 +1,21 @@
+plans/
+agent/settings.json
+TODOS.md
+/talos
+/harness
+# Editor/OS files
+.DS_Store
+*.swp
+*.swo
+*~
+# Go build artifacts
+*.exe
+*.test
+*.out
+# GoLand / IntelliJ
+.idea/
+# VSCode
+.vscode/
+# Session files
+.talos/sessions/
+.talos/swarm/
