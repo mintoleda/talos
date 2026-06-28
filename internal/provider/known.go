@@ -1,0 +1,31 @@
+package provider
+
+// Known describes a provider talos knows how to talk to.
+type Known struct {
+	Name    string // canonical name used in config and picker
+	BaseURL string // base URL without /v1 suffix
+	EnvVar  string // primary environment variable for the API key
+	Label   string // short display label for the login dialog
+}
+
+// All is the list of providers talos supports out of the box.
+// Anthropic is included for completeness but its /v1/models endpoint is not
+// standard; model listing falls back to a hardcoded list.
+var All = []Known{
+	{Name: "opencode-go", BaseURL: "https://opencode.ai/zen/go", EnvVar: "OPENCODE_API_KEY", Label: "opencode.ai/go"},
+	{Name: "opencode-zen", BaseURL: "https://opencode.ai/zen", EnvVar: "OPENCODE_API_KEY", Label: "opencode.ai/zen"},
+	{Name: "deepseek", BaseURL: "https://api.deepseek.com", EnvVar: "DEEPSEEK_API_KEY", Label: "deepseek.com"},
+	{Name: "openrouter", BaseURL: "https://openrouter.ai/api", EnvVar: "OPENROUTER_API_KEY", Label: "openrouter.ai"},
+	{Name: "openai", BaseURL: "https://api.openai.com", EnvVar: "OPENAI_API_KEY", Label: "openai.com"},
+	{Name: "anthropic", BaseURL: "https://api.anthropic.com", EnvVar: "ANTHROPIC_API_KEY", Label: "anthropic.com"},
+}
+
+// ByName returns the Known entry for a provider name, or zero value if not found.
+func ByName(name string) (Known, bool) {
+	for _, k := range All {
+		if k.Name == name {
+			return k, true
+		}
+	}
+	return Known{}, false
+}
