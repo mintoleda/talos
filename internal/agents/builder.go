@@ -157,29 +157,34 @@ func (b *Builder) build(def Definition, depth int) builtLoop {
 func (b *Builder) providerFor(def Definition, thinking string) provider.Provider {
 	provName := b.cfg.Provider
 	apiKey := b.cfg.APIKey
-	baseURL := b.cfg.BaseURL
 
 	if def.Provider != "" && def.Provider != b.cfg.Provider {
 		provName = def.Provider
 		apiKey = config.ReadAuthKey(b.cfg.BaseDir, provName)
-		baseURL = "" // don't inherit parent's base URL for a different provider
 	}
 
 	if provName == "anthropic" {
-		base := baseURL
+		base := b.cfg.BaseURL
+		// Don't inherit the caller's generic default for a known provider.
 		if base == "" || base == "https://api.deepseek.com" {
-			base = "https://api.anthropic.com"
+			if kp, ok := provider.ByName(provName); ok {
+				base = kp.BaseURL
+			}
 		}
 		return anthropic.New(base, apiKey, anthropic.Config{
 			MaxTokens:     8192,
 			ThinkingLevel: thinking,
 		})
 	}
-	base := baseURL
-	if base == "" {
-		if kp, ok := provider.ByName(provName); ok {
-			base = kp.BaseURL
-		}
+	// OpenAI-compatible: check known providers first, only fall back to
+	// b.cfg.BaseURL for custom/unknown providers — the default
+	// "https://api.deepseek.com" should not override a known provider's
+	// endpoint.
+	base := ""
+	if kp, ok := provider.ByName(provName); ok {
+		base = kp.BaseURL
+	} else {
+		base = b.cfg.BaseURL
 	}
 	return openai.New(base, apiKey)
 }
