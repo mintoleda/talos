@@ -55,7 +55,8 @@ type ChatModel struct {
 
 func NewChat() ChatModel {
 	vp := viewport.New(0, 0)
-	vp.KeyMap = viewport.KeyMap{} // disable built-in key bindings; we manage nav ourselves
+	vp.KeyMap = viewport.KeyMap{}     // disable built-in key bindings; we manage nav ourselves
+	vp.MouseWheelEnabled = false      // we handle mouse scroll ourselves via model.go
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	return ChatModel{
@@ -225,6 +226,15 @@ func (c ChatModel) AppendDelta(text string) ChatModel {
 	return c
 }
 
+func (c ChatModel) AppendBatchHeading(_ int) ChatModel {
+	return c.append(segment{
+		style:  styles.BatchStyle,
+		text:   "─ batch ─",
+		before: "\n",
+		after:  "\n",
+	})
+}
+
 // AppendToolUse adds a completed tool-call entry inline in the chat transcript.
 // The call descriptor (path/command/query) is derived from the arguments and
 // rendered lazily so it reflows on resize; full output lives in the tools pane.
@@ -348,26 +358,14 @@ func (c ChatModel) ScrollBottom() ChatModel {
 }
 
 func (c ChatModel) View() string {
-	if c.dirty {
-		content := c.body()
-		if c.autoscroll {
-			c.vp.SetContent(content)
-			c.vp.GotoBottom()
-		} else {
-			// User has scrolled up — preserve their scroll position.
-			// Use SetYOffset (which clamps) rather than direct YOffset
-			// assignment, because SetContent may change the line count
-			// (e.g. resize, or streaming text re-rendering at a different
-			// height). An unclamped YOffset produces invalid slice bounds
-			// in visibleLines(), causing visual corruption.
-			savedOffset := c.vp.YOffset
-			c.vp.SetContent(content)
-			c.vp.SetYOffset(savedOffset)
-		}
-		c.dirty = false
-	} else if c.autoscroll {
-		// No content change, but pin to bottom (e.g. after user hit ScrollBottom).
+	content := c.body()
+	if c.autoscroll {
+		c.vp.SetContent(content)
 		c.vp.GotoBottom()
+	} else {
+		savedOffset := c.vp.YOffset
+		c.vp.SetContent(content)
+		c.vp.SetYOffset(savedOffset)
 	}
 	return c.vp.View()
 }

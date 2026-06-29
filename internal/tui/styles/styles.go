@@ -78,6 +78,8 @@ var (
 			Foreground(lipgloss.Color("82")).
 			Bold(true)
 
+	BatchStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+
 	// Pane borders
 	PaneStyle = lipgloss.NewStyle().
 			Padding(0, 1)

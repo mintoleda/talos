@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -108,6 +110,20 @@ func (m TabsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case spinner.TickMsg:
+		// Broadcast spinner ticks to every tab so each tab's spinner Cmd chain
+		// stays alive regardless of which tab is active. Each spinner only
+		// advances when the TickMsg ID matches its own, so inactive tabs are no-ops.
+		var cmds []tea.Cmd
+		for i := range m.tabs {
+			updated, cmd := m.tabs[i].model.Update(msg)
+			m.tabs[i].model = updated.(Model)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+		return m, tea.Batch(cmds...)
+
 	case TabEventMsg:
 		for i := range m.tabs {
 			if m.tabs[i].id == msg.TabID {
@@ -168,15 +184,18 @@ func (m TabsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				updated, _ := m.tabs[0].model.Update(sub)
 				m.tabs[0].model = updated.(Model)
 			}
-			return m, nil
+			// Restart cursor blink for the tab that's now active.
+			return m, textinput.Blink
 		case "alt+l":
 			if len(m.tabs) > 1 {
 				m.active = (m.active + 1) % len(m.tabs)
+				return m, textinput.Blink
 			}
 			return m, nil
 		case "alt+h":
 			if len(m.tabs) > 1 {
 				m.active = (m.active - 1 + len(m.tabs)) % len(m.tabs)
+				return m, textinput.Blink
 			}
 			return m, nil
 		case "alt+1", "alt+2", "alt+3", "alt+4", "alt+5",
@@ -185,6 +204,7 @@ func (m TabsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			idx := digit - 1
 			if idx >= 0 && idx < len(m.tabs) {
 				m.active = idx
+				return m, textinput.Blink
 			}
 			return m, nil
 		}

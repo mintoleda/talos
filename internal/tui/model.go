@@ -466,7 +466,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case focusSubagents:
 					m.subagents = m.subagents.CursorDown()
 				default:
-					m.chat = m.chat.ScrollDown(3)
+					m.chat = m.chat.ScrollDown(1)
 				}
 			case "k":
 				switch m.focusPane {
@@ -475,7 +475,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case focusSubagents:
 					m.subagents = m.subagents.CursorUp()
 				default:
-					m.chat = m.chat.ScrollUp(3)
+					m.chat = m.chat.ScrollUp(1)
 				}
 			case "enter":
 				switch m.focusPane {
@@ -672,7 +672,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case m.focusPane == focusSubagents && m.subagents.Count() > 0:
 					m.subagents = m.subagents.CursorUp()
 				default:
-					m.chat = m.chat.ScrollUp(3)
+					m.chat = m.chat.ScrollUp(1)
 				}
 				return m, nil
 			}
@@ -702,7 +702,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case m.focusPane == focusSubagents && m.subagents.Count() > 0:
 					m.subagents = m.subagents.CursorDown()
 				default:
-					m.chat = m.chat.ScrollDown(3)
+					m.chat = m.chat.ScrollDown(1)
 				}
 				return m, nil
 			}
@@ -761,9 +761,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			if up {
-				m.chat = m.chat.ScrollUp(3)
+				m.chat = m.chat.ScrollUp(1)
 			} else {
-				m.chat = m.chat.ScrollDown(3)
+				m.chat = m.chat.ScrollDown(1)
 			}
 		}
 		return m, nil
@@ -1172,6 +1172,9 @@ func (m Model) handleEvent(e protocol.Event) Model {
 	case protocol.TextDelta:
 		m.chat = m.chat.AppendDelta(ev.Text)
 		m.streamTextLen += len(ev.Text)
+	case protocol.BatchStarted:
+		m.chat = m.chat.FlushStreaming()
+		m.chat = m.chat.AppendBatchHeading(ev.Num)
 	case protocol.ToolStarted:
 		m.chat = m.chat.FlushStreaming()
 		m.chat = m.chat.AddActiveTool(ev.ID, ev.Name)
@@ -1197,6 +1200,7 @@ func (m Model) handleEvent(e protocol.Event) Model {
 			delete(m.toolNames, ev.ID)
 			delete(m.toolArgs, ev.ID)
 		}
+	case protocol.BatchFinished:
 	case protocol.Notice:
 		m.chat = m.chat.AppendNotice(ev.Level, ev.Text)
 	case protocol.TurnEnded:
