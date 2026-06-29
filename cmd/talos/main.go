@@ -33,7 +33,6 @@ import (
 )
 
 
-// Flags holds the parsed CLI flags. Zero values are the defaults.
 type Flags struct {
 	Print        string
 	Continue     bool
@@ -86,7 +85,6 @@ func run() error {
 
 	if len(flag.Args()) > 0 && flag.Args()[0] == "server" {
 		if len(flag.Args()) == 1 || (len(flag.Args()) >= 2 && flag.Args()[1] == "start") {
-			// talos server [start] — start a new server daemon.
 			serverMode = true
 		} else if len(flag.Args()) >= 2 && flag.Args()[1] == "help" {
 			return fmt.Errorf(`talos server commands:
@@ -187,22 +185,21 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
 	}
+	if n := tx.RepairCount(); n > 0 {
+		fmt.Fprintf(os.Stderr, "[notice] repaired session: removed %d orphaned tool call(s)\n", n)
+	}
 	defer tx.Close()
 
 	repoRoot := findRepoRoot(cwd)
 
-	// Load project-level system prompt from SYSTEM_PROMPT.md in the repo root.
-	// If present, it takes precedence over the config file's system_prompt.
 	if sp, err := config.LoadProjectSystemPrompt(repoRoot); err != nil {
 		fmt.Fprintf(os.Stderr, "[warning] reading SYSTEM_PROMPT.md: %v\n", err)
 	} else if sp != "" {
 		cfg.SystemPrompt = sp
 	}
 
-	// Scan skills directories (global + project-local) and append a compact
-	// listing to the system prompt so the LLM knows what's available.
-	skillsDir := filepath.Join(cfg.BaseDir, "skills")               // ~/.talos/skills/
-	projectSkillsDir := filepath.Join(repoRoot, ".talos", "skills") // .talos/skills/
+	skillsDir := filepath.Join(cfg.BaseDir, "skills")
+	projectSkillsDir := filepath.Join(repoRoot, ".talos", "skills")
 	allSkills, err := skills.Scan([]skills.Dir{
 		{Path: skillsDir, Label: "global"},
 		{Path: projectSkillsDir, Label: "project"},
@@ -214,7 +211,6 @@ func run() error {
 		cfg.SystemPrompt += listing
 	}
 
-	// Inject persistent memory into the system prompt so it's available from turn one.
 	if mem, err := memory.Load(cfg.BaseDir); err != nil {
 		fmt.Fprintf(os.Stderr, "[warning] loading memory: %v\n", err)
 	} else if mem != "" {
@@ -223,9 +219,6 @@ func run() error {
 
 	cp := safety.NewCheckpointer(repoRoot)
 
-	// Restore the read history from disk if this is a resumed session, then
-	// re-enable persistence so every fresh read keeps the on-disk set current.
-	// A missing file is fine; that just means no reads have been recorded yet.
 	reads, readErr := tools.LoadReadSet(sess.Path + ".reads.json")
 	if readErr != nil {
 		fmt.Fprintf(os.Stderr, "[warning] loading read set: %v\n", readErr)
@@ -249,9 +242,6 @@ func run() error {
 			filepath.Join(repoRoot, ".talos", "skills"),
 		}))
 
-		// Subagents: load markdown-defined agent loadouts (builtin + user dirs)
-		// and give the primary agent a spawn tool for every loaded definition.
-		// The listing is appended to the system prompt so the model knows to delegate.
 		agentDirs := []agents.Dir{
 			{Path: filepath.Join(cfg.BaseDir, "subagents"), Label: "global"},
 			{Path: filepath.Join(repoRoot, ".talos", "subagents"), Label: "project"},
@@ -338,12 +328,10 @@ func run() error {
 		return runServer(context.Background(), cfg, a, lp, cp, sess.ID)
 
 	case f.Print != "":
-		// One-shot mode: run a single prompt and exit.
 		_, _ = cp.Snapshot("before-run")
 		return lp.RunTurn(context.Background(), protocol.TextBlocks(f.Print), renderTo(os.Stdout, f.DebugCache))
 
 	default:
-		// Full-screen TUI with multi-tab support (ctrl+n to open a new agent tab).
 		tuiCtx := context.Background()
 		inCh, steerQueue, intCh, cmpCh, evCh := tui.StartEngine(tuiCtx, lp, cp)
 

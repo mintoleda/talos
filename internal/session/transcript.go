@@ -36,13 +36,14 @@ type StatsRecord struct {
 }
 
 type Transcript struct {
-	mu        sync.Mutex
-	f         *os.File
-	w         *bufio.Writer
-	frozen    []protocol.FrozenMessage
-	summaries []protocol.FrozenMessage
-	path      string
-	lastStats StatsRecord // most recent stats found during Load
+	mu          sync.Mutex
+	f           *os.File
+	w           *bufio.Writer
+	frozen      []protocol.FrozenMessage
+	summaries   []protocol.FrozenMessage
+	path        string
+	lastStats   StatsRecord // most recent stats found during Load
+	repairCount int         // number of orphaned tool-call groups removed during Load
 }
 
 // Create returns a new Transcript for the given path. The file is not created
@@ -128,6 +129,14 @@ func Load(path string) (*Transcript, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
+
+	// Repair: remove orphaned assistant tool_calls that don't have matching
+	// tool result messages. DeepSeek (and other strict providers) reject
+	// requests where an assistant message with tool_calls isn't immediately
+	// followed by tool messages responding to each tool_call_id. This happens
+	// when a session is interrupted mid-tool-execution.
+	t.repairCount = t.repair()
+
 	return t, nil
 }
 
@@ -228,6 +237,12 @@ func (t *Transcript) WriteStats(sr StatsRecord) error {
 	return nil
 }
 
+// RepairCount returns the number of orphaned assistant tool-call groups that
+// were removed during Load. Returns 0 if repair was not needed.
+func (t *Transcript) RepairCount() int {
+	return t.repairCount
+}
+
 // RestoreStats returns the last stats snapshot found when the transcript was
 // loaded (zero value if none).
 func (t *Transcript) RestoreStats() StatsRecord {
@@ -261,6 +276,77 @@ func (t *Transcript) PrependSummary(summary string) error {
 	return nil
 }
 
+// repair removes orphaned assistant tool_calls from the in-memory frozen
+// transcript. Some providers (DeepSeek) strictly require that every assistant
+// message with tool_calls is immediately followed by tool messages responding
+// to each tool_call_id. When a session is interrupted mid-tool-execution,
+// orphaned tool_calls break this invariant. This method scans the transcript
+// and removes any assistant+tool group that is incomplete, keeping the
+// transcript valid for all providers.
+//
+// Strategy: walk the transcript. When we encounter an assistant message with
+// tool_calls, collect its tool_call_ids. Then consume subsequent tool messages
+// until the next user/assistant message or end-of-transcript. If all IDs are
+// matched, keep the group. If not, remove the assistant and all partial tool
+// messages that followed it.
+//
+// Returns the number of orphaned assistant messages that were removed.
+func (t *Transcript) repair() int {
+	if len(t.frozen) == 0 {
+		return 0
+	}
+
+	msgs := t.frozen
+	var cleaned []protocol.FrozenMessage
+	removed := 0
+
+	i := 0
+	for i < len(msgs) {
+		m := msgs[i]
+		if m.Msg.Role != protocol.RoleAssistant || len(m.Msg.ToolUses()) == 0 {
+			cleaned = append(cleaned, m)
+			i++
+			continue
+		}
+
+		// Assistant message with tool_calls — collect expected IDs.
+		expected := make(map[string]bool)
+		for _, tu := range m.Msg.ToolUses() {
+			expected[tu.ID] = true
+		}
+
+		// Consume subsequent tool messages.
+		groupStart := i
+		i++ // skip the assistant message
+		matched := make(map[string]bool)
+		for i < len(msgs) && msgs[i].Msg.Role == protocol.RoleTool {
+			for _, b := range msgs[i].Msg.Content {
+				if b.Type == protocol.BlockToolResult && b.ToolResult != nil {
+					if expected[b.ToolResult.ToolUseID] {
+						matched[b.ToolResult.ToolUseID] = true
+					}
+				}
+			}
+			i++
+		}
+
+		// Check if all expected IDs were matched.
+		allMatched := len(matched) == len(expected)
+		if allMatched {
+			// Keep the whole group: assistant + tool messages.
+			cleaned = append(cleaned, msgs[groupStart:i]...)
+		} else {
+			// Orphaned — drop the assistant and all partial tool
+			// messages. The tool messages are invalid without their
+			// assistant context.
+			removed++
+		}
+	}
+
+	t.frozen = cleaned
+	return removed
+}
+
 func (t *Transcript) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -280,7 +366,6 @@ func (t *Transcript) Close() error {
 		// but had zero messages (unlikely, but safe).
 		if len(t.frozen) == 0 && len(t.summaries) == 0 {
 			_ = os.Remove(path)
-			// Also remove the parent directory if it becomes empty.
 			if parent := filepath.Dir(path); parent != "." {
 				entries, _ := os.ReadDir(parent)
 				if len(entries) == 0 {
