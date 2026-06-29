@@ -24,7 +24,6 @@ func MarshalDeterministic(v any) ([]byte, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
-// MustMarshalDeterministic is like MarshalDeterministic but panics on error.
 func MustMarshalDeterministic(v any) []byte {
 	b, err := MarshalDeterministic(v)
 	if err != nil {

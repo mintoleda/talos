@@ -16,8 +16,6 @@ import (
 // to broadcast additional events (e.g. ModelChanged).
 type SlashHandler func(cmd string, emit func(protocol.Event)) string
 
-// LoopEngine wraps a loop.Loop and safety.Checkpointer into the Engine
-// interface used by the server transport.
 type LoopEngine struct {
 	lp      *loop.Loop
 	cp      *safety.Checkpointer
@@ -35,7 +33,6 @@ type LoopEngine struct {
 	slash SlashHandler
 }
 
-// NewLoopEngine starts the engine. The sessionID is used in the hello message.
 func NewLoopEngine(parentCtx context.Context, lp *loop.Loop, cp *safety.Checkpointer, sessionID string) *LoopEngine {
 	ctx, cancel := context.WithCancel(parentCtx)
 	e := &LoopEngine{

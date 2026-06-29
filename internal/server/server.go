@@ -19,18 +19,14 @@ import (
 	"github.com/mintoleda/talos/internal/version"
 )
 
-// SocketPath returns the Unix socket path for a session.
 func SocketPath(baseDir, sessionID string) string {
 	return filepath.Join(baseDir, "server", sessionID+".sock")
 }
 
-// PidFile returns the pid file path for a session.
 func PidFile(baseDir, sessionID string) string {
 	return filepath.Join(baseDir, "server", sessionID+".pid")
 }
 
-// Engine is the server-side abstraction that runs the core and exposes
-// Subscribe/Submit/Interrupt/Approve methods to clients.
 type Engine interface {
 	SessionID() string
 	Subscribe(fn func(protocol.Event))
@@ -39,7 +35,6 @@ type Engine interface {
 	Approve(approved bool, plan []byte)
 }
 
-// Server holds the long-running socket transport state.
 type Server struct {
 	engine      Engine
 	sockPath    string
@@ -159,7 +154,6 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	// Subscribe this client to events.
 	events := make(chan protocol.Event, 64)
 	defer close(events)
 
@@ -179,7 +173,6 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		s.mu.Unlock()
 	}()
 
-	// Writer goroutine.
 	go func() {
 		for e := range events {
 			if err := s.encodeEvent(enc, e); err != nil {
@@ -188,7 +181,6 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		}
 	}()
 
-	// Reader loop.
 	for {
 		var cm transport.ClientMsg
 		if err := dec.Decode(&cm); err != nil {

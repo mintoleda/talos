@@ -79,8 +79,6 @@ func (t *findTool) glob(pattern string) (protocol.ToolResult, error) {
 	return okResult(strings.Join(matches, "\n")), nil
 }
 
-// isGlob reports whether s looks like a shell glob pattern rather than a fuzzy
-// natural-language query.
 func isGlob(s string) bool {
 	return strings.ContainsAny(s, "*?[")
 }

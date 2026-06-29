@@ -11,7 +11,6 @@ const (
 	ThinkingXHigh   = "xhigh"
 )
 
-// allLevels is the full set for models with no restrictions.
 var allLevels = []string{ThinkingOff, ThinkingMinimal, ThinkingLow, ThinkingMedium, ThinkingHigh, ThinkingXHigh}
 
 // modelThinkingCaps maps model IDs to the set of thinking levels the model
@@ -114,12 +113,10 @@ var modelThinkingCaps = map[string][]string{
 	"us.anthropic.claude-fable-5":        {ThinkingMinimal, ThinkingLow, ThinkingMedium, ThinkingHigh, ThinkingXHigh},
 }
 
-// ValidThinkingLevels returns all recognized thinking levels.
 func ValidThinkingLevels() []string {
 	return allLevels
 }
 
-// IsValidThinkingLevel returns true if the given level is one of the known values.
 func IsValidThinkingLevel(level string) bool {
 	for _, l := range allLevels {
 		if l == level {
@@ -150,14 +147,12 @@ func SupportedLevels(model string) []string {
 func ClampThinkingLevel(model, level string) string {
 	caps := SupportedLevels(model)
 
-	// Already valid.
 	for _, l := range caps {
 		if l == level {
 			return level
 		}
 	}
 
-	// Search upward from the requested index, then downward.
 	reqIdx := indexOf(allLevels, level)
 	if reqIdx == -1 {
 		return caps[0]
@@ -179,8 +174,6 @@ func ClampThinkingLevel(model, level string) string {
 	return caps[0]
 }
 
-// MapThinkingToAnthropicBudget returns the anthropic thinking.budget_tokens for
-// the given abstract level, or 0 to disable thinking.
 func MapThinkingToAnthropicBudget(level string) int {
 	switch level {
 	case ThinkingOff:
@@ -224,7 +217,6 @@ func MapThinkingToOpenAIEffort(level string) string {
 	}
 }
 
-// indexOf returns the index of s in slice, or -1.
 func indexOf(slice []string, s string) int {
 	for i, v := range slice {
 		if v == s {

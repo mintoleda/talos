@@ -8,7 +8,6 @@ import (
 	"github.com/mintoleda/talos/internal/protocol"
 )
 
-// helper to build a frozen message with tool_use content blocks.
 func frozenToolCall(ids ...string) protocol.FrozenMessage {
 	blocks := make([]protocol.ContentBlock, len(ids))
 	for i, id := range ids {
@@ -22,7 +21,6 @@ func frozenToolCall(ids ...string) protocol.FrozenMessage {
 	return protocol.FrozenMessage{Msg: m, Raw: raw}
 }
 
-// helper to build a frozen message with tool_result content blocks.
 func frozenToolResult(ids ...string) protocol.FrozenMessage {
 	blocks := make([]protocol.ContentBlock, len(ids))
 	for i, id := range ids {
@@ -36,7 +34,6 @@ func frozenToolResult(ids ...string) protocol.FrozenMessage {
 	return protocol.FrozenMessage{Msg: m, Raw: raw}
 }
 
-// helper to build a plain text frozen message.
 func frozenText(role protocol.Role, text string) protocol.FrozenMessage {
 	m := protocol.TextMessage(role, text)
 	raw, _ := m.MarshalCanonical()
@@ -154,7 +151,6 @@ func TestCompactionDropsOldestAndPrependsSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Append 5 messages.
 	for i := 0; i < 5; i++ {
 		if err := tx.Append(protocol.TextMessage(protocol.RoleUser, "msg")); err != nil {
 			t.Fatal(err)

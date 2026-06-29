@@ -2,7 +2,6 @@ package transport
 
 import "encoding/json"
 
-// ClientMsg is sent client → server.
 type ClientMsg struct {
 	Type     string          `json:"type"` // "input" | "interrupt" | "approve"
 	Text     string          `json:"text,omitempty"`
@@ -10,7 +9,6 @@ type ClientMsg struct {
 	Plan     json.RawMessage `json:"plan,omitempty"`
 }
 
-// ServerMsg is sent server → client.
 type ServerMsg struct {
 	Type    string          `json:"type"` // "hello" | "event" | "error"
 	Version string          `json:"version,omitempty"`

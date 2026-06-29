@@ -12,8 +12,6 @@ import (
 	"github.com/mintoleda/talos/internal/protocol"
 )
 
-// SessionPreview holds a session ID, its last modification time, and a short
-// preview of the last user message in the transcript.
 type SessionPreview struct {
 	ID      string
 	ModTime time.Time

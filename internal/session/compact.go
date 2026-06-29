@@ -9,7 +9,6 @@ import (
 	"github.com/mintoleda/talos/internal/protocol"
 )
 
-// Summarizer produces a concise summary of a chunk of messages.
 type Summarizer interface {
 	Summarize(ctx context.Context, msgs []protocol.Message) (string, error)
 	// WithFocus returns a Summarizer that is guided by the given focus message.
@@ -18,7 +17,6 @@ type Summarizer interface {
 	WithFocus(focus string) Summarizer
 }
 
-// SummarizerFunc adapts a plain function to the Summarizer interface.
 type SummarizerFunc func(context.Context, []protocol.Message) (string, error)
 
 func (f SummarizerFunc) Summarize(ctx context.Context, msgs []protocol.Message) (string, error) {
@@ -120,7 +118,6 @@ type Compactor struct {
 	EmergencyThreshold float64 // above this, compact regardless of chunk size
 }
 
-// NewCompactor creates a compactor with sensible defaults.
 func NewCompactor(s Summarizer) *Compactor {
 	return &Compactor{
 		Summarizer:         s,
@@ -325,7 +322,7 @@ func (c *Compactor) CompactNow(ctx context.Context, tx *Transcript, focus string
 	}
 	frozen := tx.Frozen()
 	if len(frozen) == 0 {
-		return "", nil // nothing to compact
+		return "", nil
 	}
 	chunk := c.alignedChunk(frozen)
 	if len(chunk) == 0 {

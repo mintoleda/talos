@@ -25,12 +25,10 @@ type backgroundProc struct {
 	buffer *ringBuffer
 }
 
-// NewBackgroundRegistry creates a registry for the given working directory.
 func NewBackgroundRegistry(cwd string) *BackgroundRegistry {
 	return &BackgroundRegistry{procs: make(map[string]*backgroundProc), cwd: cwd}
 }
 
-// Start spawns a background command and returns a stable handle.
 func (r *BackgroundRegistry) Start(command string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -77,7 +75,6 @@ func (r *BackgroundRegistry) Kill(id string) error {
 	return syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 }
 
-// KillAll terminates every registered background process.
 func (r *BackgroundRegistry) KillAll() {
 	r.mu.Lock()
 	ids := make([]string, 0, len(r.procs))

@@ -37,7 +37,6 @@ func TestPromptBuilderInjectsContextFn(t *testing.T) {
 		t.Fatalf("expected user content preserved, got: %q", got)
 	}
 
-	// The transcript itself must be unchanged.
 	frozen := tx.Frozen()
 	lastFrozen := frozen[len(frozen)-1]
 	if lastFrozen.Msg.Content[0].Text != "do the thing" {

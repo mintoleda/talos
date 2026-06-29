@@ -22,23 +22,16 @@ import (
 	"github.com/mintoleda/talos/internal/tui/dialogs"
 )
 
-// app holds the mutable runtime state shared by the interactive commands
-// (/provider, /model, /login) and the operations over it. It exists so that
-// modelCache — which fetchModels writes and switchProvider/saveLogin clear —
-// has an explicit owner rather than being a local captured by several closures.
 type app struct {
 	cfg          *config.Config
 	lp           *loop.Loop
 	pb           *loop.PromptBuilder
-	prov         provider.Provider  // current provider; updated by switchProvider
-	exec         executor.Executor  // shared executor (thread-safe ReadSet)
-	agentBuilder *agents.Builder    // nil when noTools or no agents loaded
+	prov         provider.Provider
+	exec         executor.Executor
+	agentBuilder *agents.Builder
 	cwd          string
 	noTools      bool
 
-	// modelCache holds the last-fetched model list for the active provider.
-	// Cleared whenever the provider switches or a login is added so stale
-	// lists don't linger.
 	modelCache []models.Entry
 }
 
@@ -72,9 +65,6 @@ func (a *app) resumeSession(id string) (*session.Transcript, string, error) {
 	return tx, sess.ID, nil
 }
 
-// switchProviderFor creates a new provider client, re-creates the compactor,
-// and swaps them on the given loop. Also updates a.prov so new tabs pick up
-// the change. Used by the /provider and /model commands.
 func (a *app) switchProviderFor(lp *loop.Loop, pName, pModel string) error {
 	oldProv := a.cfg.Provider
 	oldModel := a.cfg.Model
@@ -97,24 +87,19 @@ func (a *app) switchProviderFor(lp *loop.Loop, pName, pModel string) error {
 	lp.SetProvider(prov)
 	lp.SetCompactor(comp)
 	a.pb.SetModel(a.cfg.Model)
-	a.prov = prov   // update so new tabs created after this switch use the right provider
-	a.modelCache = nil // clear so next picker open re-fetches for the new provider
+	a.prov = prov
+	a.modelCache = nil
 
-	// Persist the choice so it survives restarts.
 	if err := config.SaveProviderModel(a.cfg.BaseDir, a.cfg.Provider, a.cfg.Model); err != nil {
 		fmt.Fprintf(os.Stderr, "[warning] save provider/model: %v\n", err)
 	}
 	return nil
 }
 
-// switchProvider updates the main loop (tab 1). Delegates to switchProviderFor.
 func (a *app) switchProvider(pName, pModel string) error {
 	return a.switchProviderFor(a.lp, pName, pModel)
 }
 
-// makeNewTabFn returns the factory used by TabsModel to spawn new agent tabs.
-// Each new tab gets its own loop and session; they share the executor and
-// prompt builder with the primary tab (thinking level is therefore global).
 func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices *pricing.Table) tui.NewTabFunc {
 	return func(tabCtx context.Context, tabID int) (tui.Config, <-chan protocol.Event, error) {
 		ntx, id, err := a.newSession()
@@ -227,9 +212,6 @@ func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices 
 	}
 }
 
-// fetchModels queries all logged-in providers concurrently and returns a
-// combined, sorted model list. Results are cached until the provider switches
-// or a login is added.
 func (a *app) fetchModels() ([]models.Entry, error) {
 	if a.modelCache != nil {
 		return a.modelCache, nil

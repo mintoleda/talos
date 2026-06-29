@@ -31,7 +31,6 @@ func TestCheckpointSnapshotRestore(t *testing.T) {
 	repo := initRepo(t)
 	cp := NewCheckpointer(repo)
 
-	// Modify a tracked file and add an untracked one, then snapshot.
 	os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("v2\n"), 0o644)
 	os.WriteFile(filepath.Join(repo, "untracked.txt"), []byte("new\n"), 0o644)
 
@@ -43,7 +42,6 @@ func TestCheckpointSnapshotRestore(t *testing.T) {
 		t.Fatalf("unexpected ref: %s", ref)
 	}
 
-	// Mutate further, then restore from the checkpoint.
 	os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("v3\n"), 0o644)
 	os.Remove(filepath.Join(repo, "untracked.txt"))
 	if err := cp.Restore(ref); err != nil {

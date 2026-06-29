@@ -13,7 +13,6 @@ import (
 	"github.com/mintoleda/talos/internal/protocol"
 )
 
-// WebSearchConfig configures the web-search tool.
 type WebSearchConfig struct {
 	SearchURL string // custom search endpoint (empty = DuckDuckGo HTML)
 }
@@ -81,7 +80,6 @@ func (w *webSearch) Execute(ctx context.Context, args map[string]any) (protocol.
 		return errResult(fmt.Errorf("search returned status %d", resp.StatusCode)), nil
 	}
 
-	// Truncate to avoid huge responses.
 	maxLen := 20000
 	if len(body) > maxLen {
 		body = body[:maxLen]

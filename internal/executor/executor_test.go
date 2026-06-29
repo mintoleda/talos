@@ -10,8 +10,6 @@ import (
 	"github.com/mintoleda/talos/internal/tools"
 )
 
-// fakeEmitting is a tool that implements tools.EmittingTool. It records whether
-// it received an emit function and uses it.
 type fakeEmitting struct{ gotEmit bool }
 
 func (f *fakeEmitting) Name() string            { return "fake" }

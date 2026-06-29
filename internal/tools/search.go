@@ -58,7 +58,6 @@ func (t *searchTool) Execute(ctx context.Context, args map[string]any) (protocol
 	return t.fzgrep(query, root, args)
 }
 
-// isRegex reports whether s looks like a regex rather than natural language.
 func isRegex(s string) bool {
 	metas := `\^$()[|+*{`
 	for _, r := range s {
@@ -68,8 +67,6 @@ func isRegex(s string) bool {
 	}
 	return false
 }
-
-// ---- regex mode ----
 
 func (t *searchTool) grep(ctx context.Context, pattern, root string) (protocol.ToolResult, error) {
 	if _, err := exec.LookPath("rg"); err == nil {
@@ -123,8 +120,6 @@ func (t *searchTool) grep(ctx context.Context, pattern, root string) (protocol.T
 	return okResult(out.String()), nil
 }
 
-// ---- fuzzy mode ----
-
 func (t *searchTool) fzgrep(query, root string, args map[string]any) (protocol.ToolResult, error) {
 	limit, _, _ := intArg(args, "limit")
 	if limit <= 0 {
@@ -137,7 +132,6 @@ func (t *searchTool) fzgrep(query, root string, args map[string]any) (protocol.T
 		return errResult(fmt.Errorf("fuzzy search: %w", err)), nil
 	}
 
-	// Filter by root if a path was specified.
 	if root != "." {
 		filtered := make([]fff.SearchResult, 0, len(results))
 		for _, r := range results {

@@ -46,7 +46,6 @@ func parseSSE(body io.ReadCloser, out chan<- protocol.ProviderEvent) {
 		if len(line) > 0 {
 			line = strings.TrimRight(line, "\r\n")
 			if line == "" || strings.HasPrefix(line, ":") {
-				// ignore
 			} else if data, ok := strings.CutPrefix(line, "data: "); ok {
 				if data == "[DONE]" {
 					flushToolCalls()

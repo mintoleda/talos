@@ -2,8 +2,6 @@ package anthropic
 
 import "encoding/json"
 
-// --- request ---
-
 type msgRequest struct {
 	Model     string     `json:"model"`
 	MaxTokens int        `json:"max_tokens"`
@@ -22,7 +20,7 @@ type sysBlock struct {
 
 type cacheControl struct {
 	Type string `json:"type"`
-} // {"type":"ephemeral"}
+}
 
 type apiMsg struct {
 	Role    string     `json:"role"`
@@ -61,8 +59,6 @@ type thinkCfg struct {
 	BudgetTokens int    `json:"budget_tokens"`
 }
 
-// --- SSE events ---
-
 type sseEvent struct {
 	Type         string    `json:"type"`
 	Index        int       `json:"index"`
@@ -84,8 +80,6 @@ type sseUsage struct {
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 }
-
-// --- non-streaming response ---
 
 type msgResponse struct {
 	Content []apiBlock `json:"content"`

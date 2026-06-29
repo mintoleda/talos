@@ -38,13 +38,11 @@ func TestAutoAllowAndHeadlessBlock(t *testing.T) {
 	root := t.TempDir()
 	dangerous := "sudo rm something"
 
-	// auto + interactive: dangerous bash auto-allows.
 	pi := NewPolicy(ModeAuto, root, NewClassifier(), true)
 	if d, _ := pi.Check(bashTU(dangerous)); d != Allow {
 		t.Fatalf("auto+interactive dangerous bash should auto-allow, got %v", d)
 	}
 
-	// auto + headless: the same Prompt decision degrades to Block.
 	ph := NewPolicy(ModeAuto, root, NewClassifier(), false)
 	if d, _ := ph.Check(bashTU(dangerous)); d != Block {
 		t.Fatalf("auto+headless dangerous bash should block, got %v", d)

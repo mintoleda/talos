@@ -21,11 +21,9 @@ func TestScan(t *testing.T) {
 
 	writeSkill("deploy-docker", "# Deploy Docker — Deploy the current project to Docker\n\n## Usage\n\nRun `docker build -t project .`\n")
 	writeSkill("run-tests", "Run tests with coverage and formatting.\nFull instructions here.")
-	// hidden dirs and files should be ignored
 	os.WriteFile(filepath.Join(dir, "_private.md"), []byte("should be ignored"), 0644)
 	os.WriteFile(filepath.Join(dir, ".hidden.md"), []byte("should be ignored"), 0644)
 	os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("not a skill"), 0644)
-	// dir without SKILL.md should be ignored
 	os.MkdirAll(filepath.Join(dir, "empty-dir"), 0755)
 
 	skills, err := Scan([]Dir{{Path: dir}})
@@ -64,7 +62,6 @@ func TestScanOverride(t *testing.T) {
 	os.MkdirAll(filepath.Join(project, "deploy"), 0755)
 	os.WriteFile(filepath.Join(project, "deploy", "SKILL.md"), []byte("Project-specific deploy"), 0644)
 
-	// Later dirs override earlier ones.
 	skills, err := Scan([]Dir{{Path: global, Label: "global"}, {Path: project, Label: "project"}})
 	if err != nil {
 		t.Fatal(err)

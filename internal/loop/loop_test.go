@@ -14,8 +14,6 @@ import (
 	"github.com/mintoleda/talos/internal/session"
 )
 
-// fakeProvider replays a scripted sequence of ProviderEvent batches, one batch
-// per StreamTurn call. The value-typed seam makes this trivial.
 type fakeProvider struct {
 	batches [][]protocol.ProviderEvent
 	calls   int
@@ -38,7 +36,6 @@ func (f *fakeProvider) ListModels(ctx context.Context) ([]string, error) {
 	return nil, nil
 }
 
-// fakeExecutor records calls and returns a canned result.
 type fakeExecutor struct{ calls []protocol.ToolUse }
 
 func (e *fakeExecutor) Run(ctx context.Context, tu protocol.ToolUse, _ protocol.EmitFunc) protocol.ToolResult {
@@ -109,7 +106,6 @@ func TestParallelToolExecution(t *testing.T) {
 		done <- lp.RunTurn(context.Background(), protocol.TextBlocks("hi"), func(protocol.Event) {})
 	}()
 
-	// Wait for all three tools to be inside Run, then release them together.
 	for {
 		if atomic.LoadInt32(&exec.max) == 3 {
 			break
@@ -134,7 +130,6 @@ func TestParallelToolExecution(t *testing.T) {
 	if toolMsg.Role != protocol.RoleTool || len(toolMsg.Content) != 3 {
 		t.Fatalf("expected tool message with 3 results, got %+v", toolMsg)
 	}
-	// Results must preserve the original tool_use order.
 	for i, id := range []string{"1", "2", "3"} {
 		if toolMsg.Content[i].ToolResult == nil || toolMsg.Content[i].ToolResult.ToolUseID != id {
 			t.Fatalf("result %d expected tool_use_id %s, got %+v", i, id, toolMsg.Content[i].ToolResult)
@@ -188,9 +183,6 @@ func TestToolRoundTrip(t *testing.T) {
 	}
 }
 
-// TestIterationCap verifies that MaxIterations (when set) prevents a model
-// that always requests tool calls from looping forever. The default (0)
-// means unlimited.
 func TestIterationCap(t *testing.T) {
 	var batches [][]protocol.ProviderEvent
 	for i := 0; i < 60; i++ {
@@ -229,7 +221,6 @@ func TestNewRestoresStatsFromTranscript(t *testing.T) {
 	if err := tx.Append(protocol.TextMessage(protocol.RoleUser, "previous turn")); err != nil {
 		t.Fatal(err)
 	}
-	// Seed a stats record as if a previous session had run 3 turns.
 	if err := tx.WriteStats(session.StatsRecord{
 		Calls:        3,
 		InputTokens:  1000,

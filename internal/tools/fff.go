@@ -12,8 +12,6 @@ import (
 	"github.com/mintoleda/talos/internal/protocol"
 )
 
-// FFFIndex is the shared fuzzy-finding index used by fff and ffgrep.
-// It is set up once by DefaultRegistry.
 var FFFIndex *fff.Index
 
 func ensureFFFIndex(cwd string) *fff.Index {

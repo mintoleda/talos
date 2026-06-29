@@ -7,13 +7,10 @@ import (
 	"github.com/mintoleda/talos/internal/protocol"
 )
 
-// RoutingPolicy selects which provider handles a request.
 type RoutingPolicy interface {
 	Pick(req protocol.Request, providers []Provider) Provider
 }
 
-// RoutingProvider wraps multiple providers behind a single Provider interface
-// and a routing policy.
 type RoutingProvider struct {
 	providers []Provider
 	policy    RoutingPolicy
@@ -44,7 +41,6 @@ func (r *RoutingProvider) ListModels(ctx context.Context) ([]string, error) {
 	return r.providers[0].ListModels(ctx)
 }
 
-// RoundRobin cycles through providers for each request.
 type RoundRobin struct {
 	next int
 }

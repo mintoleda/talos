@@ -1,11 +1,10 @@
 package provider
 
-// Known describes a provider talos knows how to talk to.
 type Known struct {
-	Name    string // canonical name used in config and picker
-	BaseURL string // base URL without /v1 suffix
-	EnvVar  string // primary environment variable for the API key
-	Label   string // short display label for the login dialog
+	Name    string
+	BaseURL string // BaseURL without /v1 suffix
+	EnvVar  string
+	Label   string
 }
 
 // All is the list of providers talos supports out of the box.
@@ -20,7 +19,6 @@ var All = []Known{
 	{Name: "anthropic", BaseURL: "https://api.anthropic.com", EnvVar: "ANTHROPIC_API_KEY", Label: "anthropic.com"},
 }
 
-// ByName returns the Known entry for a provider name, or zero value if not found.
 func ByName(name string) (Known, bool) {
 	for _, k := range All {
 		if k.Name == name {

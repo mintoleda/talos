@@ -11,7 +11,6 @@ import (
 	"github.com/mintoleda/talos/internal/protocol"
 )
 
-// WebFetchConfig configures the web-fetch tool.
 type WebFetchConfig struct{}
 
 type webFetch struct {

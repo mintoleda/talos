@@ -55,8 +55,6 @@ func TextMessage(role Role, text string) Message {
 	return Message{Role: role, Content: []ContentBlock{{Type: BlockText, Text: text}}}
 }
 
-// TextBlocks returns a single-element slice containing a text ContentBlock.
-// Convenience wrapper for callers that only have a plain string to send.
 func TextBlocks(text string) []ContentBlock {
 	return []ContentBlock{{Type: BlockText, Text: text}}
 }

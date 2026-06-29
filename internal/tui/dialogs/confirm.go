@@ -10,7 +10,6 @@ import (
 	"github.com/mintoleda/talos/internal/tui/styles"
 )
 
-// ConfirmDialog asks the user to approve or deny a permission request.
 type ConfirmDialog struct {
 	ev        protocol.PermissionRequested
 	dismissed bool

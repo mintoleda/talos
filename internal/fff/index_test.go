@@ -10,7 +10,6 @@ func TestIndexBuildAndFind(t *testing.T) {
 	dir := t.TempDir()
 	idxDir := t.TempDir()
 
-	// Create some files.
 	mustWrite(t, filepath.Join(dir, "prompt.go"), "package main")
 	mustWrite(t, filepath.Join(dir, "builder.go"), "package main")
 	mustWrite(t, filepath.Join(dir, "nested", "deep_prompt.go"), "package nested")
@@ -34,7 +33,6 @@ func TestIndexBuildAndFind(t *testing.T) {
 		t.Fatalf("expected prompt.go first, got %s", results[0].Path)
 	}
 
-	// Frecency boost.
 	idx.RecordRead(filepath.Join(dir, "nested", "deep_prompt.go"))
 	results = idx.Find("prompt", 10)
 	if results[0].Path != filepath.Join(dir, "nested", "deep_prompt.go") {

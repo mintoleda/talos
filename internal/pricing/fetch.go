@@ -78,7 +78,6 @@ func parseHTML(body []byte) (map[string]rawPrice, error) {
 	return models, nil
 }
 
-// MarshalRaw encodes a raw price map to JSON (used by the gen tool).
 func MarshalRaw(m map[string]rawPrice) ([]byte, error) {
 	return json.Marshal(m)
 }

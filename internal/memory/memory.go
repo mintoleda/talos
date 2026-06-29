@@ -24,7 +24,6 @@ func Load(baseDir string) (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-// Append adds a timestamped entry to the memory file.
 func Append(baseDir, entry string) error {
 	path := Path(baseDir)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

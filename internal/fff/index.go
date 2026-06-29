@@ -18,14 +18,12 @@ import (
 	"github.com/sahilm/fuzzy"
 )
 
-// Entry is one indexed file path plus its frecency score.
 type Entry struct {
 	Path     string  `json:"path"`
 	Score    float64 `json:"score"`
 	LastRead int64   `json:"last_read"` // unix seconds
 }
 
-// Index holds the searchable file list for a project.
 type Index struct {
 	mu       sync.RWMutex
 	root     string
@@ -34,7 +32,6 @@ type Index struct {
 	updated  time.Time
 }
 
-// NewIndex creates an index for root. The index is persisted under indexDir.
 func NewIndex(root, indexDir string) *Index {
 	return &Index{
 		root:     root,
@@ -42,7 +39,6 @@ func NewIndex(root, indexDir string) *Index {
 	}
 }
 
-// Load reads a persisted index from disk, if one exists.
 func (idx *Index) Load() error {
 	path := idx.file()
 	data, err := os.ReadFile(path)
@@ -57,7 +53,6 @@ func (idx *Index) Load() error {
 	return json.Unmarshal(data, &idx.entries)
 }
 
-// Save persists the current index to disk.
 func (idx *Index) Save() error {
 	if err := os.MkdirAll(idx.indexDir, 0o755); err != nil {
 		return err
@@ -71,16 +66,13 @@ func (idx *Index) Save() error {
 	return os.WriteFile(idx.file(), data, 0o644)
 }
 
-// file returns the on-disk path for this project's index.
 func (idx *Index) file() string {
 	name := projectHash(idx.root) + ".json"
 	return filepath.Join(idx.indexDir, name)
 }
 
-// projectHash is a stable identifier for a project root.
 func projectHash(root string) string {
 	abs, _ := filepath.Abs(root)
-	// simple stable hash
 	h := 0
 	for i, c := range abs {
 		h += int(c) * (i + 1)
@@ -88,7 +80,6 @@ func projectHash(root string) string {
 	return fmt.Sprintf("%x", h)
 }
 
-// Build walks root and rebuilds the index from disk.
 func (idx *Index) Build() error {
 	var entries []Entry
 	seen := make(map[string]bool)
@@ -101,7 +92,6 @@ func (idx *Index) Build() error {
 		if rel == "." {
 			return nil
 		}
-		// Skip hidden directories and common junk.
 		if d.IsDir() {
 			base := filepath.Base(path)
 			if strings.HasPrefix(base, ".") && base != "." {
@@ -141,12 +131,10 @@ func (idx *Index) Build() error {
 	return idx.Save()
 }
 
-// isIgnored checks .gitignore files along rel's path.
 func isIgnored(root, rel string) bool {
 	dir := filepath.Dir(rel)
 	base := filepath.Base(rel)
 
-	// Walk from root out to the file's directory looking for .gitignore files.
 	parts := strings.Split(dir, string(filepath.Separator))
 	current := root
 	for _, part := range parts {
@@ -179,13 +167,11 @@ func loadGitignore(path string) (*ignore.GitIgnore, bool) {
 	return gi, true
 }
 
-// SearchResult is one fuzzy match.
 type SearchResult struct {
 	Path  string
 	Score int
 }
 
-// Find returns up to limit paths matching query, ranked by fuzzy score and frecency.
 func (idx *Index) Find(query string, limit int) []SearchResult {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -207,7 +193,6 @@ func (idx *Index) Find(query string, limit int) []SearchResult {
 		})
 	}
 
-	// Boost by frecency.
 	for i := range results {
 		entry := idx.entryByPath(results[i].Path)
 		results[i].Score = int(float64(results[i].Score) * entry.Score)
@@ -232,7 +217,6 @@ func (idx *Index) entryByPath(path string) Entry {
 	return Entry{Path: path, Score: 1.0}
 }
 
-// RecordRead bumps the frecency score for a file.
 func (idx *Index) RecordRead(path string) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -245,7 +229,6 @@ func (idx *Index) RecordRead(path string) {
 	}
 }
 
-// Stats returns the number of indexed files.
 func (idx *Index) Stats() int {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()

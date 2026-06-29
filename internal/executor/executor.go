@@ -10,7 +10,6 @@ import (
 	"github.com/mintoleda/talos/internal/tools"
 )
 
-// Executor runs tools against a registry, respecting the safety policy.
 type Executor interface {
 	Run(ctx context.Context, tu protocol.ToolUse, emit protocol.EmitFunc) protocol.ToolResult
 	Close()
@@ -92,9 +91,6 @@ func (e *InProcExecutor) Run(ctx context.Context, tu protocol.ToolUse, emit prot
 	return res
 }
 
-// InlineConfirm returns a PermissionRequested handler for tests and headless
-// callers that cannot render events. It prompts on stdin directly and sends
-// the answer to the event's ReplyCh.
 func InlineConfirm(ev protocol.PermissionRequested) {
 	fmt.Printf("\n⚠ %s requires approval: %s\nAllow? [y/N] ", ev.ToolName, ev.Reason)
 	var ans string

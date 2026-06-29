@@ -88,7 +88,6 @@ func LatestSession(projectRoot string) (Session, error) {
 	return Session{ID: id, ProjectID: pid, Path: items[0].path}, nil
 }
 
-// DeleteSession removes a session file by ID for the given project.
 func DeleteSession(projectRoot, id string) error {
 	pid := ProjectHash(projectRoot)
 	path := filepath.Join(SessionsDir(), pid, id+".jsonl")

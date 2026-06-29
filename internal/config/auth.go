@@ -11,7 +11,6 @@ type authEntry struct {
 	Key  string `json:"key"`
 }
 
-// ReadAuthKey reads a provider's API key from ~/.talos/auth.json.
 func ReadAuthKey(baseDir, providerName string) string {
 	data, err := os.ReadFile(filepath.Join(baseDir, "auth.json"))
 	if err != nil {
@@ -24,7 +23,6 @@ func ReadAuthKey(baseDir, providerName string) string {
 	return entries[providerName].Key
 }
 
-// WriteAuthKey saves a provider's API key to ~/.talos/auth.json.
 func WriteAuthKey(baseDir, providerName, key string) error {
 	path := filepath.Join(baseDir, "auth.json")
 	entries := map[string]authEntry{}
@@ -39,7 +37,6 @@ func WriteAuthKey(baseDir, providerName, key string) error {
 	return os.WriteFile(path, data, 0600)
 }
 
-// ResolveKeyFor returns the API key for a named provider from ~/.talos/auth.json.
 func ResolveKeyFor(baseDir, providerName, _ string) string {
 	return ReadAuthKey(baseDir, providerName)
 }

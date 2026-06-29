@@ -16,7 +16,7 @@ type PromptBuilder struct {
 	model         string
 	ctxLimit      int
 	thinkingLevel string
-	contextFn     func() string // optional per-turn reminder injected into the last user message
+	contextFn     func() string
 }
 
 func NewPromptBuilder(system string, tools []protocol.ToolSchema, model string) *PromptBuilder {
@@ -140,8 +140,6 @@ func (b *PromptBuilder) PrefixHash(req protocol.Request) string {
 
 func (b *PromptBuilder) Model() string { return b.model }
 
-// SetContextLimit drives compaction thresholds and context-usage warnings.
-// Should be set from the pricing table after construction.
 func (b *PromptBuilder) SetContextLimit(n int) {
 	if n > 0 {
 		b.ctxLimit = n

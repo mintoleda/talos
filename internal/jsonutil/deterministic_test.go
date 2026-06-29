@@ -29,7 +29,6 @@ func TestMarshalDeterministic(t *testing.T) {
 		t.Errorf("got %s, want %s", got, want)
 	}
 
-	// Second call must be identical.
 	got2, err := MarshalDeterministic(v)
 	if err != nil {
 		t.Fatalf("marshal 2: %v", err)

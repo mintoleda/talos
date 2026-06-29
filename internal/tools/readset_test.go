@@ -14,8 +14,6 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
-// TestReadSetSeenAndFresh: a record is only "fresh" if the on-disk file still
-// matches the hash + mtime we saw.
 func TestReadSetSeenAndFresh(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a.txt")
@@ -32,7 +30,6 @@ func TestReadSetSeenAndFresh(t *testing.T) {
 		t.Fatal("after Record, file should be fresh")
 	}
 
-	// External modification: bump mtime and change content.
 	time.Sleep(2 * time.Millisecond)
 	writeFile(t, path, "v2")
 	if rs.SeenAndFresh(path) {
@@ -40,8 +37,6 @@ func TestReadSetSeenAndFresh(t *testing.T) {
 	}
 }
 
-// TestReadSetRecentPathsOrder: a re-read moves the path to the most-recent
-// slot, so RecentPaths(1) returns it last.
 func TestReadSetRecentPathsOrder(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.txt")
@@ -64,7 +59,6 @@ func TestReadSetRecentPathsOrder(t *testing.T) {
 		t.Fatalf("unexpected order: %v", recent)
 	}
 
-	// Re-reading a moves it to the end.
 	_ = rs.Record(a)
 	recent = rs.RecentPaths(3)
 	if recent[0] != a || recent[1] != c || recent[2] != b {
@@ -72,7 +66,6 @@ func TestReadSetRecentPathsOrder(t *testing.T) {
 	}
 }
 
-// TestReadSetSaveLoad: a saved set round-trips through LoadReadSet.
 func TestReadSetSaveLoad(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.txt")
@@ -92,14 +85,12 @@ func TestReadSetSaveLoad(t *testing.T) {
 	if !loaded.SeenAndFresh(a) || !loaded.SeenAndFresh(b) {
 		t.Fatalf("loaded set missing entries: all=%v", loaded.AllPaths())
 	}
-	// And it remembers the save path so subsequent Updates persist.
 	_ = loaded.Record(a)
 	if _, err := os.Stat(filepath.Join(dir, "rs.json")); err != nil {
 		t.Fatalf("save path not preserved: %v", err)
 	}
 }
 
-// TestReadSetLoadMissing: a missing file gives an empty set, not an error.
 func TestReadSetLoadMissing(t *testing.T) {
 	rs, err := LoadReadSet(filepath.Join(t.TempDir(), "absent.json"))
 	if err != nil {
@@ -110,7 +101,6 @@ func TestReadSetLoadMissing(t *testing.T) {
 	}
 }
 
-// TestReadSetLoadCorrupt: a corrupt file is reported, not silently dropped.
 func TestReadSetLoadCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rs.json")

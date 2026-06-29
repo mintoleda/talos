@@ -75,7 +75,6 @@ func Load() (*Config, error) {
 		cfg.SystemPrompt = sp
 	}
 
-	// Resolve API key from auth.json (may be empty — user can /login later).
 	cfg.ResolveAPIKey()
 	return cfg, nil
 }
@@ -92,7 +91,6 @@ func (c *Config) Override(baseURL, model, key string) {
 	}
 }
 
-// OverrideProvider sets the provider name from a flag and re-resolves the API key.
 func (c *Config) OverrideProvider(provider string) {
 	if provider != "" {
 		c.Provider = provider
@@ -100,7 +98,6 @@ func (c *Config) OverrideProvider(provider string) {
 	}
 }
 
-// ResolveAPIKey sets APIKey from ~/.talos/auth.json for the current provider.
 func (c *Config) ResolveAPIKey() {
 	// Normalize provider aliases to canonical names for auth.json lookups.
 	authName := c.Provider
@@ -132,11 +129,10 @@ type fileConfig struct {
 	MaxAgentDepth         int    `toml:"max_agent_depth"`
 	// Deprecated: use thinking_level. Kept for backward compat.
 	ThinkingBudget int `toml:"thinking_budget"`
-	// Compaction controls.
-	CompactThreshold          float64 `toml:"compact_threshold"`   // 0 = use default (0.85)
-	CompactEmergencyThreshold float64 `toml:"compact_emergency"`   // 0 = use default (0.95)
-	CompactChunkSize          int     `toml:"compact_chunk_size"`  // 0 = use default (20)
-	SummaryModel              string  `toml:"summary_model"`       // empty = deterministic placeholder
+	CompactThreshold          float64 `toml:"compact_threshold"`
+	CompactEmergencyThreshold float64 `toml:"compact_emergency"`
+	CompactChunkSize          int     `toml:"compact_chunk_size"`
+	SummaryModel              string  `toml:"summary_model"` // empty = deterministic placeholder
 }
 
 func loadFile(path string, cfg *Config) error {
@@ -206,9 +202,6 @@ func loadFile(path string, cfg *Config) error {
 	return nil
 }
 
-// LoadUserSystemPrompt reads ~/.talos/SYSTEM_PROMPT.md, the global/cross-project
-// system prompt file. If present it takes precedence over the config.toml's
-// system_prompt field (but can still be overridden by a project-level AGENTS.md).
 func LoadUserSystemPrompt(baseDir string) (string, error) {
 	path := filepath.Join(baseDir, "SYSTEM_PROMPT.md")
 	data, err := os.ReadFile(path)
@@ -221,9 +214,6 @@ func LoadUserSystemPrompt(baseDir string) (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-// LoadProjectSystemPrompt reads AGENTS.md from the given project root.
-// If the file exists, its contents replace the system prompt entirely
-// (highest precedence). If not, the empty string is returned.
 func LoadProjectSystemPrompt(projectRoot string) (string, error) {
 	dir := projectRoot
 	if dir == "" || dir == "." {
@@ -251,9 +241,6 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// SaveProviderModel persists the provider and model to ~/.talos/config.toml.
-// It reads the existing file, updates only the provider and model keys, and
-// writes it back — preserving all other keys and their values.
 func SaveProviderModel(baseDir, provider, model string) error {
 	path := filepath.Join(baseDir, "config.toml")
 
@@ -276,9 +263,6 @@ func SaveProviderModel(baseDir, provider, model string) error {
 	return os.WriteFile(path, buf.Bytes(), 0644)
 }
 
-// SaveThinkingLevel persists the thinking level to ~/.talos/config.toml.
-// It reads the existing file, updates only the thinking_level key, and writes
-// it back — preserving all other keys and their values.
 func SaveThinkingLevel(baseDir, level string) error {
 	path := filepath.Join(baseDir, "config.toml")
 

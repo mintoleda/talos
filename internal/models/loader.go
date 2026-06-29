@@ -2,13 +2,11 @@ package models
 
 import "strings"
 
-// Entry is a selectable model with its provider.
 type Entry struct {
 	Provider string
 	ID       string
 }
 
-// Full returns "provider/id".
 func (e Entry) Full() string { return e.Provider + "/" + e.ID }
 
 // Filter returns entries matching all whitespace-separated words in query

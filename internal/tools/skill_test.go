@@ -10,15 +10,12 @@ import (
 func TestSkillTool(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create a skill directory with SKILL.md
 	sub := filepath.Join(dir, "test-skill")
 	os.MkdirAll(sub, 0755)
 	os.WriteFile(filepath.Join(sub, "SKILL.md"), []byte("# Test Skill\n\nDo the thing."), 0644)
 
-	// Create a non-skill directory (no SKILL.md)
 	os.MkdirAll(filepath.Join(dir, "empty"), 0755)
 
-	// Create a hidden directory
 	os.MkdirAll(filepath.Join(dir, ".hidden"), 0755)
 	os.WriteFile(filepath.Join(dir, ".hidden", "SKILL.md"), []byte("hidden"), 0644)
 
@@ -28,7 +25,6 @@ func TestSkillTool(t *testing.T) {
 		t.Errorf("expected name 'skill', got %s", tool.Name())
 	}
 
-	// Valid invocation
 	res, err := tool.Execute(context.Background(), map[string]any{"name": "test-skill"})
 	if err != nil {
 		t.Fatal(err)
@@ -40,7 +36,6 @@ func TestSkillTool(t *testing.T) {
 		t.Errorf("unexpected content: %q", res.Content)
 	}
 
-	// Unknown skill
 	res, _ = tool.Execute(context.Background(), map[string]any{"name": "missing"})
 	if !res.IsError {
 		t.Error("expected error for missing skill")

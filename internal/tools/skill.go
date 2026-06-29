@@ -11,14 +11,11 @@ import (
 	"github.com/mintoleda/talos/internal/protocol"
 )
 
-// SkillTool lets the LLM load a skill by name instead of by full path.
 type SkillTool struct {
 	byName map[string]string // skill name -> full path to SKILL.md
 	dirs   []string          // for error messages
 }
 
-// NewSkillTool creates a skill tool that searches the given directories.
-// Each directory is scanned for subdirectories containing SKILL.md.
 func NewSkillTool(dirs []string) *SkillTool {
 	byName := make(map[string]string)
 	for _, dir := range dirs {
@@ -48,7 +45,6 @@ func (t *SkillTool) Name() string        { return "skill" }
 func (t *SkillTool) Description() string { return "Load a skill by name. Returns the full SKILL.md content. Use when the task matches one of the Available Skills listed in the system prompt." }
 
 func (t *SkillTool) Schema() json.RawMessage {
-	// Build a sorted list of available names for the enum.
 	names := make([]string, 0, len(t.byName))
 	for n := range t.byName {
 		names = append(names, n)

@@ -17,17 +17,15 @@ import (
 	"strings"
 )
 
-// A Skill is a single reusable capability documented in a markdown file.
 type Skill struct {
-	Name        string // file stem (e.g. "deploy-docker")
-	Path        string // full path to the .md file
-	Description string // one-line summary
+	Name        string
+	Path        string
+	Description string
 }
 
-// Dir describes a directory to scan for skills.
 type Dir struct {
 	Path  string
-	Label string // used only for diagnostic / debugging
+	Label string
 }
 
 // Scan reads all SKILL.md files from the given directories and their
@@ -56,7 +54,7 @@ func Scan(dirs []Dir) ([]Skill, error) {
 
 			skillPath := filepath.Join(d.Path, name, "SKILL.md")
 			if _, err := os.Stat(skillPath); err != nil {
-				continue // subdirectory without SKILL.md — skip
+				continue
 			}
 
 			desc, err := extractDescription(skillPath)
@@ -132,7 +130,6 @@ func extractDescription(path string) (string, error) {
 			continue
 		}
 
-		// Track YAML frontmatter.
 		if trimmed == "---" {
 			inFrontmatter = !inFrontmatter
 			continue
@@ -141,33 +138,26 @@ func extractDescription(path string) (string, error) {
 			continue
 		}
 
-		// Thematic break.
 		if isThematicBreak(trimmed) {
 			continue
 		}
 
-		// Heading? Check for embedded description first.
 		if isHeading(trimmed) {
 			if desc := extractHeadingDesc(trimmed); desc != "" {
 				return desc, nil
 			}
-			continue // bare heading, skip
+			continue
 		}
 
-		// Regular line — this is the description.
 		return trimmed, nil
 	}
 	return "", fmt.Errorf("no description found in %s", path)
 }
 
-// isHeading returns true if s looks like an ATX heading (starts with #).
 func isHeading(s string) bool {
 	return len(s) > 0 && s[0] == '#'
 }
 
-// extractHeadingDesc checks whether a heading contains a description
-// separator (" — " or " - ").  If so it returns the part after the
-// separator; otherwise it returns "".
 func extractHeadingDesc(s string) string {
 	for _, sep := range []string{" — ", " - "} {
 		if idx := strings.Index(s, sep); idx > 0 {

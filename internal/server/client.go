@@ -11,8 +11,6 @@ import (
 	"github.com/mintoleda/talos/internal/version"
 )
 
-// ClientConn is an active connection to a talos server. It exposes methods
-// that the TUI model calls when the user submits input or interrupts.
 type ClientConn struct {
 	enc *json.Encoder
 	dec *json.Decoder

@@ -14,7 +14,6 @@ import (
 	"github.com/mintoleda/talos/internal/provider"
 )
 
-// Client implements provider.Provider for Anthropic's native Messages API.
 type Client struct {
 	baseURL string
 	apiKey  string
