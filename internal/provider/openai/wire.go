@@ -8,6 +8,7 @@ type chatRequest struct {
 	StreamOptions   *streamOpts   `json:"stream_options,omitempty"`
 	Messages        []chatMessage `json:"messages"`
 	Tools           []chatTool    `json:"tools,omitempty"`
+	MaxTokens       int           `json:"max_tokens,omitempty"`
 	ReasoningEffort *string       `json:"reasoning_effort,omitempty"`
 }
 

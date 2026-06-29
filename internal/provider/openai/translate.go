@@ -88,12 +88,15 @@ func buildBody(req protocol.Request) ([]byte, error) {
 	}
 
 	effort := provider.MapThinkingToOpenAIEffort(req.ThinkingLevel)
+	// Set a generous max_tokens; many providers require it for streaming.
+	maxTok := 32768
 	cr := chatRequest{
 		Model:           req.Model,
 		Stream:          true,
 		StreamOptions:   &streamOpts{IncludeUsage: true},
 		Messages:        msgs,
 		Tools:           tools,
+		MaxTokens:       maxTok,
 		ReasoningEffort: strPtrOrNil(effort),
 	}
 	return json.Marshal(cr)
@@ -137,8 +140,6 @@ func joinText(parts []string) string {
 	return strings.Join(parts, "\n")
 }
 
-// strPtrOrNil returns a pointer to s if s is non-empty, nil otherwise.
-// Used for optional JSON fields like reasoning_effort.
 func strPtrOrNil(s string) *string {
 	if s == "" {
 		return nil
