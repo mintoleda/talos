@@ -28,8 +28,12 @@ type Config struct {
 	SystemPrompt   string
 	BaseDir        string
 	ThinkingLevel  string
-	SearchURL      string // custom search endpoint (empty = DuckDuckGo HTML)
-	MaxAgentDepth  int    // max subagent nesting depth (0 = default 3)
+	SearchURL                 string  // custom search endpoint (empty = DuckDuckGo HTML)
+	MaxAgentDepth             int     // max subagent nesting depth (0 = default 3)
+	CompactThreshold          float64 // normal compaction fires at this fraction (0 = default 0.85)
+	CompactEmergencyThreshold float64 // emergency: compact regardless of chunk size (0 = default 0.95)
+	CompactChunkSize          int     // messages per compaction chunk (0 = default 20)
+	SummaryModel              string  // model for compaction summaries (empty = deterministic placeholder)
 }
 
 func Load() (*Config, error) {
@@ -47,7 +51,10 @@ func Load() (*Config, error) {
 		BashMaxOutput:  30 * 1024,
 		SystemPrompt:   strings.TrimSpace(corePrompt),
 		BaseDir:        filepath.Join(home, ".talos"),
-		ThinkingLevel:  "off",
+		ThinkingLevel:             "off",
+		CompactThreshold:          0.85,
+		CompactEmergencyThreshold: 0.95,
+		CompactChunkSize:          20,
 	}
 
 	// Resolution order (lowest to highest precedence):
@@ -125,6 +132,11 @@ type fileConfig struct {
 	MaxAgentDepth         int    `toml:"max_agent_depth"`
 	// Deprecated: use thinking_level. Kept for backward compat.
 	ThinkingBudget int `toml:"thinking_budget"`
+	// Compaction controls.
+	CompactThreshold          float64 `toml:"compact_threshold"`   // 0 = use default (0.85)
+	CompactEmergencyThreshold float64 `toml:"compact_emergency"`   // 0 = use default (0.95)
+	CompactChunkSize          int     `toml:"compact_chunk_size"`  // 0 = use default (20)
+	SummaryModel              string  `toml:"summary_model"`       // empty = deterministic placeholder
 }
 
 func loadFile(path string, cfg *Config) error {
@@ -178,6 +190,18 @@ func loadFile(path string, cfg *Config) error {
 	}
 	if fc.MaxAgentDepth > 0 {
 		cfg.MaxAgentDepth = fc.MaxAgentDepth
+	}
+	if fc.CompactThreshold > 0 {
+		cfg.CompactThreshold = fc.CompactThreshold
+	}
+	if fc.CompactEmergencyThreshold > 0 {
+		cfg.CompactEmergencyThreshold = fc.CompactEmergencyThreshold
+	}
+	if fc.CompactChunkSize > 0 {
+		cfg.CompactChunkSize = fc.CompactChunkSize
+	}
+	if fc.SummaryModel != "" {
+		cfg.SummaryModel = fc.SummaryModel
 	}
 	return nil
 }

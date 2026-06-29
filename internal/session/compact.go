@@ -38,6 +38,18 @@ func (f SummarizerFunc) WithFocus(focus string) Summarizer {
 	})
 }
 
+// DropSummarizer replaces the oldest conversation chunk with a constant
+// placeholder text. The placeholder is byte-identical across all compactions,
+// so the post-compaction prefix is cacheable — same remaining messages after
+// the same boundary produce the same prefix hash. Zero cost, zero API calls.
+type DropSummarizer struct{}
+
+func (DropSummarizer) Summarize(_ context.Context, _ []protocol.Message) (string, error) {
+	return "[Earlier conversation has been summarized to stay within context limits.]", nil
+}
+
+func (d DropSummarizer) WithFocus(_ string) Summarizer { return d }
+
 // LLMSummarizer uses a provider to summarize a chunk of conversation history.
 // It emits no events and blocks until the summary is returned.
 type LLMSummarizer struct {
@@ -102,17 +114,51 @@ func (s *LLMSummarizer) Summarize(ctx context.Context, msgs []protocol.Message) 
 // Compactor decides when and how to compact the oldest chunk of Zone B into a
 // stable summary prefix.
 type Compactor struct {
-	Summarizer Summarizer
-	ChunkSize  int
-	Threshold  float64
+	Summarizer         Summarizer
+	ChunkSize          int
+	Threshold          float64
+	EmergencyThreshold float64 // above this, compact regardless of chunk size
 }
 
 // NewCompactor creates a compactor with sensible defaults.
 func NewCompactor(s Summarizer) *Compactor {
 	return &Compactor{
-		Summarizer: s,
-		ChunkSize:  20,
-		Threshold:  0.85,
+		Summarizer:         s,
+		ChunkSize:          20,
+		Threshold:          0.85,
+		EmergencyThreshold: 0.95,
+	}
+}
+
+// Clamp snaps compaction thresholds and chunk size to valid ranges.
+// Callers that set custom values after NewCompactor should call this afterward.
+func (c *Compactor) Clamp() {
+	if c.Threshold == 0 {
+		c.Threshold = 0.85
+	}
+	if c.Threshold < 0.1 {
+		c.Threshold = 0.1
+	}
+	if c.Threshold > 1.0 {
+		c.Threshold = 1.0
+	}
+	if c.EmergencyThreshold == 0 {
+		c.EmergencyThreshold = 0.95
+	}
+	if c.EmergencyThreshold < c.Threshold {
+		c.EmergencyThreshold = c.Threshold
+	}
+	if c.EmergencyThreshold > 1.0 {
+		c.EmergencyThreshold = 1.0
+	}
+	if c.ChunkSize == 0 {
+		c.ChunkSize = 20
+	}
+	if c.ChunkSize < 5 {
+		c.ChunkSize = 5
+	}
+	if c.ChunkSize > 500 {
+		c.ChunkSize = 500
 	}
 }
 
@@ -237,6 +283,9 @@ func (c *Compactor) compactChunk(ctx context.Context, tx *Transcript, chunk []pr
 // It mutates the transcript in place: the chunk is removed from the in-memory
 // frozen list and a summary message is prepended to the prefix. A compaction
 // record is appended to the JSONL.
+//
+// When usage exceeds EmergencyThreshold, the ChunkSize guard is bypassed so
+// even short-but-dense conversations can be compacted to free headroom.
 func (c *Compactor) MaybeCompact(ctx context.Context, tx *Transcript, promptTokens, ctxLimit int) (bool, error) {
 	if c.Threshold == 0 {
 		c.Threshold = 0.85
@@ -248,7 +297,13 @@ func (c *Compactor) MaybeCompact(ctx context.Context, tx *Transcript, promptToke
 		return false, nil
 	}
 	frozen := tx.Frozen()
-	if len(frozen) <= c.ChunkSize {
+
+	// Emergency: above EmergencyThreshold, compact whatever we can even if
+	// the session is shorter than ChunkSize (e.g. few messages but enormous
+	// tool outputs consumed the context).
+	emergency := c.EmergencyThreshold > 0 && float64(promptTokens)/float64(ctxLimit) >= c.EmergencyThreshold
+
+	if !emergency && len(frozen) <= c.ChunkSize {
 		return false, nil
 	}
 	chunk := c.alignedChunk(frozen)
