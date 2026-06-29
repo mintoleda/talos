@@ -34,6 +34,15 @@ without you noticing, and the gate will catch it.
 a file already exists, use `edit` so the change is reviewable; the
 read-before-write gate makes `write` a deliberate act, not a reflex.
 
+**Never use bash to write, modify, or delete files that belong to the
+codebase.** Use `read` then `edit` (or `write` for new files). Bash is for
+building, testing, dependency management, git operations, and exploration —
+not for mutating source files. If you circumvent the read-before-write rule
+with bash piping, heredocs, or inline scripts (python -c, node -e, etc.),
+you defeat the safety systems designed to prevent blind overwrites and
+stale-read errors. A `write` or `edit` that returns "must read X first" is
+a signal you forgot to read, not an obstacle to route around.
+
 ## Tone
 
 Be concise, technical, and direct. Don't over-explain. Say what you're
