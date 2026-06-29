@@ -40,6 +40,7 @@ func normalizeMarkdown(s string) string {
 func (l *Loop) streamWithRetry(ctx context.Context, req protocol.Request, emit protocol.EmitFunc) (protocol.Message, protocol.Usage, error) {
 	const maxAttempts = 3
 	delay := time.Second
+	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
@@ -48,7 +49,7 @@ func (l *Loop) streamWithRetry(ctx context.Context, req protocol.Request, emit p
 			case <-time.After(delay):
 			}
 			delay *= 2
-			emit(protocol.Notice{Level: "warn", Text: fmt.Sprintf("provider error — retrying (attempt %d/%d)…", attempt+1, maxAttempts)})
+			emit(protocol.Notice{Level: "warn", Text: fmt.Sprintf("provider error — retrying (attempt %d/%d): %v", attempt+1, maxAttempts, lastErr)})
 		}
 		var textEmitted bool
 		wrapped := func(ev protocol.Event) {
@@ -61,11 +62,12 @@ func (l *Loop) streamWithRetry(ctx context.Context, req protocol.Request, emit p
 		if err == nil {
 			return msg, usage, nil
 		}
+		lastErr = err
 		if ctx.Err() != nil || textEmitted {
 			return protocol.Message{}, usage, err
 		}
 	}
-	return protocol.Message{}, protocol.Usage{}, fmt.Errorf("provider failed after %d attempts", maxAttempts)
+	return protocol.Message{}, protocol.Usage{}, fmt.Errorf("provider failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
 func (l *Loop) streamAndAssemble(ctx context.Context, req protocol.Request, emit protocol.EmitFunc) (protocol.Message, protocol.Usage, error) {
