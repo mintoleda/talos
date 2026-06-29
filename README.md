@@ -96,7 +96,7 @@ the status bar update automatically.
 
 ```
 /model                           # list available models
-/model deepseek/deepseek-v4-flash # switch directly
+/model opencode-go/deepseek-v4-flash # switch directly
 /thinking                        # cycle thinking level
 ```
 
@@ -118,7 +118,6 @@ the status bar update automatically.
 
 - [docs/architecture.md](docs/architecture.md) — package map and component seams
 - [docs/configuration.md](docs/configuration.md) — full config reference
-- `AGENTS.md` — per-project system prompt
 - `~/.talos/SYSTEM_PROMPT.md` — global system prompt overrides
 - `~/.talos/subagents/` — define custom subagents as markdown files
 

@@ -479,17 +479,20 @@ func newProvider(cfg *config.Config, noTools bool) (provider.Provider, *session.
 	default:
 		// For all OpenAI-compatible providers, look up the canonical base URL
 		// from the known-provider registry so switchProvider works correctly
-		// after a model picker selection.
-		base := cleanBaseURL(cfg.BaseURL)
-		if base == "" {
-			aliases := map[string]string{"go": "opencode-go", "zen": "opencode-zen", "opencode": "opencode-zen"}
-			name := cfg.Provider
-			if a, ok := aliases[name]; ok {
-				name = a
-			}
-			if kp, ok := provider.ByName(name); ok {
-				base = kp.BaseURL
-			}
+		// after a model picker selection. Always check known providers first,
+		// and only fall back to cfg.BaseURL for custom/unknown providers —
+		// the default "https://api.deepseek.com" should not override a known
+		// provider's endpoint.
+		aliases := map[string]string{"go": "opencode-go", "zen": "opencode-zen", "opencode": "opencode-zen"}
+		name := cfg.Provider
+		if a, ok := aliases[name]; ok {
+			name = a
+		}
+		base := ""
+		if kp, ok := provider.ByName(name); ok {
+			base = kp.BaseURL
+		} else {
+			base = cleanBaseURL(cfg.BaseURL)
 		}
 		prov = openai.New(base, cfg.APIKey)
 	}
