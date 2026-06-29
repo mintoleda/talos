@@ -15,6 +15,79 @@ import (
 	"github.com/mintoleda/talos/internal/tui/dialogs"
 )
 
+// StartEngine launches the goroutines that drive a loop and returns the
+// channels needed to wire them into a TUI model Config.
+func StartEngine(ctx context.Context, lp *loop.Loop, cp *safety.Checkpointer) (
+	inputCh chan<- []protocol.ContentBlock,
+	steerQueue *SteerQueue,
+	interruptCh chan<- struct{},
+	compactCh chan<- string,
+	eventCh <-chan protocol.Event,
+) {
+	evCh := make(chan protocol.Event, 64)
+	inCh := make(chan []protocol.ContentBlock, 1)
+	sq := &SteerQueue{}
+	lp.SteerFunc = sq.Drain
+	intCh := make(chan struct{}, 1)
+	cmpCh := make(chan string, 1)
+	emit := func(e protocol.Event) { evCh <- e }
+
+	go func() {
+		for blocks := range inCh {
+			if cp != nil {
+				_, _ = cp.Snapshot("before-run")
+			}
+			turnCtx, cancel := context.WithCancel(ctx)
+			go func() {
+				select {
+				case <-intCh:
+					cancel()
+				case <-turnCtx.Done():
+				}
+			}()
+			if err := lp.RunTurn(turnCtx, blocks, emit); err != nil {
+				if errors.Is(err, context.Canceled) {
+					emit(protocol.Notice{Level: "warn", Text: "interrupted"})
+				} else {
+					emit(protocol.Notice{Level: "error", Text: err.Error()})
+				}
+				emit(protocol.TurnEnded{})
+			}
+			cancel()
+		}
+	}()
+
+	go func() {
+		for focus := range cmpCh {
+			compactCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+			summary, err := lp.CompactNow(compactCtx, focus)
+			cancel()
+			if err != nil {
+				emit(protocol.Notice{Level: "error", Text: fmt.Sprintf("/compact failed: %v", err)})
+			} else if summary == "" {
+				emit(protocol.Notice{Level: "info", Text: "nothing to compact"})
+			} else {
+				emit(protocol.Notice{Level: "info", Text: fmt.Sprintf("compacted oldest chunk - summary: %s", summary)})
+			}
+		}
+	}()
+
+	return inCh, sq, intCh, cmpCh, evCh
+}
+
+// RunTabs starts the TUI in multi-tab mode. initial is the fully-wired Config
+// for the first tab (with InputCh, InterruptCh, CompactCh set). initialEventCh
+// is the event channel returned by StartEngine for that tab. newTab is the
+// factory used to spawn additional tabs on ctrl+n.
+func RunTabs(ctx context.Context, initial Config, initialEventCh <-chan protocol.Event, newTab NewTabFunc) error {
+	m := NewTabsModel(ctx, initial, initialEventCh, newTab)
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	if _, err := p.Run(); err != nil {
+		return fmt.Errorf("tui: %w", err)
+	}
+	return nil
+}
+
 // Run starts the TUI for single-agent mode. It bridges the loop to Bubble Tea
 // via channels, running the engine in a background goroutine.
 func Run(
@@ -41,6 +114,8 @@ func Run(
 ) error {
 	eventCh := make(chan protocol.Event, 64)
 	inputCh := make(chan []protocol.ContentBlock, 1)
+	steerQueue := &SteerQueue{}
+	lp.SteerFunc = steerQueue.Drain
 	interruptCh := make(chan struct{}, 1)
 	compactCh := make(chan string, 1)
 
@@ -71,6 +146,7 @@ func Run(
 		SessionID:     sessionID,
 		Mode:          ModeSingleAgent,
 		InputCh:       inputCh,
+		SteerQueue:    steerQueue,
 		InterruptCh:   interruptCh,
 		CompactCh:     compactCh,
 		NewSession:    newSession,

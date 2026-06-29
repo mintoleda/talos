@@ -7,12 +7,18 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/mintoleda/talos/internal/agents"
 	"github.com/mintoleda/talos/internal/config"
+	"github.com/mintoleda/talos/internal/executor"
 	"github.com/mintoleda/talos/internal/loop"
 	"github.com/mintoleda/talos/internal/models"
+	"github.com/mintoleda/talos/internal/pricing"
+	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/provider"
 	"github.com/mintoleda/talos/internal/provider/openai"
+	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
+	"github.com/mintoleda/talos/internal/tui"
 	"github.com/mintoleda/talos/internal/tui/dialogs"
 )
 
@@ -21,11 +27,14 @@ import (
 // modelCache — which fetchModels writes and switchProvider/saveLogin clear —
 // has an explicit owner rather than being a local captured by several closures.
 type app struct {
-	cfg     *config.Config
-	lp      *loop.Loop
-	pb      *loop.PromptBuilder
-	cwd     string
-	noTools bool
+	cfg          *config.Config
+	lp           *loop.Loop
+	pb           *loop.PromptBuilder
+	prov         provider.Provider  // current provider; updated by switchProvider
+	exec         executor.Executor  // shared executor (thread-safe ReadSet)
+	agentBuilder *agents.Builder    // nil when noTools or no agents loaded
+	cwd          string
+	noTools      bool
 
 	// modelCache holds the last-fetched model list for the active provider.
 	// Cleared whenever the provider switches or a login is added so stale
@@ -63,9 +72,10 @@ func (a *app) resumeSession(id string) (*session.Transcript, string, error) {
 	return tx, sess.ID, nil
 }
 
-// switchProvider creates a new provider client, re-creates the compactor, and
-// swaps them on the loop. Used by the /provider and /model commands.
-func (a *app) switchProvider(pName, pModel string) error {
+// switchProviderFor creates a new provider client, re-creates the compactor,
+// and swaps them on the given loop. Also updates a.prov so new tabs pick up
+// the change. Used by the /provider and /model commands.
+func (a *app) switchProviderFor(lp *loop.Loop, pName, pModel string) error {
 	oldProv := a.cfg.Provider
 	oldModel := a.cfg.Model
 
@@ -84,9 +94,10 @@ func (a *app) switchProvider(pName, pModel string) error {
 		a.cfg.Model = oldModel
 		return err
 	}
-	a.lp.SetProvider(prov)
-	a.lp.SetCompactor(comp)
+	lp.SetProvider(prov)
+	lp.SetCompactor(comp)
 	a.pb.SetModel(a.cfg.Model)
+	a.prov = prov   // update so new tabs created after this switch use the right provider
 	a.modelCache = nil // clear so next picker open re-fetches for the new provider
 
 	// Persist the choice so it survives restarts.
@@ -94,6 +105,126 @@ func (a *app) switchProvider(pName, pModel string) error {
 		fmt.Fprintf(os.Stderr, "[warning] save provider/model: %v\n", err)
 	}
 	return nil
+}
+
+// switchProvider updates the main loop (tab 1). Delegates to switchProviderFor.
+func (a *app) switchProvider(pName, pModel string) error {
+	return a.switchProviderFor(a.lp, pName, pModel)
+}
+
+// makeNewTabFn returns the factory used by TabsModel to spawn new agent tabs.
+// Each new tab gets its own loop and session; they share the executor and
+// prompt builder with the primary tab (thinking level is therefore global).
+func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices *pricing.Table) tui.NewTabFunc {
+	return func(tabCtx context.Context, tabID int) (tui.Config, <-chan protocol.Event, error) {
+		ntx, id, err := a.newSession()
+		if err != nil {
+			return tui.Config{}, nil, fmt.Errorf("new tab session: %w", err)
+		}
+
+		newLp := loop.New(a.prov, a.exec, ntx, a.pb)
+		var sum session.Summarizer = session.DropSummarizer{}
+		if a.cfg.SummaryModel != "" {
+			sum = session.NewLLMSummarizer(a.prov, a.cfg.SummaryModel, "")
+		}
+		comp := session.NewCompactor(sum)
+		if a.cfg.CompactThreshold > 0 {
+			comp.Threshold = a.cfg.CompactThreshold
+		}
+		if a.cfg.CompactEmergencyThreshold > 0 {
+			comp.EmergencyThreshold = a.cfg.CompactEmergencyThreshold
+		}
+		if a.cfg.CompactChunkSize > 0 {
+			comp.ChunkSize = a.cfg.CompactChunkSize
+		}
+		comp.Clamp()
+		newLp.SetCompactor(comp)
+
+		inCh, steerQueue, intCh, cmpCh, evCh := tui.StartEngine(tabCtx, newLp, cp)
+
+		cfg := tui.Config{
+			SessionID:   id,
+			Mode:        tui.ModeSingleAgent,
+			InputCh:     inCh,
+			SteerQueue:  steerQueue,
+			InterruptCh: intCh,
+			CompactCh:   cmpCh,
+			Provider:    a.cfg.Provider,
+			Model:       a.cfg.Model,
+			Pricing:     prices,
+			NewSession: func() (string, error) {
+				ntx2, id2, err := a.newSession()
+				if err != nil {
+					return "", err
+				}
+				newLp.SetTranscript(ntx2)
+				fmt.Fprintf(os.Stderr, "[started new session %s]\n", id2)
+				return id2, nil
+			},
+			Stats: func() string {
+				s := newLp.Stats()
+				if s.Calls == 0 {
+					return "[stats] no API calls yet"
+				}
+				return fmt.Sprintf("[stats] calls=%d | input=%d | output=%d | cached=%d (%.1f%%)",
+					s.Calls, s.InputTokens, s.OutputTokens, s.CachedTokens, s.CacheHitRate()*100)
+			},
+			ResumeSession: func(sessID string) (string, []protocol.FrozenMessage, error) {
+				tx, sid, err := a.resumeSession(sessID)
+				if err != nil {
+					return "", nil, err
+				}
+				newLp.SetTranscript(tx)
+				fmt.Fprintf(os.Stderr, "[resumed session %s]\n", sid)
+				return sid, tx.Frozen(), nil
+			},
+			SwitchProvider: func(pName, pModel string) error {
+				return a.switchProviderFor(newLp, pName, pModel)
+			},
+			CycleThinking: func() string {
+				caps := provider.SupportedLevels(a.pb.Model())
+				cur := a.pb.ThinkingLevel()
+				if cur == "" {
+					cur = caps[0]
+				}
+				for i, l := range caps {
+					if l == cur {
+						next := caps[(i+1)%len(caps)]
+						a.pb.SetThinkingLevel(next)
+						if err := config.SaveThinkingLevel(a.cfg.BaseDir, next); err != nil {
+							fmt.Fprintf(os.Stderr, "[warning] save thinking level: %v\n", err)
+						}
+						return next
+					}
+				}
+				a.pb.SetThinkingLevel(caps[0])
+				_ = config.SaveThinkingLevel(a.cfg.BaseDir, caps[0])
+				return caps[0]
+			},
+			CurrentThinkingLevel: func() string { return a.pb.ThinkingLevel() },
+			DeleteSession:        func(id string) error { return session.DeleteSession(a.cwd, id) },
+			FetchSessions:        a.fetchSessions,
+			FetchModels:          a.fetchModels,
+			LoginProviders:       a.loginProviders,
+			SaveLogin:            a.saveLogin,
+			CancelSubagent: func(id string) {
+				if a.agentBuilder != nil {
+					a.agentBuilder.CancelSubagent(id)
+				}
+			},
+			StatsSnapshot: func() (int, int, int, float64) {
+				s := newLp.Stats()
+				cm := s.InputTokens - s.CachedTokens
+				c := 0.0
+				if prices != nil && a.cfg.Model != "" {
+					c = prices.Cost(a.cfg.Model, s.InputTokens, s.OutputTokens)
+				}
+				return s.InputTokens, s.OutputTokens, cm, c
+			},
+		}
+
+		return cfg, evCh, nil
+	}
 }
 
 // fetchModels queries all logged-in providers concurrently and returns a

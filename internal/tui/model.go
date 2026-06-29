@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -86,6 +87,10 @@ type Config struct {
 	SessionID   string
 	Mode        Mode
 	InputCh     chan<- []protocol.ContentBlock
+	// SteerQueue is a thread-safe queue shared with the Loop for steer
+	// messages (typed while busy). The TUI enqueues on Enter and withdraws
+	// on up-arrow; the Loop drains before each LLM call. Nil disables steer.
+	SteerQueue *SteerQueue
 	// SubmitFn, if set, is called with the raw user text on every input
 	// submission (after slash-command handling). Used by attach mode to
 	// forward input to a remote server instead of a local loop.
@@ -151,6 +156,52 @@ type Config struct {
 	// StatsSnapshot returns the current cumulative stats from the loop.
 	// Used by /resume to refresh the TUI counters after switching transcripts.
 	StatsSnapshot func() (input, output, cacheMiss int, cost float64)
+}
+
+// SteerQueue is a thread-safe queue of pending steer messages shared between
+// the TUI and the Loop. The TUI enqueues on Enter-while-busy and withdraws on
+// up-arrow; the Loop drains before each LLM call.
+type SteerQueue struct {
+	mu       sync.Mutex
+	Messages [][]protocol.ContentBlock
+}
+
+// Enqueue appends a steer message. Called from the TUI goroutine.
+func (q *SteerQueue) Enqueue(blocks []protocol.ContentBlock) {
+	q.mu.Lock()
+	q.Messages = append(q.Messages, blocks)
+	q.mu.Unlock()
+}
+
+// Drain returns all pending messages and clears the queue. Called from the
+// loop goroutine. Returns nil if the queue is empty.
+func (q *SteerQueue) Drain() [][]protocol.ContentBlock {
+	q.mu.Lock()
+	msgs := q.Messages
+	q.Messages = nil
+	q.mu.Unlock()
+	return msgs
+}
+
+// Withdraw removes and returns the last pending message, or nil if empty.
+// Called from the TUI goroutine (up-arrow withdrawal).
+func (q *SteerQueue) Withdraw() []protocol.ContentBlock {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := len(q.Messages)
+	if n == 0 {
+		return nil
+	}
+	last := q.Messages[n-1]
+	q.Messages = q.Messages[:n-1]
+	return last
+}
+
+// Len returns the number of pending steer messages. Called from TUI.
+func (q *SteerQueue) Len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.Messages)
 }
 
 // StatsSnapshot returns the current cumulative stats from the loop.
@@ -477,10 +528,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "ctrl+t":
-			if !m.busy && m.cfg.CycleThinking != nil {
-				newLevel := m.cfg.CycleThinking()
-				m.thinkingLevel = newLevel
-				m.chat = m.chat.AppendNotice("info", "thinking level: "+newLevel)
+			if !m.busy {
+				if m.cfg.CycleThinking != nil {
+					newLevel := m.cfg.CycleThinking()
+					m.thinkingLevel = newLevel
+					m.chat = m.chat.AppendNotice("info", "thinking level: "+newLevel)
+				} else if m.cfg.SubmitSlash != nil {
+					m.cfg.SubmitSlash("/thinking")
+				}
 			}
 			return m, nil
 		case "tab":
@@ -508,6 +563,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.busy && m.focusPane == focusSubagents && m.subagents.Count() > 0 {
 				m.subagents = m.subagents.ToggleExpand()
+				return m, nil
+			}
+			if m.busy {
+				// While busy, Enter queues as a "steer" message — it gets
+				// injected after the current tool calls finish but before the
+				// next LLM streaming call (like pi's steer mechanism).
+				// Pending steers are withdrawable via up-arrow (they pop back
+				// into the input bar so you can edit or discard them).
+				text := m.input.Value()
+				if text != "" && m.cfg.SteerQueue != nil {
+					blocks, _ := resolveInput(text)
+					m.chat = m.chat.AppendUserBlocks(blocks)
+					m.cfg.SteerQueue.Enqueue(blocks)
+					m.input.Reset()
+					m.slashCompletions = nil
+					m.slashSelected = -1
+					m.relayout()
+				}
 				return m, nil
 			}
 			if !m.busy {
@@ -572,6 +645,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if m.busy {
+				// If there are pending steer messages, up-arrow withdraws
+				// the most recent one back into the input bar for editing.
+				if m.cfg.SteerQueue != nil {
+					if last := m.cfg.SteerQueue.Withdraw(); last != nil {
+						// Remove the chat entry so the user sees it's gone.
+						m.chat = m.chat.PopLastSegment()
+						// Put the text back in the input bar for editing.
+						var parts []string
+						for _, b := range last {
+							if b.Type == protocol.BlockText && b.Text != "" {
+								parts = append(parts, b.Text)
+							}
+						}
+						text := strings.Join(parts, " ")
+						m.input.SetValue(text)
+						m.input.SetCursor(len(text))
+						m.escClearConfirm = false
+						return m, nil
+					}
+				}
+				// No pending steer — scroll behavior as before.
 				switch {
 				case m.focusPane == focusTools && m.tools.Count() > 0:
 					m.tools = m.tools.CursorUp()
@@ -725,6 +819,17 @@ func (m *Model) replayTranscript(msgs []protocol.FrozenMessage) {
 		switch msg.Role {
 		case protocol.RoleUser:
 			m.chat = m.chat.AppendUserBlocks(msg.Content)
+			// Seed input history so the up-arrow in attach mode (and
+			// continue/resume) cycles through past user messages.
+			var textParts []string
+			for _, b := range msg.Content {
+				if b.Type == protocol.BlockText && b.Text != "" {
+					textParts = append(textParts, b.Text)
+				}
+			}
+			if len(textParts) > 0 {
+				m.inputHistory = append(m.inputHistory, strings.Join(textParts, " "))
+			}
 		case protocol.RoleAssistant:
 			var parts []string
 			for _, b := range msg.Content {
@@ -1043,6 +1148,14 @@ func (m Model) renderCompletions() string {
 func (m Model) handleEvent(e protocol.Event) Model {
 	switch ev := e.(type) {
 	case protocol.UserInput:
+		// In attach mode (SubmitFn set), the enter handler already appended
+		// non-slash messages locally for instant feedback. The server echoes
+		// them back as UserInput — skip the duplicate. Slash commands *are*
+		// needed here because they're forwarded via SubmitSlash and the local
+		// handler doesn't append them (they'd never appear otherwise).
+		if m.cfg.SubmitFn != nil && !strings.HasPrefix(ev.Text, "/") {
+			break
+		}
 		m.chat = m.chat.AppendUserBlocks(protocol.TextBlocks(ev.Text))
 	case protocol.ModelChanged:
 		m.cfg.Provider = ev.Provider

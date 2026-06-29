@@ -25,6 +25,11 @@ type segment struct {
 	after            string
 	renderAsMarkdown bool // if true, text is rendered through the markdown renderer
 
+	// Rendered markdown cache. Pre-computed when the segment is created
+	// and invalidated only on pane resize (mdCacheVersion mismatch).
+	renderedMarkdown string
+	mdVersion        int
+
 	// Tool-call segments are rendered lazily in body() so they reflow to the
 	// current pane width (a pre-styled string could not).
 	isTool   bool
@@ -44,6 +49,8 @@ type ChatModel struct {
 	height      int
 	md          *markdown.Renderer
 	autoscroll  bool // pin viewport to bottom unless user has scrolled up
+	dirty       bool // viewport content needs recomputation (body() + SetContent)
+	mdCacheVersion int // incremented on SetSize; invalidates per-segment markdown cache
 }
 
 func NewChat() ChatModel {
@@ -52,11 +59,13 @@ func NewChat() ChatModel {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	return ChatModel{
-		vp:          vp,
-		md:          markdown.New(80),
-		sp:          sp,
-		activeTools: make(map[string]string),
-		autoscroll:  true,
+		vp:             vp,
+		md:             markdown.New(80),
+		sp:             sp,
+		activeTools:    make(map[string]string),
+		autoscroll:     true,
+		dirty:          true, // first frame needs to set content
+		mdCacheVersion: 1,
 	}
 }
 
@@ -71,6 +80,9 @@ func (c ChatModel) Update(msg tea.Msg) (ChatModel, tea.Cmd) {
 		var spCmd tea.Cmd
 		c.sp, spCmd = c.sp.Update(msg)
 		cmds = append(cmds, spCmd)
+		// Spinner animation updates every tick; the viewport content must be
+		// re-rendered to show the new spinner frame.
+		c.dirty = true
 	}
 	return c, tea.Batch(cmds...)
 }
@@ -80,10 +92,10 @@ func (c *ChatModel) SetSize(w, h int) {
 	c.vp.Width = w
 	c.vp.Height = h
 	c.md.SetWidth(w)
-	c.vp.SetContent(c.body())
-	if c.autoscroll {
-		c.vp.GotoBottom()
-	}
+	// Invalidate all per-segment markdown caches so body() re-renders at
+	// the new width. View() will call body() once, not on every frame.
+	c.mdCacheVersion++
+	c.dirty = true
 }
 
 func (c ChatModel) Width() int  { return c.width }
@@ -103,24 +115,38 @@ func (c ChatModel) wrapText(s string) string {
 
 // body renders the full transcript (finalized segments plus any in-progress
 // streaming response) wrapped to the current width.
+//
+// Markdown segments are pre-rendered through glamour at creation time; body()
+// reuses the cached output. The cache is invalidated only when SetSize changes
+// the pane width (via mdCacheVersion). This avoids repeated glamour parse/
+// render passes — the primary source of CPU usage during streaming.
 func (c ChatModel) body() string {
 	var b strings.Builder
-	for _, s := range c.segments {
+	for i := range c.segments {
+		s := &c.segments[i]
 		b.WriteString(s.before)
 		switch {
 		case s.isTool:
-			b.WriteString(c.renderToolLine(s))
+			b.WriteString(c.renderToolLine(*s))
 		case s.renderAsMarkdown:
-			// Markdown segments use glamour's full styling (syntax highlighting,
-			// bold, headings, etc.) so we don't apply the segment's lipgloss style.
-			b.WriteString(c.md.Render(s.text))
+			if s.renderedMarkdown != "" && s.mdVersion == c.mdCacheVersion {
+				// Cache hit — skip the expensive glamour render.
+				b.WriteString(s.renderedMarkdown)
+			} else {
+				// Cache miss (width changed or segment was created
+				// without pre-render). Render now and cache for next time.
+				rendered := c.md.Render(s.text)
+				s.renderedMarkdown = rendered
+				s.mdVersion = c.mdCacheVersion
+				b.WriteString(rendered)
+			}
 		default:
 			b.WriteString(s.style.Render(c.wrapText(s.text)))
 		}
 		b.WriteString(s.after)
 	}
 	if c.streaming != "" {
-		// Streaming assistant response rendered as markdown too.
+		// Streaming text changes on every delta; there is no cache.
 		b.WriteString(c.md.Render(c.streaming))
 	}
 	if len(c.activeTools) > 0 {
@@ -144,20 +170,29 @@ func (c ChatModel) AddActiveTool(id, name string) ChatModel {
 		c.activeTools = make(map[string]string)
 	}
 	c.activeTools[id] = name
+	c.dirty = true
 	return c
 }
 
 func (c ChatModel) RemoveActiveTool(id string) ChatModel {
 	delete(c.activeTools, id)
+	c.dirty = true
 	return c
 }
 
-func (c ChatModel) append(s segment) ChatModel {
-	c.segments = append(c.segments, s)
-	c.vp.SetContent(c.body())
-	if c.autoscroll {
-		c.vp.GotoBottom()
+// markdownSegment pre-renders a segment's text through glamour so body() can
+// use the cached string instead of re-parsing markdown on every frame.
+func (c ChatModel) markdownSegment(s segment) segment {
+	if s.renderAsMarkdown && s.text != "" && s.renderedMarkdown == "" {
+		s.renderedMarkdown = c.md.Render(s.text)
+		s.mdVersion = c.mdCacheVersion
 	}
+	return s
+}
+
+func (c ChatModel) append(s segment) ChatModel {
+	c.segments = append(c.segments, c.markdownSegment(s))
+	c.dirty = true
 	return c
 }
 
@@ -186,6 +221,7 @@ func (c ChatModel) AppendUserBlocks(blocks []protocol.ContentBlock) ChatModel {
 // View() will render it combined with finalized content each frame.
 func (c ChatModel) AppendDelta(text string) ChatModel {
 	c.streaming += text
+	c.dirty = true
 	return c
 }
 
@@ -250,24 +286,37 @@ func (c ChatModel) FlushStreaming() ChatModel {
 	if c.streaming == "" {
 		return c
 	}
-	c.segments = append(c.segments, segment{renderAsMarkdown: true, text: c.streaming, after: "\n"})
+	seg := c.markdownSegment(segment{renderAsMarkdown: true, text: c.streaming, after: "\n"})
+	c.segments = append(c.segments, seg)
 	c.streaming = ""
-	c.vp.SetContent(c.body())
-	if c.autoscroll {
-		c.vp.GotoBottom()
+	c.dirty = true
+	return c
+}
+
+// PopLastSegment removes the most recently added finalized segment from the
+// transcript. Used when a pending steer message is withdrawn (up-arrow) so the
+// chat pane doesn't show a message the agent never saw. Returns the updated
+// model. No-op if there are no segments.
+func (c ChatModel) PopLastSegment() ChatModel {
+	if len(c.segments) == 0 {
+		return c
 	}
+	c.segments = c.segments[:len(c.segments)-1]
+	c.dirty = true
 	return c
 }
 
 func (c ChatModel) FinalizeTurn(usage protocol.Usage) ChatModel {
 	if c.streaming != "" {
-		c.segments = append(c.segments, segment{
+		seg := c.markdownSegment(segment{
 			style:            styles.AssistantStyle,
 			text:             c.streaming,
 			after:            "\n",
 			renderAsMarkdown: true,
 		})
+		c.segments = append(c.segments, seg)
 		c.streaming = ""
+		c.dirty = true
 	}
 	return c
 }
@@ -299,16 +348,26 @@ func (c ChatModel) ScrollBottom() ChatModel {
 }
 
 func (c ChatModel) View() string {
-	if c.autoscroll {
-		// Always re-render and pin to bottom on a local copy — covers streaming,
-		// active tools, and idle state consistently so content never jumps.
-		c.vp.SetContent(c.body())
+	if c.dirty {
+		content := c.body()
+		if c.autoscroll {
+			c.vp.SetContent(content)
+			c.vp.GotoBottom()
+		} else {
+			// User has scrolled up — preserve their scroll position.
+			// Use SetYOffset (which clamps) rather than direct YOffset
+			// assignment, because SetContent may change the line count
+			// (e.g. resize, or streaming text re-rendering at a different
+			// height). An unclamped YOffset produces invalid slice bounds
+			// in visibleLines(), causing visual corruption.
+			savedOffset := c.vp.YOffset
+			c.vp.SetContent(content)
+			c.vp.SetYOffset(savedOffset)
+		}
+		c.dirty = false
+	} else if c.autoscroll {
+		// No content change, but pin to bottom (e.g. after user hit ScrollBottom).
 		c.vp.GotoBottom()
-	} else if c.streaming != "" || len(c.activeTools) > 0 {
-		// User has scrolled up; update content but preserve their scroll position.
-		savedOffset := c.vp.YOffset
-		c.vp.SetContent(c.body())
-		c.vp.YOffset = savedOffset
 	}
 	return c.vp.View()
 }

@@ -43,6 +43,14 @@ type Loop struct {
 	// stops requesting tools or the context is cancelled.
 	MaxIterations int
 
+	// SteerFunc is called after tool execution to drain pending steer messages
+	// queued by the TUI while the agent was busy. Each element is a single
+	// user message ([]ContentBlock for text + optional images). Returning nil
+	// means nothing is pending. Called from the loop goroutine, so it must be
+	// thread-safe. Messages are injected before the next LLM call — the same
+	// pattern as pi's "steer" mechanism.
+	SteerFunc func() [][]protocol.ContentBlock
+
 	stats Stats
 }
 
@@ -207,6 +215,21 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 	// MaxIterations == 0 means unlimited (default). When set, the cap
 	// prevents a model that always requests tool calls from looping forever.
 	for iter := 0; l.MaxIterations == 0 || iter < l.MaxIterations; iter++ {
+		// Check for steering messages submitted while the agent was busy
+		// (e.g. during tool execution or streaming). They are injected
+		// into the transcript before the next LLM call, just like pi's
+		// "steer" mechanism — messages queued during a turn become
+		// additional user context on the next reasoning step.
+		if l.SteerFunc != nil && iter > 0 {
+			if steerMessages := l.SteerFunc(); len(steerMessages) > 0 {
+				for _, blocks := range steerMessages {
+					if err := l.tx.Append(protocol.Message{Role: protocol.RoleUser, Content: blocks}); err != nil {
+						return fmt.Errorf("append steer message: %w", err)
+					}
+				}
+				emit(protocol.Notice{Level: "info", Text: fmt.Sprintf("✎ steer: %d message(s) injected", len(steerMessages))})
+			}
+		}
 		if l.compactor != nil {
 			req := l.promptB.Build(l.tx)
 			tokens := l.promptB.EstimatedTokens(req)

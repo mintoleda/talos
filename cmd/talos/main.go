@@ -320,7 +320,16 @@ func run() error {
 	lp.DebugCache = f.DebugCache
 	defer lp.Close()
 
-	a := &app{cfg: cfg, lp: lp, pb: pb, cwd: cwd, noTools: f.NoTools}
+	a := &app{
+		cfg:          cfg,
+		lp:           lp,
+		pb:           pb,
+		prov:         prov,
+		exec:         exec,
+		agentBuilder: agentBuilder,
+		cwd:          cwd,
+		noTools:      f.NoTools,
+	}
 
 	fmt.Fprintf(os.Stderr, "[session %s] [%s/%s]\n", sess.ID, cfg.Provider, cfg.Model)
 
@@ -334,10 +343,40 @@ func run() error {
 		return lp.RunTurn(context.Background(), protocol.TextBlocks(f.Print), renderTo(os.Stdout, f.DebugCache))
 
 	default:
-		// Default: full-screen TUI.
-		return tui.Run(context.Background(), lp, cp, sess.ID,
-			cfg.Provider, cfg.Model,
-			func() (string, error) {
+		// Full-screen TUI with multi-tab support (ctrl+n to open a new agent tab).
+		tuiCtx := context.Background()
+		inCh, steerQueue, intCh, cmpCh, evCh := tui.StartEngine(tuiCtx, lp, cp)
+
+		ls := lp.Stats()
+		cacheMiss := ls.InputTokens - ls.CachedTokens
+		seedCost := 0.0
+		if prices != nil && cfg.Model != "" {
+			seedCost = prices.Cost(cfg.Model, ls.InputTokens, ls.OutputTokens)
+		}
+
+		initialCfg := tui.Config{
+			SessionID:   sess.ID,
+			Mode:        tui.ModeSingleAgent,
+			InputCh:     inCh,
+			SteerQueue:  steerQueue,
+			InterruptCh: intCh,
+			CompactCh:   cmpCh,
+			Provider:    cfg.Provider,
+			Model:       cfg.Model,
+			Pricing:     prices,
+			SeedStats: struct {
+				InputTokens  int
+				OutputTokens int
+				CacheMiss    int
+				Cost         float64
+			}{
+				InputTokens:  ls.InputTokens,
+				OutputTokens: ls.OutputTokens,
+				CacheMiss:    cacheMiss,
+				Cost:         seedCost,
+			},
+			InitialHistory: tx.Frozen(),
+			NewSession: func() (string, error) {
 				ntx, id, err := a.newSession()
 				if err != nil {
 					return "", err
@@ -346,7 +385,7 @@ func run() error {
 				fmt.Fprintf(os.Stderr, "[started new session %s]\n", id)
 				return id, nil
 			},
-			func() string {
+			Stats: func() string {
 				s := lp.Stats()
 				if s.Calls == 0 {
 					return "[stats] no API calls yet"
@@ -354,17 +393,17 @@ func run() error {
 				return fmt.Sprintf("[stats] calls=%d | input=%d | output=%d | cached=%d (%.1f%%)",
 					s.Calls, s.InputTokens, s.OutputTokens, s.CachedTokens, s.CacheHitRate()*100)
 			},
-			func(id string) (string, []protocol.FrozenMessage, error) {
-				tx, sid, err := a.resumeSession(id)
+			ResumeSession: func(id string) (string, []protocol.FrozenMessage, error) {
+				ntx, sid, err := a.resumeSession(id)
 				if err != nil {
 					return "", nil, err
 				}
-				lp.SetTranscript(tx)
+				lp.SetTranscript(ntx)
 				fmt.Fprintf(os.Stderr, "[resumed session %s]\n", sid)
-				return sid, tx.Frozen(), nil
+				return sid, ntx.Frozen(), nil
 			},
-			a.switchProvider,
-			func() string {
+			SwitchProvider: a.switchProvider,
+			CycleThinking: func() string {
 				caps := provider.SupportedLevels(pb.Model())
 				cur := pb.ThinkingLevel()
 				if cur == "" {
@@ -374,7 +413,6 @@ func run() error {
 					if l == cur {
 						next := caps[(i+1)%len(caps)]
 						pb.SetThinkingLevel(next)
-						// Persist the new level so it survives a restart.
 						if err := config.SaveThinkingLevel(cfg.BaseDir, next); err != nil {
 							fmt.Fprintf(os.Stderr, "[warning] save thinking level: %v\n", err)
 						}
@@ -385,22 +423,29 @@ func run() error {
 				_ = config.SaveThinkingLevel(cfg.BaseDir, caps[0])
 				return caps[0]
 			},
-			func() string { return pb.ThinkingLevel() },
-			func(id string) error {
-				return session.DeleteSession(a.cwd, id)
-			},
-			a.fetchSessions,
-			a.fetchModels,
-			a.loginProviders,
-			a.saveLogin,
-			func(id string) {
+			CurrentThinkingLevel: func() string { return pb.ThinkingLevel() },
+			DeleteSession:        func(id string) error { return session.DeleteSession(a.cwd, id) },
+			FetchSessions:        a.fetchSessions,
+			FetchModels:          a.fetchModels,
+			LoginProviders:       a.loginProviders,
+			SaveLogin:            a.saveLogin,
+			CancelSubagent: func(id string) {
 				if agentBuilder != nil {
 					agentBuilder.CancelSubagent(id)
 				}
 			},
-			prices,
-			tx.Frozen(),
-		)
+			StatsSnapshot: func() (int, int, int, float64) {
+				s := lp.Stats()
+				cm := s.InputTokens - s.CachedTokens
+				c := 0.0
+				if prices != nil && cfg.Model != "" {
+					c = prices.Cost(cfg.Model, s.InputTokens, s.OutputTokens)
+				}
+				return s.InputTokens, s.OutputTokens, cm, c
+			},
+		}
+
+		return tui.RunTabs(tuiCtx, initialCfg, evCh, a.makeNewTabFn(tuiCtx, cp, prices))
 	}
 }
 
@@ -497,7 +542,25 @@ func newProvider(cfg *config.Config, noTools bool) (provider.Provider, *session.
 		prov = openai.New(base, cfg.APIKey)
 	}
 
-	compactor := session.NewCompactor(session.NewLLMSummarizer(prov, cfg.Model, ""))
+	// Build the compactor. By default, use a deterministic, zero-cost
+	// placeholder summarizer that keeps the prefix cacheable after compaction.
+	// When the user sets summary_model in config, an LLM-based summarizer
+	// (using the specified model) replaces it for richer summaries.
+	var sum session.Summarizer = session.DropSummarizer{}
+	if cfg.SummaryModel != "" {
+		sum = session.NewLLMSummarizer(prov, cfg.SummaryModel, "")
+	}
+	compactor := session.NewCompactor(sum)
+	if cfg.CompactThreshold > 0 {
+		compactor.Threshold = cfg.CompactThreshold
+	}
+	if cfg.CompactEmergencyThreshold > 0 {
+		compactor.EmergencyThreshold = cfg.CompactEmergencyThreshold
+	}
+	if cfg.CompactChunkSize > 0 {
+		compactor.ChunkSize = cfg.CompactChunkSize
+	}
+	compactor.Clamp()
 	return prov, compactor, nil
 }
 
@@ -597,9 +660,20 @@ func runAttach(ctx context.Context, cfg *config.Config, sessionID string) error 
 
 	prices := pricing.Load(cfg.BaseDir)
 
+	// Load the existing session transcript so newly-attached clients see
+	// messages and tool calls that happened before they connected.
+	cwd, _ := os.Getwd()
+	sessPath := filepath.Join(session.SessionsDir(), session.ProjectHash(cwd), sessionID+".jsonl")
+	var initialHistory []protocol.FrozenMessage
+	if tx, err := session.Load(sessPath); err == nil {
+		initialHistory = tx.Frozen()
+		_ = tx.Close()
+	}
+
 	m := tui.NewModel(tui.Config{
-		SessionID: sessionID,
-		Mode:      tui.ModeSingleAgent,
+		SessionID:       sessionID,
+		Mode:            tui.ModeSingleAgent,
+		InitialHistory:  initialHistory,
 		SubmitFn: func(text string) {
 			_ = client.Send(text)
 		},
