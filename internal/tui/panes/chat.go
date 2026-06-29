@@ -85,6 +85,15 @@ func (c ChatModel) Update(msg tea.Msg) (ChatModel, tea.Cmd) {
 		// re-rendered to show the new spinner frame.
 		c.dirty = true
 	}
+	// Sync viewport content into the actual model so that scroll operations
+	// (ScrollUp/ScrollDown) see a correctly-populated viewport with real
+	// line counts.  Without this, AtTop/AtBottom always return true because
+	// the viewport's internal lines are empty, turning 1-line scrolls into
+	// no-ops and reducing scroll to a binary autoscroll toggle.
+	if c.dirty {
+		c.syncViewportContent()
+		c.dirty = false
+	}
 	return c, tea.Batch(cmds...)
 }
 
@@ -93,8 +102,8 @@ func (c *ChatModel) SetSize(w, h int) {
 	c.vp.Width = w
 	c.vp.Height = h
 	c.md.SetWidth(w)
-	// Invalidate all per-segment markdown caches so body() re-renders at
-	// the new width. View() will call body() once, not on every frame.
+	// Invalidate the per-segment markdown caches so the next content sync
+	// re-renders at the new width.
 	c.mdCacheVersion++
 	c.dirty = true
 }
@@ -357,7 +366,11 @@ func (c ChatModel) ScrollBottom() ChatModel {
 	return c
 }
 
-func (c *ChatModel) View() string {
+// syncViewportContent recomputes the full transcript and pushes it into the
+// viewport.  When autoscroll is off (user is reading history), the current
+// YOffset is preserved so that new content arriving below does not yank the
+// view.
+func (c *ChatModel) syncViewportContent() {
 	content := c.body()
 	if c.autoscroll {
 		c.vp.SetContent(content)
@@ -366,6 +379,12 @@ func (c *ChatModel) View() string {
 		savedOffset := c.vp.YOffset
 		c.vp.SetContent(content)
 		c.vp.SetYOffset(savedOffset)
+	}
+}
+
+func (c *ChatModel) View() string {
+	if c.autoscroll {
+		c.vp.GotoBottom()
 	}
 	return c.vp.View()
 }
