@@ -12,8 +12,6 @@ import (
 	"github.com/mintoleda/talos/internal/session"
 )
 
-// Stats holds aggregate token usage across all API calls since the session
-// started (or since the last ResetStats).
 type Stats struct {
 	Calls        int
 	InputTokens  int
@@ -21,8 +19,6 @@ type Stats struct {
 	OutputTokens int
 }
 
-// CacheHitRate returns the cache hit ratio as a float between 0 and 1.
-// Returns 0 when there are no input tokens.
 func (s Stats) CacheHitRate() float64 {
 	if s.InputTokens == 0 {
 		return 0
@@ -37,6 +33,8 @@ type Loop struct {
 	promptB    *PromptBuilder
 	compactor  *session.Compactor
 	DebugCache bool
+
+	batchNum int
 
 	// MaxIterations caps how many tool-call round-trips a single turn may
 	// make. 0 (the default) means unlimited — the turn runs until the model
@@ -212,8 +210,6 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 		return fmt.Errorf("append user message: %w", err)
 	}
 
-	// MaxIterations == 0 means unlimited (default). When set, the cap
-	// prevents a model that always requests tool calls from looping forever.
 	for iter := 0; l.MaxIterations == 0 || iter < l.MaxIterations; iter++ {
 		// Check for steering messages submitted while the agent was busy
 		// (e.g. during tool execution or streaming). They are injected
@@ -247,8 +243,6 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 			emit(protocol.Notice{Level: "warn", Text: fmt.Sprintf("context %.0f%% full — consider /new", pct*100)})
 		}
 
-		// Let the UI know the estimated context size before streaming,
-		// so the status bar updates when the context grows across iterations.
 		emit(protocol.PromptEstimate{
 			PromptTokens: l.promptB.EstimatedTokens(req),
 			ContextLimit: l.promptB.ContextLimit(),
@@ -274,15 +268,18 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 			return nil
 		}
 
+		l.batchNum++
+		emit(protocol.BatchStarted{Num: l.batchNum})
+
 		results, err := l.runToolsParallel(ctx, toolUses, emit)
 		if err != nil {
 			return err
 		}
+
+		emit(protocol.BatchFinished{Num: l.batchNum})
 		if err := l.tx.Append(protocol.Message{Role: protocol.RoleTool, Content: results}); err != nil {
 			return fmt.Errorf("append tool results: %w", err)
 		}
-		// Emit updated context estimate right after tool results land, so the
-		// status bar reflects the grown context before the next streaming phase.
 		nextReq := l.promptB.Build(l.tx)
 		emit(protocol.PromptEstimate{
 			PromptTokens: l.promptB.EstimatedTokens(nextReq),
