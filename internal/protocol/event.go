@@ -2,6 +2,9 @@ package protocol
 
 type Event interface{ isEvent() }
 
+type BatchStarted struct{ Num int }
+type BatchFinished struct{ Num int }
+
 type TextDelta struct{ Text string }
 type ToolStarted struct {
 	ID   string
@@ -98,6 +101,8 @@ type ModelChanged struct {
 
 func (UserInput) isEvent()           {}
 func (ModelChanged) isEvent()        {}
+func (BatchStarted) isEvent()        {}
+func (BatchFinished) isEvent()       {}
 func (TextDelta) isEvent()           {}
 func (ToolStarted) isEvent()         {}
 func (ToolFinished) isEvent()        {}

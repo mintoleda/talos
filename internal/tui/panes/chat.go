@@ -357,7 +357,7 @@ func (c ChatModel) ScrollBottom() ChatModel {
 	return c
 }
 
-func (c ChatModel) View() string {
+func (c *ChatModel) View() string {
 	content := c.body()
 	if c.autoscroll {
 		c.vp.SetContent(content)

@@ -1253,12 +1253,12 @@ func (m Model) mainView() string {
 		}
 		sep := lipgloss.NewStyle().Foreground(sepColor).Render(panes.VerticalRule(m.paneH))
 		body = lipgloss.JoinHorizontal(lipgloss.Top,
-			clipHeight(m.chat.View(), m.paneH),
+			clipHeight((&m.chat).View(), m.paneH),
 			sep,
 			clipHeight(m.rightColumn(), m.paneH),
 		)
 	} else {
-		body = m.chat.View()
+		body = (&m.chat).View()
 	}
 	var sections []string
 	sections = append(sections, body)
