@@ -44,8 +44,6 @@ func NewReadSet() *ReadSet {
 	}
 }
 
-// readSetSnapshot is the on-disk JSON shape. Versioned so future schema
-// changes can migrate without silent corruption.
 type readSetSnapshot struct {
 	Version int      `json:"version"`
 	Paths   []string `json:"paths"`
@@ -216,16 +214,45 @@ func (r *ReadSet) Update(path string) error {
 	return nil
 }
 
-// Record is an alias for Update kept for call sites that only care about the
-// read side-effect (not the error from the missing-file case, which is
-// reported by Update and surfaced through the tool's own error path).
 func (r *ReadSet) Record(path string) error {
 	return r.Update(path)
 }
 
-// RecentPaths returns up to n of the most recently read paths, most recent
-// first. The order is the session read order: a re-read moves the path to
-// the end.
+func (r *ReadSet) MarkStale(path string) {
+	r.mu.Lock()
+	delete(r.seen, path)
+	if idx, ok := r.indexOf[path]; ok {
+		r.order = append(r.order[:idx], r.order[idx+1:]...)
+		for i := idx; i < len(r.order); i++ {
+			r.indexOf[r.order[i]] = i
+		}
+		delete(r.indexOf, path)
+	}
+	r.mu.Unlock()
+}
+
+func (r *ReadSet) MarkStaleBatch(paths []string) {
+	r.mu.Lock()
+	for _, path := range paths {
+		delete(r.seen, path)
+		if idx, ok := r.indexOf[path]; ok {
+			r.order = append(r.order[:idx], r.order[idx+1:]...)
+			for i := idx; i < len(r.order); i++ {
+				r.indexOf[r.order[i]] = i
+			}
+			delete(r.indexOf, path)
+		}
+	}
+	r.mu.Unlock()
+}
+
+func (r *ReadSet) WasSeen(path string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.seen[path]
+	return ok
+}
+
 func (r *ReadSet) RecentPaths(n int) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()

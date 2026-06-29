@@ -18,9 +18,11 @@ type bashTool struct {
 	defaultTimeout time.Duration
 	maxTimeout     time.Duration
 	maxOutput      int
+	reads          *ReadSet
+	maxWalkFiles   int
 }
 
-func NewBash(cwd string, defaultTimeout, maxTimeout time.Duration, maxOutput int) Tool {
+func NewBash(cwd string, defaultTimeout, maxTimeout time.Duration, maxOutput int, reads *ReadSet) Tool {
 	if defaultTimeout == 0 {
 		defaultTimeout = 120 * time.Second
 	}
@@ -30,7 +32,14 @@ func NewBash(cwd string, defaultTimeout, maxTimeout time.Duration, maxOutput int
 	if maxOutput == 0 {
 		maxOutput = 30 * 1024
 	}
-	return &bashTool{cwd: cwd, defaultTimeout: defaultTimeout, maxTimeout: maxTimeout, maxOutput: maxOutput}
+	return &bashTool{
+		cwd:            cwd,
+		defaultTimeout: defaultTimeout,
+		maxTimeout:     maxTimeout,
+		maxOutput:      maxOutput,
+		reads:          reads,
+		maxWalkFiles:   50000,
+	}
 }
 
 func (t *bashTool) Name() string { return "bash" }
@@ -60,6 +69,11 @@ func (t *bashTool) Execute(ctx context.Context, args map[string]any) (protocol.T
 		timeout = time.Duration(clamp(int(v), 1, int(t.maxTimeout.Seconds()))) * time.Second
 	}
 
+	var before map[string]time.Time
+	if t.reads != nil {
+		before, _ = walkModTimes(t.cwd, t.maxWalkFiles)
+	}
+
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -81,6 +95,35 @@ func (t *bashTool) Execute(ctx context.Context, args map[string]any) (protocol.T
 
 	runErr := cmd.Run()
 	out := cw.String()
+
+	if t.reads != nil && before != nil {
+		after, _ := walkModTimes(t.cwd, t.maxWalkFiles)
+		changed := diffModTimes(before, after)
+		var unread []string
+		for _, p := range changed {
+			if !t.reads.WasSeen(p) {
+				unread = append(unread, p)
+			}
+		}
+		if len(changed) > 0 {
+			t.reads.MarkStaleBatch(changed)
+		}
+		if len(unread) > 0 {
+			const maxWarn = 5
+			shown := unread
+			extra := ""
+			if len(unread) > maxWarn {
+				shown = unread[:maxWarn]
+				extra = fmt.Sprintf(" (+%d more)", len(unread)-maxWarn)
+			}
+			out += fmt.Sprintf(
+				"\n[⚠ unread files modified by this command:%s %s. "+
+					"The read-before-write rule was bypassed. "+
+					"Use `read` + `edit`/`write` instead. "+
+					"Revert these changes if they were not intentional.]",
+				extra, strings.Join(shown, ", "))
+		}
+	}
 
 	switch {
 	case cctx.Err() == context.DeadlineExceeded:

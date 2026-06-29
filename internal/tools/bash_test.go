@@ -13,9 +13,8 @@ func TestBashProcessGroupKill(t *testing.T) {
 	if _, err := exec.LookPath("ps"); err != nil {
 		t.Skip("ps not available")
 	}
-	bt := NewBash(t.TempDir(), 0, 0, 0)
+	bt := NewBash(t.TempDir(), 0, 0, 0, nil)
 
-	// Write a unique marker so we can find the child via ps.
 	marker := "talos_pgtest_marker_42"
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -29,14 +28,13 @@ func TestBashProcessGroupKill(t *testing.T) {
 	}()
 
 	time.Sleep(300 * time.Millisecond)
-	cancel() // simulate user interrupt
+	cancel()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("bash Execute did not return after cancel")
 	}
 
-	// Give the OS a moment to reap, then assert no orphaned sleep with our marker.
 	time.Sleep(300 * time.Millisecond)
 	out, _ := exec.Command("ps", "-ax", "-o", "command").CombinedOutput()
 	if strings.Contains(string(out), marker) {
@@ -55,7 +53,7 @@ func grepMarker(s, marker string) string {
 }
 
 func TestBashTimeout(t *testing.T) {
-	bt := NewBash(t.TempDir(), time.Second, 5*time.Second, 4096)
+	bt := NewBash(t.TempDir(), time.Second, 5*time.Second, 4096, nil)
 	res, err := bt.Execute(context.Background(), map[string]any{
 		"command":         "sleep 10",
 		"timeout_seconds": float64(1),
@@ -69,7 +67,7 @@ func TestBashTimeout(t *testing.T) {
 }
 
 func TestBashNonZeroExit(t *testing.T) {
-	bt := NewBash(t.TempDir(), 0, 0, 0)
+	bt := NewBash(t.TempDir(), 0, 0, 0, nil)
 	res, err := bt.Execute(context.Background(), map[string]any{"command": "exit 3"})
 	if err != nil {
 		t.Fatal(err)
@@ -92,6 +90,116 @@ func TestCappedWriterHeadAndTail(t *testing.T) {
 	}
 	if !strings.Contains(out, "elided") {
 		t.Fatalf("expected elision marker, got: %q", out)
+	}
+}
+
+func TestBashUnreadFileMutationWarning(t *testing.T) {
+	dir := t.TempDir()
+	rs := NewReadSet()
+	bt := NewBash(dir, 0, 0, 0, rs)
+
+	res, err := bt.Execute(context.Background(), map[string]any{
+		"command": "echo hello > newfile.txt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Content, "unread files") {
+		t.Fatalf("expected unread-files warning, got: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "newfile.txt") {
+		t.Fatalf("expected newfile.txt in warning, got: %q", res.Content)
+	}
+	if rs.WasSeen("newfile.txt") {
+		t.Fatal("newfile.txt should not be in ReadSet (never read)")
+	}
+}
+
+func TestBashReadFileMutationNoWarning(t *testing.T) {
+	dir := t.TempDir()
+	rs := NewReadSet()
+	path := dir + "/test.go"
+	if err := os.WriteFile(path, []byte("package p"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	rs.Record(path)
+
+	bt := NewBash(dir, 0, 0, 0, rs)
+	res, err := bt.Execute(context.Background(), map[string]any{
+		"command": "echo 'package p\n\nfunc F() {}' > test.go",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Content, "unread files") {
+		t.Fatalf("should not warn for files already in ReadSet, got: %q", res.Content)
+	}
+	if rs.WasSeen(path) {
+		t.Fatal("test.go should be marked stale after bash modification")
+	}
+}
+
+func TestBashReadOnlyCommandNoWarning(t *testing.T) {
+	dir := t.TempDir()
+	rs := NewReadSet()
+	bt := NewBash(dir, 0, 0, 0, rs)
+
+	res, err := bt.Execute(context.Background(), map[string]any{
+		"command": "echo hello world",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Content, "unread files") {
+		t.Fatalf("expected no warning for read-only command, got: %q", res.Content)
+	}
+}
+
+func TestMarkStaleBatch(t *testing.T) {
+	dir := t.TempDir()
+	rs := NewReadSet()
+	paths := []string{dir + "/a.go", dir + "/b.go", dir + "/c.go"}
+	for _, p := range paths {
+		os.WriteFile(p, []byte("x"), 0644)
+		rs.Record(p)
+	}
+	for _, p := range paths {
+		if !rs.WasSeen(p) {
+			t.Fatalf("%s should be seen after Record", p)
+		}
+	}
+
+	rs.MarkStaleBatch(paths[:2])
+
+	if rs.WasSeen(paths[0]) || rs.WasSeen(paths[1]) {
+		t.Fatal("a.go and b.go should be stale after MarkStaleBatch")
+	}
+	if !rs.WasSeen(paths[2]) {
+		t.Fatal("c.go should remain seen")
+	}
+}
+
+func TestWalkModTimes(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(dir+"/a.txt", []byte("a"), 0644)
+	os.WriteFile(dir+"/b.txt", []byte("b"), 0644)
+	os.MkdirAll(dir+"/.git/objects", 0755)
+	os.WriteFile(dir+"/.git/config", []byte("x"), 0644)
+	os.MkdirAll(dir+"/node_modules/pkg", 0755)
+	os.WriteFile(dir+"/node_modules/pkg/index.js", []byte("x"), 0644)
+
+	before, err := walkModTimes(dir, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := before[dir+"/a.txt"]; !ok {
+		t.Fatal("a.txt missing from walk")
+	}
+	if _, ok := before[dir+"/.git/config"]; ok {
+		t.Fatal(".git should be skipped")
+	}
+	if _, ok := before[dir+"/node_modules/pkg/index.js"]; ok {
+		t.Fatal("node_modules should be skipped")
 	}
 }
 

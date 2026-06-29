@@ -28,7 +28,7 @@ func DefaultRegistry(cwd string, reads *ReadSet, bash BashConfig, searchURL stri
 			NewRead(reads, idx),
 			NewWrite(reads),
 			NewEdit(reads),
-			NewBash(cwd, bash.DefaultTimeout, bash.MaxTimeout, bash.MaxOutput),
+			NewBash(cwd, bash.DefaultTimeout, bash.MaxTimeout, bash.MaxOutput, reads),
 			NewSearch(cwd),
 			NewFind(cwd),
 			NewLs(),
@@ -42,7 +42,6 @@ func DefaultRegistry(cwd string, reads *ReadSet, bash BashConfig, searchURL stri
 	}
 }
 
-// Close terminates any background processes owned by the registry.
 func (r *Registry) Close() {
 	if r.bg != nil {
 		r.bg.KillAll()
