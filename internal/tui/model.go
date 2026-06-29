@@ -205,6 +205,11 @@ type Model struct {
 	// cwd is the working directory captured at startup for the status bar.
 	cwd string
 
+	// Input history for up/down arrow cycling.
+	inputHistory []string // previously submitted messages, oldest first
+	historyIdx   int      // current position in history (-1 = blank/new input)
+	historyDraft string   // saved draft when navigating back into history
+
 	// Slash-command autocompletion.
 	slashCompletions []slashCommand
 	slashSelected    int // index into slashCompletions, -1 when none
@@ -231,6 +236,9 @@ func NewModel(cfg Config) Model {
 		spinner:          sp,
 		toolNames:        make(map[string]string),
 		toolArgs:         make(map[string]map[string]any),
+		inputHistory:     nil,
+		historyIdx:       -1,
+		historyDraft:     "",
 		slashCompletions: nil,
 		slashSelected:    -1,
 		cwd:              cwd,
@@ -538,6 +546,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 						return m, nil // handled but no dialog (e.g. /new)
 					}
+					// Save to input history (non-slash messages only).
+					m.inputHistory = append(m.inputHistory, text)
+					m.historyIdx = -1
+					m.historyDraft = ""
 					blocks, _ := resolveInput(text)
 					m.chat = m.chat.AppendUserBlocks(blocks)
 					if m.cfg.InputCh != nil {
@@ -568,7 +580,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				default:
 					m.chat = m.chat.ScrollUp(3)
 				}
+				return m, nil
 			}
+			// Not busy, no completions: cycle input history backward.
+			if len(m.inputHistory) == 0 {
+				return m, nil
+			}
+			if m.historyIdx == -1 {
+				m.historyDraft = m.input.Value()
+				m.historyIdx = len(m.inputHistory) - 1
+			} else if m.historyIdx > 0 {
+				m.historyIdx--
+			}
+			m.input.SetValue(m.inputHistory[m.historyIdx])
+			m.input.SetCursor(len(m.inputHistory[m.historyIdx]))
+			m.escClearConfirm = false
 			return m, nil
 		case "down":
 			if len(m.slashCompletions) > 0 {
@@ -584,7 +610,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				default:
 					m.chat = m.chat.ScrollDown(3)
 				}
+				return m, nil
 			}
+			// Not busy, no completions: cycle input history forward.
+			if len(m.inputHistory) == 0 {
+				return m, nil
+			}
+			if m.historyIdx < len(m.inputHistory)-1 {
+				m.historyIdx++
+				m.input.SetValue(m.inputHistory[m.historyIdx])
+				m.input.SetCursor(len(m.inputHistory[m.historyIdx]))
+			} else {
+				m.historyIdx = -1
+				m.input.SetValue(m.historyDraft)
+				m.input.SetCursor(len(m.historyDraft))
+				m.historyDraft = ""
+			}
+			m.escClearConfirm = false
 			return m, nil
 		default:
 			m.escClearConfirm = false
@@ -816,6 +858,9 @@ func (m *Model) handleSlash(text string) (bool, error) {
 			m.streamTextLen = 0
 			m.contextUsed = 0
 			m.contextWin = 0
+			m.inputHistory = nil
+			m.historyIdx = -1
+			m.historyDraft = ""
 			m.relayout()
 		}
 		return true, nil
