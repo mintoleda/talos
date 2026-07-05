@@ -37,6 +37,34 @@ func WriteAuthKey(baseDir, providerName, key string) error {
 	return os.WriteFile(path, data, 0600)
 }
 
-func ResolveKeyFor(baseDir, providerName, _ string) string {
-	return ReadAuthKey(baseDir, providerName)
+func ResolveKeyFor(baseDir, providerName, envVar string) string {
+	if key := ReadAuthKey(baseDir, providerName); key != "" {
+		return key
+	}
+	if envVar == "" {
+		envVar = defaultKeyEnv(providerName)
+	}
+	if envVar == "" {
+		return ""
+	}
+	return os.Getenv(envVar)
+}
+
+func defaultKeyEnv(providerName string) string {
+	switch providerName {
+	case "anthropic":
+		return "ANTHROPIC_API_KEY"
+	case "cloudflare":
+		return "CLOUDFLARE_API_KEY"
+	case "deepseek":
+		return "DEEPSEEK_API_KEY"
+	case "openai":
+		return "OPENAI_API_KEY"
+	case "openrouter":
+		return "OPENROUTER_API_KEY"
+	case "opencode-go", "opencode-zen":
+		return "OPENCODE_API_KEY"
+	default:
+		return ""
+	}
 }

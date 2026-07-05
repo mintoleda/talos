@@ -28,24 +28,36 @@ var permissionAsk string
 var permissionPanic string
 
 type Config struct {
-	BaseURL        string
-	APIKey         string
-	Model          string
-	Provider       string
-	PermissionMode safety.Mode
-	BashTimeout    time.Duration
-	BashMaxTimeout time.Duration
-	BashMaxOutput  int
-	SystemPrompt   string
-	BaseDir        string
-	ThinkingLevel  string
-	SearchURL                 string  // custom search endpoint (empty = DuckDuckGo HTML)
-	MaxAgentDepth             int     // max subagent nesting depth (0 = default 3)
+	BaseURL                   string
+	APIKey                    string
+	Model                     string
+	Provider                  string
+	PermissionMode            safety.Mode
+	BashTimeout               time.Duration
+	BashMaxTimeout            time.Duration
+	BashMaxOutput             int
+	SystemPrompt              string
+	BaseDir                   string
+	ThinkingLevel             string
+	SearchURL                 string // custom search endpoint (empty = DuckDuckGo HTML)
+	MaxAgentDepth             int    // max subagent nesting depth (0 = default 3)
+	EnableSubagents           bool
 	CompactThreshold          float64 // normal compaction fires at this fraction (0 = default 0.85)
 	CompactEmergencyThreshold float64 // emergency: compact regardless of chunk size (0 = default 0.95)
 	CompactChunkSize          int     // messages per compaction chunk (0 = default 20)
 	SummaryModel              string  // model for compaction summaries (empty = deterministic placeholder)
+	Historian                 bool
+	HistorianProvider         string
+	HistorianModel            string
+	HistorianBaseURL          string
+	HistorianAPIKey           string
+	DreamerProvider           string
+	DreamerModel              string
+	DreamerBaseURL            string
+	DreamerAPIKey             string
 	KillBgOnInterrupt         bool
+	ServerListen              string // empty/unix default, or tcp host:port
+	ServerToken               string // auth token for network listeners
 
 	Notifications notify.Config // desktop notification settings
 
@@ -58,15 +70,15 @@ func Load() (*Config, error) {
 		home = "."
 	}
 	cfg := &Config{
-		BaseURL:        "https://api.deepseek.com",
-		Model:          "deepseek-chat",
-		Provider:       "openai",
-		PermissionMode: safety.ModeAuto,
-		BashTimeout:    120 * time.Second,
-		BashMaxTimeout: 600 * time.Second,
-		BashMaxOutput:  30 * 1024,
-		SystemPrompt:   strings.TrimSpace(corePrompt),
-		BaseDir:        filepath.Join(home, ".talos"),
+		BaseURL:                   "https://api.deepseek.com",
+		Model:                     "deepseek-chat",
+		Provider:                  "openai",
+		PermissionMode:            safety.ModeAuto,
+		BashTimeout:               120 * time.Second,
+		BashMaxTimeout:            600 * time.Second,
+		BashMaxOutput:             30 * 1024,
+		SystemPrompt:              strings.TrimSpace(corePrompt),
+		BaseDir:                   filepath.Join(home, ".talos"),
 		ThinkingLevel:             "off",
 		CompactThreshold:          0.85,
 		CompactEmergencyThreshold: 0.95,
@@ -125,7 +137,7 @@ func (c *Config) ResolveAPIKey() {
 	case "opencode":
 		authName = "opencode-go"
 	}
-	c.APIKey = ReadAuthKey(c.BaseDir, authName)
+	c.APIKey = ResolveKeyFor(c.BaseDir, authName, "")
 }
 
 // fileConfig mirrors the small set of keys allowed in ~/.talos/config.toml.
@@ -143,31 +155,202 @@ type fileConfig struct {
 	BashMaxOutput         int    `toml:"bash_max_output"`
 	SearchURL             string `toml:"search_url"`
 	MaxAgentDepth         int    `toml:"max_agent_depth"`
+	EnableSubagents       *bool  `toml:"enable_subagents"`
 	// Deprecated: use thinking_level. Kept for backward compat.
-	ThinkingBudget    int   `toml:"thinking_budget"`
-	KillBgOnInterrupt *bool `toml:"kill_bg_on_interrupt"`
+	ThinkingBudget            int     `toml:"thinking_budget"`
+	KillBgOnInterrupt         *bool   `toml:"kill_bg_on_interrupt"`
 	CompactThreshold          float64 `toml:"compact_threshold"`
 	CompactEmergencyThreshold float64 `toml:"compact_emergency"`
 	CompactChunkSize          int     `toml:"compact_chunk_size"`
 	SummaryModel              string  `toml:"summary_model"` // empty = deterministic placeholder
+	Historian                 *bool   `toml:"historian"`
+	HistorianProvider         string  `toml:"historian_provider"`
+	HistorianModel            string  `toml:"historian_model"`
+	HistorianBaseURL          string  `toml:"historian_base_url"`
+	HistorianAPIKey           string  `toml:"historian_api_key"`
+	DreamerProvider           string  `toml:"dreamer_provider"`
+	DreamerModel              string  `toml:"dreamer_model"`
+	DreamerBaseURL            string  `toml:"dreamer_base_url"`
+	DreamerAPIKey             string  `toml:"dreamer_api_key"`
+	ServerListen              string  `toml:"server_listen"`
+	ServerToken               string  `toml:"server_token"`
 
 	Notifications *notifyFileConfig `toml:"notifications"`
 
 	MCPServers []mcp.ServerConfig `toml:"mcp_servers"`
 }
 
+type sectionedConfig struct {
+	Provider      providerFileConfig   `toml:"provider"`
+	Timeout       timeoutFileConfig    `toml:"timeout"`
+	Search        searchFileConfig     `toml:"search"`
+	Agent         agentFileConfig      `toml:"agent"`
+	Compaction    compactionFileConfig `toml:"compaction"`
+	Memory        memoryFileConfig     `toml:"memory"`
+	Notifications *notifyFileConfig    `toml:"notifications"`
+	MCPServers    []mcp.ServerConfig   `toml:"mcp_servers"`
+}
+
+type providerFileConfig struct {
+	BaseURL        string `toml:"base_url"`
+	APIKey         string `toml:"api_key"`
+	Model          string `toml:"model"`
+	Provider       string `toml:"provider"`
+	PermissionMode string `toml:"permission_mode"`
+	ThinkingLevel  string `toml:"thinking_level"`
+}
+
+type timeoutFileConfig struct {
+	BashTimeoutSeconds    int `toml:"bash_timeout_seconds"`
+	BashMaxTimeoutSeconds int `toml:"bash_max_timeout_seconds"`
+	BashMaxOutput         int `toml:"bash_max_output"`
+}
+
+type searchFileConfig struct {
+	SearchURL string `toml:"search_url"`
+}
+
+type agentFileConfig struct {
+	MaxAgentDepth   int   `toml:"max_agent_depth"`
+	EnableSubagents *bool `toml:"enable_subagents"`
+	// Deprecated: use provider.thinking_level. Kept for backward compat.
+	ThinkingBudget int `toml:"thinking_budget"`
+}
+
+type compactionFileConfig struct {
+	CompactThreshold          float64 `toml:"compact_threshold"`
+	CompactEmergencyThreshold float64 `toml:"compact_emergency"`
+	CompactChunkSize          int     `toml:"compact_chunk_size"`
+	SummaryModel              string  `toml:"summary_model"`
+	Historian                 *bool   `toml:"historian"`
+	EnableSubagents           *bool   `toml:"enable_subagents"`
+}
+
+type memoryFileConfig struct {
+	Historian         *bool  `toml:"historian"`
+	HistorianProvider string `toml:"historian_provider"`
+	HistorianModel    string `toml:"historian_model"`
+	HistorianBaseURL  string `toml:"historian_base_url"`
+	HistorianAPIKey   string `toml:"historian_api_key"`
+	DreamerProvider   string `toml:"dreamer_provider"`
+	DreamerModel      string `toml:"dreamer_model"`
+	DreamerBaseURL    string `toml:"dreamer_base_url"`
+	DreamerAPIKey     string `toml:"dreamer_api_key"`
+}
+
 // notifyFileConfig mirrors the [notifications] section of config.toml.
 type notifyFileConfig struct {
-	Enabled             bool `toml:"enabled"`
-	NotifyOnPermission  bool `toml:"notify_on_permission"`
-	NotifyOnTurnEnded   bool `toml:"notify_on_turn_ended"`
-	NotifyOnError       bool `toml:"notify_on_error"`
+	Enabled            bool `toml:"enabled"`
+	NotifyOnPermission bool `toml:"notify_on_permission"`
+	NotifyOnTurnEnded  bool `toml:"notify_on_turn_ended"`
+	NotifyOnError      bool `toml:"notify_on_error"`
+}
+
+func mergeSectionedConfig(fc *fileConfig, sc sectionedConfig) {
+	if fc.BaseURL == "" {
+		fc.BaseURL = sc.Provider.BaseURL
+	}
+	if fc.APIKey == "" {
+		fc.APIKey = sc.Provider.APIKey
+	}
+	if fc.Model == "" {
+		fc.Model = sc.Provider.Model
+	}
+	if fc.Provider == "" {
+		fc.Provider = sc.Provider.Provider
+	}
+	if fc.PermissionMode == "" {
+		fc.PermissionMode = sc.Provider.PermissionMode
+	}
+	if fc.ThinkingLevel == "" {
+		fc.ThinkingLevel = sc.Provider.ThinkingLevel
+	}
+	if fc.BashTimeoutSeconds == 0 {
+		fc.BashTimeoutSeconds = sc.Timeout.BashTimeoutSeconds
+	}
+	if fc.BashMaxTimeoutSeconds == 0 {
+		fc.BashMaxTimeoutSeconds = sc.Timeout.BashMaxTimeoutSeconds
+	}
+	if fc.BashMaxOutput == 0 {
+		fc.BashMaxOutput = sc.Timeout.BashMaxOutput
+	}
+	if fc.SearchURL == "" {
+		fc.SearchURL = sc.Search.SearchURL
+	}
+	if fc.MaxAgentDepth == 0 {
+		fc.MaxAgentDepth = sc.Agent.MaxAgentDepth
+	}
+	if fc.EnableSubagents == nil {
+		if sc.Agent.EnableSubagents != nil {
+			fc.EnableSubagents = sc.Agent.EnableSubagents
+		} else {
+			fc.EnableSubagents = sc.Compaction.EnableSubagents
+		}
+	}
+	if fc.ThinkingBudget == 0 {
+		fc.ThinkingBudget = sc.Agent.ThinkingBudget
+	}
+	if fc.CompactThreshold == 0 {
+		fc.CompactThreshold = sc.Compaction.CompactThreshold
+	}
+	if fc.CompactEmergencyThreshold == 0 {
+		fc.CompactEmergencyThreshold = sc.Compaction.CompactEmergencyThreshold
+	}
+	if fc.CompactChunkSize == 0 {
+		fc.CompactChunkSize = sc.Compaction.CompactChunkSize
+	}
+	if fc.SummaryModel == "" {
+		fc.SummaryModel = sc.Compaction.SummaryModel
+	}
+	if fc.Historian == nil {
+		if sc.Memory.Historian != nil {
+			fc.Historian = sc.Memory.Historian
+		} else {
+			fc.Historian = sc.Compaction.Historian
+		}
+	}
+	if fc.HistorianProvider == "" {
+		fc.HistorianProvider = sc.Memory.HistorianProvider
+	}
+	if fc.HistorianModel == "" {
+		fc.HistorianModel = sc.Memory.HistorianModel
+	}
+	if fc.HistorianBaseURL == "" {
+		fc.HistorianBaseURL = sc.Memory.HistorianBaseURL
+	}
+	if fc.HistorianAPIKey == "" {
+		fc.HistorianAPIKey = sc.Memory.HistorianAPIKey
+	}
+	if fc.DreamerProvider == "" {
+		fc.DreamerProvider = sc.Memory.DreamerProvider
+	}
+	if fc.DreamerModel == "" {
+		fc.DreamerModel = sc.Memory.DreamerModel
+	}
+	if fc.DreamerBaseURL == "" {
+		fc.DreamerBaseURL = sc.Memory.DreamerBaseURL
+	}
+	if fc.DreamerAPIKey == "" {
+		fc.DreamerAPIKey = sc.Memory.DreamerAPIKey
+	}
+	if fc.Notifications == nil {
+		fc.Notifications = sc.Notifications
+	}
+	if len(fc.MCPServers) == 0 {
+		fc.MCPServers = sc.MCPServers
+	}
 }
 
 func loadFile(path string, cfg *Config) error {
 	var fc fileConfig
-	if _, err := toml.DecodeFile(path, &fc); err != nil {
-		return err
+	_, flatErr := toml.DecodeFile(path, &fc)
+	var sc sectionedConfig
+	_, sectionedErr := toml.DecodeFile(path, &sc)
+	if flatErr != nil && sectionedErr != nil {
+		return flatErr
+	}
+	if sectionedErr == nil {
+		mergeSectionedConfig(&fc, sc)
 	}
 	if fc.BaseURL != "" {
 		cfg.BaseURL = fc.BaseURL
@@ -219,6 +402,9 @@ func loadFile(path string, cfg *Config) error {
 	if fc.MaxAgentDepth > 0 {
 		cfg.MaxAgentDepth = fc.MaxAgentDepth
 	}
+	if fc.EnableSubagents != nil {
+		cfg.EnableSubagents = *fc.EnableSubagents
+	}
 	if fc.CompactThreshold > 0 {
 		cfg.CompactThreshold = fc.CompactThreshold
 	}
@@ -230,6 +416,39 @@ func loadFile(path string, cfg *Config) error {
 	}
 	if fc.SummaryModel != "" {
 		cfg.SummaryModel = fc.SummaryModel
+	}
+	if fc.Historian != nil {
+		cfg.Historian = *fc.Historian
+	}
+	if fc.HistorianProvider != "" {
+		cfg.HistorianProvider = fc.HistorianProvider
+	}
+	if fc.HistorianModel != "" {
+		cfg.HistorianModel = fc.HistorianModel
+	}
+	if fc.HistorianBaseURL != "" {
+		cfg.HistorianBaseURL = fc.HistorianBaseURL
+	}
+	if fc.HistorianAPIKey != "" {
+		cfg.HistorianAPIKey = fc.HistorianAPIKey
+	}
+	if fc.DreamerProvider != "" {
+		cfg.DreamerProvider = fc.DreamerProvider
+	}
+	if fc.DreamerModel != "" {
+		cfg.DreamerModel = fc.DreamerModel
+	}
+	if fc.DreamerBaseURL != "" {
+		cfg.DreamerBaseURL = fc.DreamerBaseURL
+	}
+	if fc.DreamerAPIKey != "" {
+		cfg.DreamerAPIKey = fc.DreamerAPIKey
+	}
+	if fc.ServerListen != "" {
+		cfg.ServerListen = fc.ServerListen
+	}
+	if fc.ServerToken != "" {
+		cfg.ServerToken = fc.ServerToken
 	}
 	if fc.Notifications != nil {
 		nc := notify.DefaultConfig()

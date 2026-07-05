@@ -17,6 +17,7 @@ var All = []Known{
 	{Name: "openrouter", BaseURL: "https://openrouter.ai/api", EnvVar: "OPENROUTER_API_KEY", Label: "openrouter.ai"},
 	{Name: "openai", BaseURL: "https://api.openai.com", EnvVar: "OPENAI_API_KEY", Label: "openai.com"},
 	{Name: "anthropic", BaseURL: "https://api.anthropic.com", EnvVar: "ANTHROPIC_API_KEY", Label: "anthropic.com"},
+	{Name: "cloudflare", BaseURL: "", EnvVar: "CLOUDFLARE_API_KEY", Label: "Cloudflare Workers AI"},
 }
 
 func ByName(name string) (Known, bool) {
