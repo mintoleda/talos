@@ -11,7 +11,83 @@ import (
 
 	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/protocol"
+	"github.com/mintoleda/talos/internal/tui/dialogs"
 )
+
+type fakeEngine struct {
+	stats       func() (int, int, int, float64, error)
+	listModels  func() ([]models.Entry, error)
+	cycle       func() (string, error)
+	events      chan protocol.Event
+	steer       [][]protocol.ContentBlock
+	submissions [][]protocol.ContentBlock
+}
+
+func (e *fakeEngine) Submit(blocks []protocol.ContentBlock) {
+	e.submissions = append(e.submissions, blocks)
+}
+func (e *fakeEngine) Interrupt()                           {}
+func (e *fakeEngine) Approve(bool, []byte)                 {}
+func (e *fakeEngine) Steer(blocks []protocol.ContentBlock) { e.steer = append(e.steer, blocks) }
+func (e *fakeEngine) WithdrawSteer() []protocol.ContentBlock {
+	n := len(e.steer)
+	if n == 0 {
+		return nil
+	}
+	last := e.steer[n-1]
+	e.steer = e.steer[:n-1]
+	return last
+}
+func (e *fakeEngine) PendingSteers() int          { return len(e.steer) }
+func (e *fakeEngine) NewSession() (string, error) { return "new", nil }
+func (e *fakeEngine) Resume(string) (string, []protocol.FrozenMessage, error) {
+	return "resumed", nil, nil
+}
+func (e *fakeEngine) ListSessions() ([]dialogs.SessionEntry, error) { return nil, nil }
+func (e *fakeEngine) DeleteSession(string) error                    { return nil }
+func (e *fakeEngine) ListModels() ([]models.Entry, error) {
+	if e.listModels != nil {
+		return e.listModels()
+	}
+	return nil, nil
+}
+func (e *fakeEngine) SwitchModel(string, string) error { return nil }
+func (e *fakeEngine) CycleThinking() (string, error) {
+	if e.cycle != nil {
+		return e.cycle()
+	}
+	return "", nil
+}
+func (e *fakeEngine) CurrentThinkingLevel() string { return "" }
+func (e *fakeEngine) Compact(string) error         { return nil }
+func (e *fakeEngine) Stats() (int, int, int, float64, error) {
+	if e.stats != nil {
+		return e.stats()
+	}
+	return 0, 0, 0, 0, nil
+}
+func (e *fakeEngine) LoginProviders() ([]dialogs.LoginProvider, error) { return nil, nil }
+func (e *fakeEngine) Login(string, string) error                       { return nil }
+func (e *fakeEngine) MCPStatus() (string, error)                       { return "", nil }
+func (e *fakeEngine) MCPCount() int                                    { return 0 }
+func (e *fakeEngine) CancelSubagent(string)                            {}
+func (e *fakeEngine) History() ([]protocol.FrozenMessage, error)       { return nil, nil }
+func (e *fakeEngine) ListFiles(string) ([]string, error)               { return nil, nil }
+func (e *fakeEngine) ResolveInput(text string) ([]protocol.ContentBlock, string, error) {
+	return protocol.TextBlocks(text), text, nil
+}
+func (e *fakeEngine) PushInstruction() (string, string, error) { return "", "", nil }
+func (e *fakeEngine) Events() <-chan protocol.Event {
+	if e.events == nil {
+		e.events = make(chan protocol.Event)
+	}
+	return e.events
+}
+func (e *fakeEngine) Close() {
+	if e.events != nil {
+		close(e.events)
+	}
+}
 
 func TestModelHandlesTextDelta(t *testing.T) {
 	m := NewModel(Config{SessionID: "test", Mode: ModeSingleAgent})
@@ -348,26 +424,6 @@ func TestModelCompletionHeight(t *testing.T) {
 	}
 }
 
-func TestModelResolveInputPlain(t *testing.T) {
-	blocks, display := resolveInput("hello world")
-	if display != "hello world" {
-		t.Fatalf("expected display 'hello world', got %q", display)
-	}
-	if len(blocks) != 1 || blocks[0].Type != protocol.BlockText {
-		t.Fatal("expected 1 text block")
-	}
-}
-
-func TestModelResolveInputEmpty(t *testing.T) {
-	blocks, display := resolveInput("")
-	if display != "" {
-		t.Fatalf("expected empty display, got %q", display)
-	}
-	if len(blocks) != 0 {
-		t.Fatal("expected no blocks for empty input")
-	}
-}
-
 func TestModelInputHistory(t *testing.T) {
 	m := NewModel(Config{SessionID: "test", Mode: ModeSingleAgent})
 	m.width, m.height = 80, 24
@@ -401,7 +457,6 @@ func TestModelStatusParts(t *testing.T) {
 	}
 	_ = right
 }
-
 
 func TestModelShortenDir(t *testing.T) {
 	home, _ := os.UserHomeDir()
@@ -536,7 +591,6 @@ func TestModelMainView(t *testing.T) {
 	}
 }
 
-
 func TestModelBusySetsBusySince(t *testing.T) {
 	m := NewModel(Config{SessionID: "test", Mode: ModeSingleAgent})
 	m.width, m.height = 80, 24
@@ -562,14 +616,13 @@ func TestModelThinkingLineCycles(t *testing.T) {
 	}
 }
 
-
 func TestModelReseedStats(t *testing.T) {
 	m := NewModel(Config{
 		SessionID: "test",
 		Mode:      ModeSingleAgent,
-		StatsSnapshot: func() (int, int, int, float64) {
-			return 100, 50, 80, 0.005
-		},
+		Engine: &fakeEngine{stats: func() (int, int, int, float64, error) {
+			return 100, 50, 80, 0.005, nil
+		}},
 	})
 	m.reseedStats()
 
@@ -600,54 +653,6 @@ func TestModelUserInputEvent(t *testing.T) {
 	}
 }
 
-func TestModelSteerQueue(t *testing.T) {
-	q := &SteerQueue{}
-	if q.Len() != 0 {
-		t.Fatal("expected empty queue")
-	}
-
-	blocks := []protocol.ContentBlock{{Type: protocol.BlockText, Text: "steer message"}}
-	q.Enqueue(blocks)
-	if q.Len() != 1 {
-		t.Fatalf("expected 1 item, got %d", q.Len())
-	}
-
-	// Withdraw should return the item.
-	withdrawn := q.Withdraw()
-	if withdrawn == nil {
-		t.Fatal("expected withdrawn item")
-	}
-	if q.Len() != 0 {
-		t.Fatal("expected empty after withdraw")
-	}
-
-	// Drain should return empty (Drain always returns a value, never nil).
-	if drained := q.Drain(); len(drained) != 0 {
-		t.Fatalf("expected empty drain, got %d items", len(drained))
-	}
-}
-
-func TestModelSteerQueueDrain(t *testing.T) {
-	q := &SteerQueue{}
-	q.Enqueue([]protocol.ContentBlock{{Type: protocol.BlockText, Text: "a"}})
-	q.Enqueue([]protocol.ContentBlock{{Type: protocol.BlockText, Text: "b"}})
-
-	drained := q.Drain()
-	if len(drained) != 2 {
-		t.Fatalf("expected 2 drained items, got %d", len(drained))
-	}
-	if q.Len() != 0 {
-		t.Fatal("expected empty after drain")
-	}
-}
-
-func TestModelSteerQueueWithdrawEmpty(t *testing.T) {
-	q := &SteerQueue{}
-	if q.Withdraw() != nil {
-		t.Fatal("expected nil from withdraw on empty")
-	}
-}
-
 func TestModelInitReturnsCmd(t *testing.T) {
 	m := NewModel(Config{SessionID: "test", Mode: ModeSingleAgent})
 	cmd := m.Init()
@@ -672,11 +677,11 @@ func TestModelInsertModeKeyHandling(t *testing.T) {
 
 func TestModelCtrlLOpensModelPicker(t *testing.T) {
 	m := NewModel(Config{
-		SessionID:    "test",
-		Mode:         ModeSingleAgent,
-		FetchModels: func() ([]models.Entry, error) {
+		SessionID: "test",
+		Mode:      ModeSingleAgent,
+		Engine: &fakeEngine{listModels: func() ([]models.Entry, error) {
 			return nil, nil
-		},
+		}},
 	})
 	m.width, m.height = 80, 24
 
@@ -692,10 +697,10 @@ func TestModelCtrlTCyclesThinking(t *testing.T) {
 	m := NewModel(Config{
 		SessionID: "test",
 		Mode:      ModeSingleAgent,
-		CycleThinking: func() string {
+		Engine: &fakeEngine{cycle: func() (string, error) {
 			cycled = "high"
-			return "high"
-		},
+			return "high", nil
+		}},
 	})
 	m.width, m.height = 80, 24
 

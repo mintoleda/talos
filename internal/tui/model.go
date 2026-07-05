@@ -1,14 +1,10 @@
 package tui
 
 import (
-	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -17,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/mintoleda/talos/internal/client"
 	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/tui/dialogs"
@@ -38,7 +35,6 @@ const (
 	InsertMode VimMode = iota
 	NormalMode
 )
-
 
 // slashCommand describes one available slash command.
 type slashCommand struct {
@@ -79,61 +75,15 @@ type InterruptMsg struct{}
 
 // Config wires the TUI to the engine.
 type Config struct {
-	SessionID   string
-	Mode        Mode
-	InputCh     chan<- []protocol.ContentBlock
-	// SteerQueue is a thread-safe queue shared with the Loop for steer
-	// messages (typed while busy). The TUI enqueues on Enter and withdraws
-	// on up-arrow; the Loop drains before each LLM call. Nil disables steer.
-	SteerQueue *SteerQueue
-	// SubmitFn, if set, is called with the raw user text on every input
-	// submission (after slash-command handling). Used by attach mode to
-	// forward input to a remote server instead of a local loop.
-	SubmitFn    func(string)
-	// SubmitSlash, if set, is called when the user types a slash command
-	// that the client cannot handle locally. Used by attach mode to forward
-	// commands like /model and /thinking to the server.
-	SubmitSlash func(string)
-	// InterruptFn, if set, is called when the user interrupts a busy turn.
-	// Used by attach mode to forward interrupts to a remote server.
-	InterruptFn func()
-	InterruptCh chan<- struct{}
-	Shutdown func()
-	NewSession  func() (string, error)
-	Stats       func() string // returns formatted stats string for /stats
-	// ResumeSession loads an existing session by id, sets it on the loop, and
-	// returns the new session ID plus the transcript history for replay.
-	ResumeSession func(id string) (string, []protocol.FrozenMessage, error)
-	Provider      string
-	Model         string
-	// SwitchProvider creates a new provider client and updates the loop.
-	SwitchProvider func(name, model string) error
-	// CycleThinking cycles to the next abstract thinking level (off→minimal→low→medium→high→xhigh→off)
-	// and returns the new level name for display.
-	CycleThinking func() string
-	// CurrentThinkingLevel returns the current abstract thinking level without cycling.
-	CurrentThinkingLevel func() string
-	// FetchSessions returns sessions for the current project (used by /resume picker).
-	FetchSessions dialogs.FetchSessionsFunc
-	// DeleteSession removes a session by ID (used by /resume picker's d key).
-	DeleteSession func(id string) error
-	// FetchModels fetches live models across all logged-in providers.
-	FetchModels dialogs.FetchModelsFunc
-	// LoginProviders is the list of known providers shown in the /login dialog.
-	LoginProviders func() []dialogs.LoginProvider
-	// SaveLogin persists a new API key for a provider.
-	SaveLogin func(provider, key string) error
-	// CancelSubagent cancels a running subagent by ID. Used when the user kills
-	// one from the subagents pane.
-	CancelSubagent func(id string)
+	SessionID string
+	Mode      Mode
+	Engine    client.Engine
+	Shutdown  func()
+	Provider  string
+	Model     string
 	// Pricing is the pricing table used to compute dollar costs and context
 	// windows for the token/cost status line. Nil disables cost display.
 	Pricing *pricing.Table
-	// CompactCh receives focus strings for manual compaction. An empty string
-	// means compact without focus guidance. The compaction happens
-	// asynchronously in the engine goroutine and emits events back through
-	// the normal event channel.
-	CompactCh chan<- string
 	// InitialHistory, if non-empty, is replayed into the chat and tools panes
 	// at startup. Used by `talos -c` / `talos --continue` to show the loaded
 	// session's messages so the user can see they really continued the last
@@ -149,92 +99,28 @@ type Config struct {
 		Cost         float64
 	}
 
-	// StatsSnapshot returns the current cumulative stats from the loop.
-	// Used by /resume to refresh the TUI counters after switching transcripts.
-	StatsSnapshot func() (input, output, cacheMiss int, cost float64)
-
-	// MCPStatus returns a human-readable summary of connected MCP servers.
-	MCPStatus func() string
-	// MCPCount returns the number of connected MCP servers.
-	MCPCount func() int
-
 	// ToggleSubagents toggles subagent visibility on/off at runtime and
 	// returns a human-readable message describing the new state.
 	ToggleSubagents func() string
 }
 
-// SteerQueue is a thread-safe queue of pending steer messages shared between
-// the TUI and the Loop. The TUI enqueues on Enter-while-busy and withdraws on
-// up-arrow; the Loop drains before each LLM call.
-type SteerQueue struct {
-	mu       sync.Mutex
-	Messages [][]protocol.ContentBlock
-}
-
-// Enqueue appends a steer message. Called from the TUI goroutine.
-func (q *SteerQueue) Enqueue(blocks []protocol.ContentBlock) {
-	q.mu.Lock()
-	q.Messages = append(q.Messages, blocks)
-	q.mu.Unlock()
-}
-
-// Drain returns all pending messages and clears the queue. Called from the
-// loop goroutine. Returns nil if the queue is empty.
-func (q *SteerQueue) Drain() [][]protocol.ContentBlock {
-	q.mu.Lock()
-	msgs := q.Messages
-	q.Messages = nil
-	q.mu.Unlock()
-	return msgs
-}
-
-// Withdraw removes and returns the last pending message, or nil if empty.
-// Called from the TUI goroutine (up-arrow withdrawal).
-func (q *SteerQueue) Withdraw() []protocol.ContentBlock {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	n := len(q.Messages)
-	if n == 0 {
-		return nil
-	}
-	last := q.Messages[n-1]
-	q.Messages = q.Messages[:n-1]
-	return last
-}
-
-// Len returns the number of pending steer messages. Called from TUI.
-func (q *SteerQueue) Len() int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return len(q.Messages)
-}
-
-// StatsSnapshot returns the current cumulative stats from the loop.
-// Used by /resume to refresh the TUI counters after switching transcripts.
-type StatsSnapshot struct {
-	InputTokens  int
-	OutputTokens int
-	CacheMiss    int
-	Cost         float64
-}
-
 // Model is the root Bubble Tea model.
 type Model struct {
-	cfg           Config
-	mode          Mode
-	vimMode       VimMode
-	quitConfirm    bool
+	cfg             Config
+	mode            Mode
+	vimMode         VimMode
+	quitConfirm     bool
 	escClearConfirm bool
-	width          int
-	height         int
-	paneH          int // height allocated to panes, updated in relayout
-	chat      panes.ChatModel
-	subagents panes.SubagentsModel
-	input     textarea.Model
-	busy      bool
-	spinner       spinner.Model
-	dialog        tea.Model
-	thinkingLevel string
+	width           int
+	height          int
+	paneH           int // height allocated to panes, updated in relayout
+	chat            panes.ChatModel
+	subagents       panes.SubagentsModel
+	input           textarea.Model
+	busy            bool
+	spinner         spinner.Model
+	dialog          tea.Model
+	thinkingLevel   string
 
 	// toolNames maps tool call ID → name so ToolFinished can look up the name.
 	toolNames map[string]string
@@ -243,12 +129,12 @@ type Model struct {
 	toolArgs map[string]map[string]any
 
 	// Cumulative usage across all turns (shown in the status line).
-	totalInput    int
-	totalOutput   int
-	totalCost     float64
+	totalInput     int
+	totalOutput    int
+	totalCost      float64
 	totalCacheMiss int // cumulative non-cached prompt tokens
-	contextUsed   int  // latest turn's prompt tokens = current context size
-	contextWin    int
+	contextUsed    int // latest turn's prompt tokens = current context size
+	contextWin     int
 
 	// busySince is set when a prompt is submitted; used to compute elapsed time.
 	busySince time.Time
@@ -295,10 +181,10 @@ type Model struct {
 // NewModel builds the initial TUI model.
 func NewModel(cfg Config) Model {
 	ti := textarea.New()
-	ti.Prompt = ""                 // the "›" glyph is drawn by promptBoxView, not textarea
+	ti.Prompt = "" // the "›" glyph is drawn by promptBoxView, not textarea
 	ti.Placeholder = "Type a message..."
 	ti.ShowLineNumbers = false
-	ti.CharLimit = 0               // no limit; long input soft-wraps instead
+	ti.CharLimit = 0 // no limit; long input soft-wraps instead
 	// Neutralize the default cursor-line background so the input reads as plain
 	// text inside our rounded box rather than a highlighted bar.
 	ti.FocusedStyle.CursorLine = lipgloss.NewStyle()
@@ -334,11 +220,11 @@ func NewModel(cfg Config) Model {
 		totalCost:        cfg.SeedStats.Cost,
 		mcpCount:         0,
 	}
-	if cfg.CurrentThinkingLevel != nil {
-		m.thinkingLevel = cfg.CurrentThinkingLevel()
+	if cfg.Engine != nil {
+		m.thinkingLevel = cfg.Engine.CurrentThinkingLevel()
 	}
-	if cfg.MCPCount != nil {
-		m.mcpCount = cfg.MCPCount()
+	if cfg.Engine != nil {
+		m.mcpCount = cfg.Engine.MCPCount()
 	}
 	// Seed the context window from the pricing table so the status bar shows
 	// context usage from the very first turn instead of waiting for TurnEnded.
@@ -384,25 +270,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case dialogs.LoginDoneMsg:
 		if !msg.Canceled && msg.Provider != "" && msg.Key != "" {
-			if m.cfg.SaveLogin != nil {
-				if err := m.cfg.SaveLogin(msg.Provider, msg.Key); err != nil {
+			if m.cfg.Engine == nil {
+				m.chat = m.chat.AppendNotice("error", "engine unavailable")
+				return m, nil
+			}
+			if err := m.cfg.Engine.Login(msg.Provider, msg.Key); err != nil {
+				m.chat = m.chat.AppendNotice("error", err.Error())
+			} else {
+				m.chat = m.chat.AppendNotice("info", "logged in to "+msg.Provider)
+				// Recreate the provider so the new key takes effect immediately.
+				if err := m.cfg.Engine.SwitchModel(m.cfg.Provider, m.cfg.Model); err != nil {
 					m.chat = m.chat.AppendNotice("error", err.Error())
-				} else {
-					m.chat = m.chat.AppendNotice("info", "logged in to "+msg.Provider)
-					// Recreate the provider so the new key takes effect immediately.
-					if m.cfg.SwitchProvider != nil {
-						if err := m.cfg.SwitchProvider(m.cfg.Provider, m.cfg.Model); err != nil {
-							m.chat = m.chat.AppendNotice("error", err.Error())
-						}
-					}
 				}
 			}
 		}
 		return m, nil
 
 	case dialogs.SessionPickerDoneMsg:
-		if !msg.Canceled && msg.ID != "" && m.cfg.ResumeSession != nil {
-			newID, history, err := m.cfg.ResumeSession(msg.ID)
+		if !msg.Canceled && msg.ID != "" && m.cfg.Engine != nil {
+			newID, history, err := m.cfg.Engine.Resume(msg.ID)
 			if err != nil {
 				m.chat = m.chat.AppendNotice("error", err.Error())
 			} else {
@@ -413,13 +299,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case dialogs.ModelPickerDoneMsg:
 		if !msg.Canceled && msg.Provider != "" {
-			if m.cfg.SwitchProvider != nil {
-				if err := m.cfg.SwitchProvider(msg.Provider, msg.Model); err != nil {
-					m.chat = m.chat.AppendNotice("error", err.Error())
-				} else {
-					m.cfg.Provider = msg.Provider
-					m.cfg.Model = msg.Model
-				}
+			if m.cfg.Engine == nil {
+				m.chat = m.chat.AppendNotice("error", "engine unavailable")
+				return m, nil
+			}
+			if err := m.cfg.Engine.SwitchModel(msg.Provider, msg.Model); err != nil {
+				m.chat = m.chat.AppendNotice("error", err.Error())
+			} else {
+				m.cfg.Provider = msg.Provider
+				m.cfg.Model = msg.Model
 			}
 		}
 		return m, nil
@@ -448,13 +336,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ctrl+c: interrupt if busy; otherwise double-press to quit.
 		if msg.String() == "ctrl+c" {
 			if m.busy {
-				if m.cfg.InterruptCh != nil {
-					select {
-					case m.cfg.InterruptCh <- struct{}{}:
-					default:
-					}
-				} else if m.cfg.InterruptFn != nil {
-					m.cfg.InterruptFn()
+				if m.cfg.Engine != nil {
+					m.cfg.Engine.Interrupt()
 				}
 				return m, nil
 			}
@@ -537,11 +420,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return clearEscClearConfirmMsg{} })
 		case "ctrl+l":
 			if !m.busy {
-				if m.cfg.FetchModels == nil {
-					m.chat = m.chat.AppendNotice("info", "model selection is managed on the server terminal")
+				if m.cfg.Engine == nil {
+					m.chat = m.chat.AppendNotice("error", "engine unavailable")
 					return m, nil
 				}
-				m.dialog = dialogs.NewModelPickerDialog(m.cfg.Provider, m.cfg.Model, "", m.cfg.FetchModels).WithSize(m.width, m.height)
+				m.dialog = dialogs.NewModelPickerDialog(m.cfg.Provider, m.cfg.Model, "", m.cfg.Engine.ListModels).WithSize(m.width, m.height)
 				return m, m.dialog.Init()
 			}
 			return m, nil
@@ -556,12 +439,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "ctrl+t":
 			if !m.busy {
-				if m.cfg.CycleThinking != nil {
-					newLevel := m.cfg.CycleThinking()
+				if m.cfg.Engine != nil {
+					newLevel, err := m.cfg.Engine.CycleThinking()
+					if err != nil {
+						m.chat = m.chat.AppendNotice("error", err.Error())
+						return m, nil
+					}
 					m.thinkingLevel = newLevel
 					m.chat = m.chat.AppendNotice("info", "thinking level: "+newLevel)
-				} else if m.cfg.SubmitSlash != nil {
-					m.cfg.SubmitSlash("/thinking")
 				}
 			}
 			return m, nil
@@ -583,10 +468,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Pending steers are withdrawable via up-arrow (they pop back
 				// into the input bar so you can edit or discard them).
 				text := m.input.Value()
-				if text != "" && m.cfg.SteerQueue != nil {
-					blocks, _ := resolveInput(text)
+				if text != "" && m.cfg.Engine != nil {
+					blocks, _, err := m.cfg.Engine.ResolveInput(text)
+					if err != nil {
+						m.chat = m.chat.AppendNotice("error", err.Error())
+						return m, nil
+					}
 					m.chat = m.chat.AppendUserBlocks(blocks)
-					m.cfg.SteerQueue.Enqueue(blocks)
+					m.cfg.Engine.Steer(blocks)
 					m.input.Reset()
 					m.slashCompletions = nil
 					m.slashSelected = -1
@@ -637,19 +526,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.inputHistory = append(m.inputHistory, text)
 					m.historyIdx = -1
 					m.historyDraft = ""
-					blocks, _ := resolveInput(text)
-					m.chat = m.chat.AppendUserBlocks(blocks)
-					if m.cfg.InputCh != nil {
-						m.busy = true
-						m.busySince = time.Now()
-						m.relayout()
-						m.cfg.InputCh <- blocks
-					} else if m.cfg.SubmitFn != nil {
-						m.busy = true
-						m.busySince = time.Now()
-						m.relayout()
-						m.cfg.SubmitFn(text)
+					if m.cfg.Engine == nil {
+						m.chat = m.chat.AppendNotice("error", "engine unavailable")
+						return m, nil
 					}
+					blocks, _, err := m.cfg.Engine.ResolveInput(text)
+					if err != nil {
+						m.chat = m.chat.AppendNotice("error", err.Error())
+						return m, nil
+					}
+					m.chat = m.chat.AppendUserBlocks(blocks)
+					m.busy = true
+					m.busySince = time.Now()
+					m.relayout()
+					m.cfg.Engine.Submit(blocks)
 				}
 			}
 			return m, nil
@@ -661,8 +551,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.busy {
 				// If there are pending steer messages, up-arrow withdraws
 				// the most recent one back into the input bar for editing.
-				if m.cfg.SteerQueue != nil {
-					if last := m.cfg.SteerQueue.Withdraw(); last != nil {
+				if m.cfg.Engine != nil {
+					if last := m.cfg.Engine.WithdrawSteer(); last != nil {
 						// Remove the chat entry so the user sees it's gone.
 						m.chat = m.chat.PopLastSegment()
 						// Put the text back in the input bar for editing.
@@ -858,17 +748,21 @@ func (m *Model) applyResume(newID string, history []protocol.FrozenMessage) tea.
 	return tea.ClearScreen
 }
 
-// reseedStats refreshes the cumulative token and cost counters from the
-// loop's StatsSnapshot callback. Used after /resume to show the loaded
-// session's historical stats instead of stale values from the old session.
+// reseedStats refreshes cumulative token and cost counters from the engine.
+// Used after /resume and TurnEnded so attached clients converge on the
+// server-authoritative totals.
 func (m *Model) reseedStats() {
-	if m.cfg.StatsSnapshot != nil {
-		in, out, miss, cost := m.cfg.StatsSnapshot()
-		m.totalInput = in
-		m.totalOutput = out
-		m.totalCacheMiss = miss
-		m.totalCost = cost
+	if m.cfg.Engine == nil {
+		return
 	}
+	in, out, miss, cost, err := m.cfg.Engine.Stats()
+	if err != nil {
+		return
+	}
+	m.totalInput = in
+	m.totalOutput = out
+	m.totalCacheMiss = miss
+	m.totalCost = cost
 }
 
 // maxInputRows caps how tall the input box may grow before it starts scrolling
@@ -942,7 +836,6 @@ func visibleRowCount(view string) int {
 	return last
 }
 
-
 // handleSlash processes a slash command. Returns (handled, error) where handled=true
 // means the input was a slash command and should not be forwarded to the AI.
 func (m *Model) handleSlash(text string) (bool, error) {
@@ -952,37 +845,38 @@ func (m *Model) handleSlash(text string) (bool, error) {
 	}
 	switch parts[0] {
 	case "/new":
-		if m.cfg.NewSession != nil {
-			newID, err := m.cfg.NewSession()
-			if err != nil {
-				return true, err
-			}
-			m.cfg.SessionID = newID
-			m.chat = panes.NewChat()
-
-			m.subagents = panes.NewSubagents()
-			m.toolNames = make(map[string]string)
-			m.toolArgs = make(map[string]map[string]any)
-			m.busy = false
-			m.totalInput = 0
-			m.totalOutput = 0
-			m.totalCost = 0
-			m.streamTextLen = 0
-			m.contextUsed = 0
-			m.contextWin = 0
-			m.inputHistory = nil
-			m.historyIdx = -1
-			m.historyDraft = ""
-			m.relayout()
+		if m.cfg.Engine == nil {
+			return true, fmt.Errorf("engine unavailable")
 		}
+		newID, err := m.cfg.Engine.NewSession()
+		if err != nil {
+			return true, err
+		}
+		m.cfg.SessionID = newID
+		m.chat = panes.NewChat()
+
+		m.subagents = panes.NewSubagents()
+		m.toolNames = make(map[string]string)
+		m.toolArgs = make(map[string]map[string]any)
+		m.busy = false
+		m.totalInput = 0
+		m.totalOutput = 0
+		m.totalCost = 0
+		m.streamTextLen = 0
+		m.contextUsed = 0
+		m.contextWin = 0
+		m.inputHistory = nil
+		m.historyIdx = -1
+		m.historyDraft = ""
+		m.relayout()
 		return true, nil
 	case "/resume":
-		if m.cfg.ResumeSession == nil {
-			return true, fmt.Errorf("[/resume is unavailable]")
+		if m.cfg.Engine == nil {
+			return true, fmt.Errorf("engine unavailable")
 		}
 		if len(parts) > 1 {
 			// ID supplied directly — resume immediately.
-			newID, history, err := m.cfg.ResumeSession(parts[1])
+			newID, history, err := m.cfg.Engine.Resume(parts[1])
 			if err != nil {
 				return true, err
 			}
@@ -990,64 +884,66 @@ func (m *Model) handleSlash(text string) (bool, error) {
 			return true, nil
 		}
 		// No ID: open the session picker dialog.
-		dlg := dialogs.NewSessionPickerDialog(m.cfg.FetchSessions).WithSize(m.width, m.height)
-		if m.cfg.DeleteSession != nil {
-			dlg = dlg.WithDeleteFn(m.cfg.DeleteSession)
-		}
+		dlg := dialogs.NewSessionPickerDialog(m.cfg.Engine.ListSessions).WithDeleteFn(m.cfg.Engine.DeleteSession).WithSize(m.width, m.height)
 		m.dialog = dlg
 		return true, nil
 	case "/restore", "/undo":
 		return true, fmt.Errorf("%s not yet implemented in TUI", text)
 	case "/login":
-		if m.cfg.LoginProviders == nil {
-			return true, fmt.Errorf("login not available in this mode")
+		if m.cfg.Engine == nil {
+			return true, fmt.Errorf("engine unavailable")
 		}
-		m.dialog = dialogs.NewLoginDialog(m.cfg.LoginProviders()).WithSize(m.width, m.height)
+		providers, err := m.cfg.Engine.LoginProviders()
+		if err != nil {
+			return true, err
+		}
+		m.dialog = dialogs.NewLoginDialog(providers).WithSize(m.width, m.height)
 		return true, nil
 	case "/stats":
-		if m.cfg.Stats != nil {
-			m.chat = m.chat.AppendNotice("info", m.cfg.Stats())
-		} else {
-			m.chat = m.chat.AppendNotice("error", "stats unavailable")
+		if m.cfg.Engine == nil {
+			return true, fmt.Errorf("engine unavailable")
 		}
+		in, out, miss, cost, err := m.cfg.Engine.Stats()
+		if err != nil {
+			return true, err
+		}
+		m.chat = m.chat.AppendNotice("info", formatStats(in, out, miss, cost))
 		return true, nil
 	case "/model":
-		if m.cfg.FetchModels != nil {
-			query := ""
-			if len(parts) >= 2 {
-				query = strings.Join(parts[1:], " ")
-			}
-			m.dialog = dialogs.NewModelPickerDialog(m.cfg.Provider, m.cfg.Model, query, m.cfg.FetchModels).WithSize(m.width, m.height)
-			return true, nil
+		if m.cfg.Engine == nil {
+			return true, fmt.Errorf("engine unavailable")
 		}
-		if m.cfg.SubmitSlash != nil {
-			m.cfg.SubmitSlash(text)
-			return true, nil
+		query := ""
+		if len(parts) >= 2 {
+			query = strings.Join(parts[1:], " ")
 		}
-		m.chat = m.chat.AppendNotice("info", "model selection is managed on the server terminal")
+		m.dialog = dialogs.NewModelPickerDialog(m.cfg.Provider, m.cfg.Model, query, m.cfg.Engine.ListModels).WithSize(m.width, m.height)
 		return true, nil
 	case "/thinking":
-		if m.cfg.CycleThinking != nil {
-			newLevel := m.cfg.CycleThinking()
-			m.chat = m.chat.AppendNotice("info", "thinking level: "+newLevel)
-			return true, nil
+		if m.cfg.Engine == nil {
+			return true, fmt.Errorf("engine unavailable")
 		}
-		if m.cfg.SubmitSlash != nil {
-			m.cfg.SubmitSlash(text)
-			return true, nil
+		newLevel, err := m.cfg.Engine.CycleThinking()
+		if err != nil {
+			return true, err
 		}
-		m.chat = m.chat.AppendNotice("info", "thinking level is managed on the server terminal")
+		m.thinkingLevel = newLevel
+		m.chat = m.chat.AppendNotice("info", "thinking level: "+newLevel)
 		return true, nil
 	case "/push":
-		msg, notice := pushInstruction()
+		if m.cfg.Engine == nil {
+			return true, fmt.Errorf("engine unavailable")
+		}
+		msg, notice, err := m.cfg.Engine.PushInstruction()
+		if err != nil {
+			return true, err
+		}
 		if notice != "" {
 			m.chat = m.chat.AppendNotice("info", notice)
 		}
 		if msg != "" {
-			if m.cfg.InputCh != nil {
-				m.cfg.InputCh <- protocol.TextBlocks(msg)
-			} else if m.cfg.SubmitFn != nil {
-				m.cfg.SubmitFn(msg)
+			if m.cfg.Engine != nil {
+				m.cfg.Engine.Submit(protocol.TextBlocks(msg))
 			}
 		}
 		return true, nil
@@ -1056,12 +952,11 @@ func (m *Model) handleSlash(text string) (bool, error) {
 		if len(parts) >= 2 {
 			focus = strings.Join(parts[1:], " ")
 		}
-		if m.cfg.CompactCh != nil {
-			select {
-			case m.cfg.CompactCh <- focus:
-			default:
-				m.chat = m.chat.AppendNotice("error", "compaction request dropped (busy)")
-			}
+		if m.cfg.Engine == nil {
+			return true, fmt.Errorf("engine unavailable")
+		}
+		if err := m.cfg.Engine.Compact(focus); err != nil {
+			return true, err
 		}
 		return true, nil
 	case "/subagents":
@@ -1074,12 +969,14 @@ func (m *Model) handleSlash(text string) (bool, error) {
 		}
 		return true, nil
 	case "/mcp":
-		if m.cfg.MCPStatus != nil {
-			status := m.cfg.MCPStatus()
-			m.chat = m.chat.AppendNotice("info", status)
-		} else {
-			m.chat = m.chat.AppendNotice("error", "mcp status unavailable")
+		if m.cfg.Engine == nil {
+			return true, fmt.Errorf("engine unavailable")
 		}
+		status, err := m.cfg.Engine.MCPStatus()
+		if err != nil {
+			return true, err
+		}
+		m.chat = m.chat.AppendNotice("info", status)
 		return true, nil
 	case "/help", "/":
 		m.chat = m.chat.AppendNotice("info", m.slashHelp())
@@ -1096,6 +993,21 @@ func (m *Model) slashHelp() string {
 		fmt.Fprintf(&b, "  %-12s %s\n", sc.Name, sc.Desc)
 	}
 	return b.String()
+}
+
+func formatStats(input, output, cacheMiss int, cost float64) string {
+	cached := input - cacheMiss
+	if cached < 0 {
+		cached = 0
+	}
+	rate := 0.0
+	if input > 0 {
+		rate = float64(cached) / float64(input) * 100
+	}
+	if cost > 0 {
+		return fmt.Sprintf("[stats] input=%d | output=%d | cached=%d (%.1f%%) | cost=$%.4f", input, output, cached, rate, cost)
+	}
+	return fmt.Sprintf("[stats] input=%d | output=%d | cached=%d (%.1f%%)", input, output, cached, rate)
 }
 
 func (m *Model) updateFilePicker() {
@@ -1118,6 +1030,14 @@ func (m *Model) updateFilePicker() {
 	}
 
 	// Activate / refresh the file picker.
+	if m.cfg.Engine != nil {
+		paths, err := m.cfg.Engine.ListFiles(query)
+		if err == nil {
+			m.filePicker.activatePaths(paths, query, atIdx)
+			m.relayout()
+			return
+		}
+	}
 	m.filePicker.activate(m.cwd, query, atIdx)
 	m.relayout()
 }
@@ -1213,12 +1133,7 @@ func (m Model) renderCompletions() string {
 func (m Model) handleEvent(e protocol.Event) Model {
 	switch ev := e.(type) {
 	case protocol.UserInput:
-		// In attach mode (SubmitFn set), the enter handler already appended
-		// non-slash messages locally for instant feedback. The server echoes
-		// them back as UserInput — skip the duplicate. Slash commands *are*
-		// needed here because they're forwarded via SubmitSlash and the local
-		// handler doesn't append them (they'd never appear otherwise).
-		if m.cfg.SubmitFn != nil && !strings.HasPrefix(ev.Text, "/") {
+		if _, ok := m.cfg.Engine.(*client.RemoteEngine); ok && !strings.HasPrefix(ev.Text, "/") {
 			break
 		}
 		m.chat = m.chat.AppendUserBlocks(protocol.TextBlocks(ev.Text))
@@ -1280,6 +1195,7 @@ func (m Model) handleEvent(e protocol.Event) Model {
 				m.contextWin = m.cfg.Pricing.ContextWindow(m.cfg.Model)
 			}
 		}
+		m.reseedStats()
 		m.streamTextLen = 0
 		m.relayout()
 	case protocol.PermissionRequested:
@@ -1341,7 +1257,6 @@ func (m Model) mainView() string {
 	sections = append(sections, m.promptBoxView())
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
-
 
 // thinkingMessages are cycled while the model is busy (one per 4 seconds).
 var thinkingMessages = []string{
@@ -1551,133 +1466,6 @@ type dialog interface {
 var _ dialog = (*dialogs.ConfirmDialog)(nil)
 var _ dialog = (*dialogs.ModelPickerDialog)(nil)
 var _ dialog = (*dialogs.LoginDialog)(nil)
-
-// pushInstruction runs git checks and returns a message to send to the agent
-// plus an optional notice for the chat pane. Mirrors pi's /push extension.
-func pushInstruction() (msg string, notice string) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", fmt.Sprintf("push: getwd: %v", err)
-	}
-
-	// 1. Check if inside a git repo.
-	isGit := false
-	if out, err := exec.Command("git", "rev-parse", "--is-inside-work-tree").Output(); err == nil {
-		isGit = strings.TrimSpace(string(out)) == "true"
-	}
-
-	if !isGit {
-		dirName := filepath.Base(cwd)
-		ghUser := ""
-		if out, err := exec.Command("gh", "api", "user", "--jq", ".login").Output(); err == nil {
-			ghUser = strings.TrimSpace(string(out))
-		}
-		userClause := ""
-		if ghUser != "" {
-			userClause = " My GitHub username is " + ghUser + "."
-		}
-		return fmt.Sprintf(
-			"Initialize a new git repository named %q in the current directory, add all current files as the initial commit, and create a corresponding public repository on GitHub using 'gh repo create %q --public --source=. --remote=origin --push'.%s",
-			dirName, dirName, userClause,
-		), ""
-	}
-
-	// 2. It is a git repo — check for changes.
-	statusOut, err := exec.Command("git", "status", "--porcelain").Output()
-	if err != nil {
-		return "", fmt.Sprintf("push: git status: %v", err)
-	}
-	changes := strings.TrimSpace(string(statusOut))
-
-	branch := ""
-	if out, err := exec.Command("git", "branch", "--show-current").Output(); err == nil {
-		branch = strings.TrimSpace(string(out))
-	}
-
-	head := ""
-	if out, err := exec.Command("git", "rev-parse", "HEAD").Output(); err == nil {
-		head = strings.TrimSpace(string(out))
-	}
-
-	unpushed := 0
-	if out, err := exec.Command("git", "rev-list", "--count", "@{u}..HEAD").Output(); err == nil {
-		unpushed, _ = strconv.Atoi(strings.TrimSpace(string(out)))
-	}
-
-	if changes == "" {
-		if unpushed > 0 {
-			return fmt.Sprintf(
-				"There were %d commit(s) already waiting to be pushed when /push was called. Push those existing commits to the remote repository. The branch is %q and HEAD is %s.",
-				unpushed, branch, head,
-			), ""
-		}
-		return "", "push: no changes or unpushed commits"
-	}
-
-	// 3. Construct detailed instruction.
-	return fmt.Sprintf(
-		"I want to handle all current changes and any commits that were already waiting to be pushed when /push was called. Please follow these rules strictly:\n"+
-			"1. Ensure .gitignore exists before committing.\n"+
-			"2. Examine all changed files (including untracked ones) using git status and git diff.\n"+
-			"3. Group files that were changed for the same reason.\n"+
-			"4. If changes perform different functions, split them into multiple commits. DO NOT commit 10+ files in one commit if they were changed for different reasons.\n"+
-			"5. For each commit, use the format: 'type(abc): message', where:\n"+
-			"   - 'type' is one of: feat, fix, chore, refactor, docs, style, test, perf.\n"+
-			"   - 'abc' is a one-word representation of what was touched (e.g., 'api', 'ui', 'config', 'cli').\n"+
-			"6. There were %d commit(s) already waiting to be pushed when /push was called. Push those pre-existing commits if this count is greater than zero. To avoid accidentally pushing newly-created commits, push before creating new commits or push only up to the command-start HEAD (%s) on branch %q.\n"+
-			"7. After creating commits for the current changes, decide whether those newly-created commits should also be pushed. Do not automatically push them unless you determine it is appropriate.\n\n"+
-			"Current changes reported by git:\n%s\n\n"+
-			"Please analyze the diffs, perform the commits, and push only the commits that should be pushed under the rules above.",
-		unpushed, head, branch, changes,
-	), ""
-}
-
-// imageExts is the set of file extensions we treat as images.
-var imageExts = map[string]string{
-	".png":  "image/png",
-	".jpg":  "image/jpeg",
-	".jpeg": "image/jpeg",
-	".gif":  "image/gif",
-	".webp": "image/webp",
-}
-
-// resolveInput parses @path tokens from the user text, loads image files as
-// BlockImage blocks, and returns the full []ContentBlock plus a display string
-// (with @paths left in place so the user sees what was attached).
-func resolveInput(text string) ([]protocol.ContentBlock, string) {
-	var blocks []protocol.ContentBlock
-	words := strings.Fields(text)
-	var remaining []string
-
-	for _, w := range words {
-		if !strings.HasPrefix(w, "@") {
-			remaining = append(remaining, w)
-			continue
-		}
-		path := w[1:]
-		ext := strings.ToLower(filepath.Ext(path))
-		mime, ok := imageExts[ext]
-		if !ok {
-			remaining = append(remaining, w)
-			continue
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			remaining = append(remaining, w)
-			continue
-		}
-		blocks = append(blocks, protocol.ContentBlock{
-			Type:  protocol.BlockImage,
-			Image: &protocol.ImageBlock{MediaType: mime, Data: base64.StdEncoding.EncodeToString(data)},
-		})
-	}
-
-	plainText := strings.Join(remaining, " ")
-	if plainText != "" {
-		blocks = append([]protocol.ContentBlock{{Type: protocol.BlockText, Text: plainText}}, blocks...)
-	}
-	return blocks, text
-}
 
 // pasteClipboardImage tries to read a PNG image from the system clipboard,
 // writes it to a temp file, and returns the @path string to insert into the

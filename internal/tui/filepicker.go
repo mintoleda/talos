@@ -239,6 +239,25 @@ func (fp *filePickerState) activate(cwd string, query string, atIndex int) {
 	}
 }
 
+func (fp *filePickerState) activatePaths(paths []string, query string, atIndex int) {
+	fp.active = true
+	fp.query = query
+	fp.atIndex = atIndex
+	fp.cachedRoot = ""
+	fp.cachedEntries = nil
+	fp.results = fp.results[:0]
+	for _, p := range paths {
+		isDir := strings.HasSuffix(p, "/")
+		fp.results = append(fp.results, filePickerEntry{
+			Path:  strings.TrimSuffix(p, "/"),
+			IsDir: isDir,
+		})
+	}
+	if fp.selected >= len(fp.results) {
+		fp.selected = 0
+	}
+}
+
 func (fp *filePickerState) deactivate() {
 	fp.active = false
 	fp.results = nil
