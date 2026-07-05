@@ -11,7 +11,9 @@ import (
 	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/executor"
 	"github.com/mintoleda/talos/internal/loop"
+	"github.com/mintoleda/talos/internal/mcp"
 	"github.com/mintoleda/talos/internal/models"
+	"github.com/mintoleda/talos/internal/notify"
 	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/provider"
@@ -29,6 +31,7 @@ type app struct {
 	prov         provider.Provider
 	exec         executor.Executor
 	agentBuilder *agents.Builder
+	mcpManager   *mcp.Manager
 	cwd          string
 	noTools      bool
 
@@ -100,11 +103,23 @@ func (a *app) switchProvider(pName, pModel string) error {
 	return a.switchProviderFor(a.lp, pName, pModel)
 }
 
-func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices *pricing.Table) tui.NewTabFunc {
-	return func(tabCtx context.Context, tabID int) (tui.Config, <-chan protocol.Event, error) {
+func (a *app) toggleSubagents() string {
+	if a.pb == nil {
+		return "subagents not configured"
+	}
+	enabled := !a.pb.SubagentEnabled()
+	a.pb.SetSubagentEnabled(enabled)
+	if enabled {
+		return "subagents: on"
+	}
+	return "subagents: off"
+}
+
+func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices *pricing.Table, notifyCfg notify.Config) tui.NewTabFunc {
+	return func(tabCtx context.Context, tabID int) (tui.Config, <-chan protocol.Event, func(), error) {
 		ntx, id, err := a.newSession()
 		if err != nil {
-			return tui.Config{}, nil, fmt.Errorf("new tab session: %w", err)
+			return tui.Config{}, nil, nil, fmt.Errorf("new tab session: %w", err)
 		}
 
 		newLp := loop.New(a.prov, a.exec, ntx, a.pb)
@@ -125,7 +140,13 @@ func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices 
 		comp.Clamp()
 		newLp.SetCompactor(comp)
 
-		inCh, steerQueue, intCh, cmpCh, evCh := tui.StartEngine(tabCtx, newLp, cp)
+		inCh, steerQueue, intCh, cmpCh, evCh, engineCleanup := tui.StartEngine(tabCtx, newLp, cp, notifyCfg)
+
+		// Wrap the engine cleanup to also close the per-tab loop.
+		cleanup := func() {
+			engineCleanup()
+			newLp.Close()
+		}
 
 		cfg := tui.Config{
 			SessionID:   id,
@@ -134,6 +155,7 @@ func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices 
 			SteerQueue:  steerQueue,
 			InterruptCh: intCh,
 			CompactCh:   cmpCh,
+			Shutdown:    cleanup,
 			Provider:    a.cfg.Provider,
 			Model:       a.cfg.Model,
 			Pricing:     prices,
@@ -197,6 +219,11 @@ func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices 
 					a.agentBuilder.CancelSubagent(id)
 				}
 			},
+			MCPStatus: func() string { return a.mcpManager.Status() },
+			MCPCount: func() int { return a.mcpManager.ConnectedCount() },
+			ToggleSubagents: func() string {
+				return a.toggleSubagents()
+			},
 			StatsSnapshot: func() (int, int, int, float64) {
 				s := newLp.Stats()
 				cm := s.InputTokens - s.CachedTokens
@@ -208,7 +235,7 @@ func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices 
 			},
 		}
 
-		return cfg, evCh, nil
+		return cfg, evCh, cleanup, nil
 	}
 }
 

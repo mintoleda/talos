@@ -3,14 +3,24 @@ package styles
 import "github.com/charmbracelet/lipgloss"
 
 var (
-	// Chat styles
+	FilePickerSelected = lipgloss.NewStyle().
+				Background(lipgloss.Color("236")).
+				Foreground(lipgloss.Color("254")).
+				Bold(true)
+	FilePickerDir = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("111"))
+	FilePickerFile = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("251"))
+	FilePickerHint = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240")).
+			Italic(true)
+
 	UserStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
 	AssistantStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
 	DimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	ErrorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	ThinkStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("248")).Italic(true)
 
-	// Tool pane styles
 	ToolRunningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("221"))
 	ToolOKStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))
 	ToolErrorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
@@ -28,16 +38,13 @@ var (
 	// ToolCursorStyle colors the ▌ gutter bar on the selected row.
 	ToolCursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("111"))
 
-	// Status bar
 	StatusBarStyle = lipgloss.NewStyle().
 			Background(lipgloss.Color("235")).
 			Foreground(lipgloss.Color("251"))
 
-	// Thinking animation line (shown above status bar while busy)
 	ThinkingLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("146"))
 	ThinkingMsgStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("183")).Italic(true)
 
-	// Status bar segment styles
 	StatusSepStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	StatusDirStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
 	StatusModelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true)
@@ -48,8 +55,8 @@ var (
 	StatusCostStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))
 	StatusOutStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("251"))
 	StatusMissStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	StatusMCPStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("140"))
 
-	// Dialog styles
 	DialogBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("39")).
@@ -60,7 +67,6 @@ var (
 				Bold(true).
 				Foreground(lipgloss.Color("39"))
 
-	// Input
 	InputStyle = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("240"))
@@ -69,7 +75,6 @@ var (
 			Border(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("237"))
 
-	// Vim mode indicator
 	VimNormalStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("220")).
 			Bold(true)
@@ -80,7 +85,6 @@ var (
 
 	BatchStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 
-	// Pane borders
 	PaneStyle = lipgloss.NewStyle().
 			Padding(0, 1)
 

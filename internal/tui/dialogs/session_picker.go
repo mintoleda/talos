@@ -69,6 +69,13 @@ func (d *SessionPickerDialog) WithDeleteFn(fn DeleteSessionFunc) *SessionPickerD
 	return d
 }
 
+// WithSize pre-seeds the dialog dimensions so the first render is correct
+// without waiting for a WindowSizeMsg.
+func (d *SessionPickerDialog) WithSize(w, h int) *SessionPickerDialog {
+	d.width, d.height = w, h
+	return d
+}
+
 func (d *SessionPickerDialog) Init() tea.Cmd {
 	return tea.Batch(d.spinner.Tick, d.doFetch())
 }

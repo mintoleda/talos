@@ -65,6 +65,11 @@ func NewModelPickerDialog(currentProvider, currentModel, initialQuery string, fe
 	}
 }
 
+func (d *ModelPickerDialog) WithSize(w, h int) *ModelPickerDialog {
+	d.width, d.height = w, h
+	return d
+}
+
 func (d *ModelPickerDialog) Init() tea.Cmd {
 	return tea.Batch(textinput.Blink, d.spinner.Tick, d.doFetch())
 }

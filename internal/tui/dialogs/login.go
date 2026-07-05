@@ -54,6 +54,11 @@ func NewLoginDialog(providers []LoginProvider) *LoginDialog {
 	}
 }
 
+func (d *LoginDialog) WithSize(w, h int) *LoginDialog {
+	d.width, d.height = w, h
+	return d
+}
+
 func (d *LoginDialog) Init() tea.Cmd { return textinput.Blink }
 
 func (d *LoginDialog) Update(msg tea.Msg) (tea.Model, tea.Cmd) {

@@ -4,25 +4,40 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/mintoleda/talos/internal/loop"
+	"github.com/mintoleda/talos/internal/notify"
 	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/tui/dialogs"
 )
 
+func QuitOnSignal(p *tea.Program) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM)
+	go func() {
+		<-ch
+		p.Quit()
+	}()
+}
+
 // StartEngine launches the goroutines that drive a loop and returns the
 // channels needed to wire them into a TUI model Config.
-func StartEngine(ctx context.Context, lp *loop.Loop, cp *safety.Checkpointer) (
+func StartEngine(ctx context.Context, lp *loop.Loop, cp *safety.Checkpointer, notifyCfg notify.Config) (
 	inputCh chan<- []protocol.ContentBlock,
 	steerQueue *SteerQueue,
 	interruptCh chan<- struct{},
 	compactCh chan<- string,
 	eventCh <-chan protocol.Event,
+	cleanup func(),
 ) {
 	evCh := make(chan protocol.Event, 64)
 	inCh := make(chan []protocol.ContentBlock, 1)
@@ -30,9 +45,14 @@ func StartEngine(ctx context.Context, lp *loop.Loop, cp *safety.Checkpointer) (
 	lp.SteerFunc = sq.Drain
 	intCh := make(chan struct{}, 1)
 	cmpCh := make(chan string, 1)
-	emit := func(e protocol.Event) { evCh <- e }
+	rawEmit := func(e protocol.Event) { evCh <- e }
+	emit := notify.Wrap(rawEmit, notifyCfg)
 
+	var wg sync.WaitGroup
+
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for blocks := range inCh {
 			if cp != nil {
 				_, _ = cp.Snapshot("before-run")
@@ -57,7 +77,9 @@ func StartEngine(ctx context.Context, lp *loop.Loop, cp *safety.Checkpointer) (
 		}
 	}()
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for focus := range cmpCh {
 			compactCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 			summary, err := lp.CompactNow(compactCtx, focus)
@@ -72,7 +94,14 @@ func StartEngine(ctx context.Context, lp *loop.Loop, cp *safety.Checkpointer) (
 		}
 	}()
 
-	return inCh, sq, intCh, cmpCh, evCh
+	cleanup = func() {
+		close(inCh)
+		close(cmpCh)
+		close(evCh)
+		wg.Wait()
+	}
+
+	return inCh, sq, intCh, cmpCh, evCh, cleanup
 }
 
 // RunTabs starts the TUI in multi-tab mode. initial is the fully-wired Config
@@ -82,9 +111,11 @@ func StartEngine(ctx context.Context, lp *loop.Loop, cp *safety.Checkpointer) (
 func RunTabs(ctx context.Context, initial Config, initialEventCh <-chan protocol.Event, newTab NewTabFunc) error {
 	m := NewTabsModel(ctx, initial, initialEventCh, newTab)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	QuitOnSignal(p)
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("tui: %w", err)
 	}
+	m.ShutdownAll()
 	return nil
 }
 
@@ -177,16 +208,22 @@ func Run(
 		},
 	})
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	QuitOnSignal(p)
 
-	// Bridge harness events to Bubble Tea.
+	var producerWg sync.WaitGroup
+	var bridgeWg sync.WaitGroup
+
+	bridgeWg.Add(1)
 	go func() {
+		defer bridgeWg.Done()
 		for e := range eventCh {
 			p.Send(EventMsg{E: e})
 		}
 	}()
 
-	// Engine loop goroutine.
+	producerWg.Add(1)
 	go func() {
+		defer producerWg.Done()
 		for blocks := range inputCh {
 			if cp != nil {
 				_, _ = cp.Snapshot("before-run")
@@ -212,8 +249,9 @@ func Run(
 		}
 	}()
 
-	// Compaction goroutine.
+	producerWg.Add(1)
 	go func() {
+		defer producerWg.Done()
 		for focus := range compactCh {
 			compactCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 			summary, err := lp.CompactNow(compactCtx, focus)
@@ -232,5 +270,11 @@ func Run(
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("tui: %w", err)
 	}
+
+	close(inputCh)
+	close(compactCh)
+	producerWg.Wait()
+	close(eventCh)
+	bridgeWg.Wait()
 	return nil
 }

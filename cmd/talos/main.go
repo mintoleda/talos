@@ -8,14 +8,17 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/mintoleda/talos/internal/agents"
 	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/executor"
 	"github.com/mintoleda/talos/internal/loop"
+	"github.com/mintoleda/talos/internal/mcp"
 	"github.com/mintoleda/talos/internal/memory"
 	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/protocol"
@@ -42,6 +45,7 @@ type Flags struct {
 	Provider     string
 	BaseURL      string
 	NoTools      bool
+	NoSubagents  bool
 	SystemPrompt string
 	DebugCache   bool
 }
@@ -71,6 +75,7 @@ func run() error {
 	flag.StringVar(&f.Provider, "provider", "", "provider: openai or anthropic")
 	flag.StringVar(&f.BaseURL, "base-url", "", "base URL override")
 	flag.BoolVar(&f.NoTools, "no-tools", false, "disable tools")
+	flag.BoolVar(&f.NoSubagents, "no-subagents", false, "disable subagents at startup")
 	flag.StringVar(&f.SystemPrompt, "system-prompt", "", "system prompt override")
 	flag.BoolVar(&f.DebugCache, "debug-cache", false, "log cache prefix hashes")
 	flag.BoolVar(&serverMode, "server", false, "run as a long-lived daemon")
@@ -225,9 +230,17 @@ func run() error {
 		reads = tools.NewReadSet()
 	}
 	reads.SetSavePath(sess.Path + ".reads.json")
+
+	mcpManager, mcpErrs := mcp.NewManager(context.Background(), cfg.MCPServers)
+	defer mcpManager.Close()
+	for _, e := range mcpErrs {
+		fmt.Fprintf(os.Stderr, "[mcp] %v\n", e)
+	}
+
 	var (
-		reg          *tools.Registry
-		agentBuilder *agents.Builder
+		reg              *tools.Registry
+		agentBuilder     *agents.Builder
+		subagentListing string
 	)
 	if f.NoTools {
 		reg = tools.EmptyRegistry()
@@ -270,9 +283,11 @@ func run() error {
 			}
 			sort.Strings(allAgents)
 			reg.Add(agentBuilder.SpawnTools(allAgents)...)
-			cfg.SystemPrompt += agents.RenderListing(defs, allAgents)
+			subagentListing = agents.RenderListing(defs, allAgents)
+			cfg.SystemPrompt += subagentListing
 		}
 		reg.Add(tools.NewMemoryWrite(cfg.BaseDir))
+		reg.Add(mcpManager.Tools()...)
 	}
 
 	prov, compactor, err := newProvider(cfg, f.NoTools)
@@ -286,8 +301,22 @@ func run() error {
 	pb := loop.NewPromptBuilder(cfg.SystemPrompt, reg.Schemas(), cfg.Model)
 	pb.SetThinkingLevel(cfg.ThinkingLevel)
 	pb.SetContextLimit(prices.ContextWindow(cfg.Model))
+
+	// Wire subagent data into the prompt builder so subagent listing and
+	// spawn-tool schemas can be toggled at runtime without losing them from
+	// the registry. Apply the --no-subagents flag as the initial state.
+	if agentBuilder != nil {
+		subagentToolNames := make(map[string]bool)
+		for _, n := range agentBuilder.SubagentToolNames() {
+			subagentToolNames[n] = true
+		}
+		pb.SetSubagentData(subagentListing, subagentToolNames)
+		if f.NoSubagents {
+			pb.SetSubagentEnabled(false)
+		}
+	}
 	// Inject a per-turn reminder listing files the model has actually opened
-	// in this session. Goes into the last user message so it does not break
+	// in this session. Surfaced via Request.Volatile so it does not break
 	// the cacheable prefix (system + tools + messages[:-1]).
 	pb.SetContextFn(func() string {
 		total := reads.Len()
@@ -308,6 +337,7 @@ func run() error {
 	lp := loop.New(prov, exec, tx, pb)
 	lp.SetCompactor(compactor)
 	lp.DebugCache = f.DebugCache
+	lp.KillBgOnInterrupt = cfg.KillBgOnInterrupt
 	defer lp.Close()
 
 	a := &app{
@@ -317,6 +347,7 @@ func run() error {
 		prov:         prov,
 		exec:         exec,
 		agentBuilder: agentBuilder,
+		mcpManager:   mcpManager,
 		cwd:          cwd,
 		noTools:      f.NoTools,
 	}
@@ -328,12 +359,38 @@ func run() error {
 		return runServer(context.Background(), cfg, a, lp, cp, sess.ID)
 
 	case f.Print != "":
+		ctx, cancel := context.WithCancel(context.Background())
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			select {
+			case <-sigCh:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
 		_, _ = cp.Snapshot("before-run")
-		return lp.RunTurn(context.Background(), protocol.TextBlocks(f.Print), renderTo(os.Stdout, f.DebugCache))
+		err := lp.RunTurn(ctx, protocol.TextBlocks(f.Print), renderTo(os.Stdout, f.DebugCache))
+		signal.Reset(syscall.SIGINT, syscall.SIGTERM)
+		cancel()
+
+		// Ephemeral session: -p runs must not leave traces on disk.
+		// Remove the transcript and reads files so the session does not
+		// show up in /resume or the resume picker.
+		os.Remove(sess.Path)
+		os.Remove(sess.Path + ".reads.json")
+		if parent := filepath.Dir(sess.Path); parent != "." {
+			entries, _ := os.ReadDir(parent)
+			if len(entries) == 0 {
+				os.Remove(parent)
+			}
+		}
+
+		return err
 
 	default:
 		tuiCtx := context.Background()
-		inCh, steerQueue, intCh, cmpCh, evCh := tui.StartEngine(tuiCtx, lp, cp)
+		inCh, steerQueue, intCh, cmpCh, evCh, engineCleanup := tui.StartEngine(tuiCtx, lp, cp, cfg.Notifications)
 
 		ls := lp.Stats()
 		cacheMiss := ls.InputTokens - ls.CachedTokens
@@ -349,6 +406,7 @@ func run() error {
 			SteerQueue:  steerQueue,
 			InterruptCh: intCh,
 			CompactCh:   cmpCh,
+			Shutdown:    engineCleanup,
 			Provider:    cfg.Provider,
 			Model:       cfg.Model,
 			Pricing:     prices,
@@ -431,9 +489,22 @@ func run() error {
 				}
 				return s.InputTokens, s.OutputTokens, cm, c
 			},
+			MCPStatus: func() string { return mcpManager.Status() },
+			MCPCount: func() int { return mcpManager.ConnectedCount() },
+			ToggleSubagents: func() string {
+				if pb == nil {
+					return "subagents not configured"
+				}
+				enabled := !pb.SubagentEnabled()
+				pb.SetSubagentEnabled(enabled)
+				if enabled {
+					return "subagents: on"
+				}
+				return "subagents: off"
+			},
 		}
 
-		return tui.RunTabs(tuiCtx, initialCfg, evCh, a.makeNewTabFn(tuiCtx, cp, prices))
+		return tui.RunTabs(tuiCtx, initialCfg, evCh, a.makeNewTabFn(tuiCtx, cp, prices, cfg.Notifications))
 	}
 }
 
@@ -566,6 +637,7 @@ func cleanBaseURL(raw string) string {
 
 func runServer(ctx context.Context, cfg *config.Config, a *app, lp *loop.Loop, cp *safety.Checkpointer, sessionID string) error {
 	engine := server.NewLoopEngine(ctx, lp, cp, sessionID)
+	engine.SetNotifyConfig(cfg.Notifications)
 	engine.SetSlashHandler(func(cmd string, emit func(protocol.Event)) string {
 		parts := strings.Fields(cmd)
 		if len(parts) == 0 {
@@ -595,7 +667,6 @@ func runServer(ctx context.Context, cfg *config.Config, a *app, lp *loop.Loop, c
 			return fmt.Sprintf("thinking level: %s", cur)
 		case "/model":
 			if len(parts) >= 2 {
-				// /model <provider/model> — switch directly.
 				arg := parts[1]
 				parts := strings.SplitN(arg, "/", 2)
 				var pName, pModel string
@@ -616,7 +687,6 @@ func runServer(ctx context.Context, cfg *config.Config, a *app, lp *loop.Loop, c
 				})
 				return fmt.Sprintf("switched to %s/%s", pName, pModel)
 			}
-			// /model with no args — fetch and display available models.
 			entries, err := a.fetchModels()
 			if err != nil {
 				return fmt.Sprintf("fetch models: %v", err)
@@ -631,6 +701,10 @@ func runServer(ctx context.Context, cfg *config.Config, a *app, lp *loop.Loop, c
 			}
 			b.WriteString("\n\nUse /model <provider/model> to switch.")
 			return b.String()
+		case "/mcp":
+			return a.mcpManager.Status()
+		case "/subagents":
+			return a.toggleSubagents()
 		default:
 			return fmt.Sprintf("unknown command: %s", parts[0])
 		}
@@ -680,7 +754,6 @@ func runAttach(ctx context.Context, cfg *config.Config, sessionID string) error 
 	})
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 
-	// Forward server events to the Bubble Tea program.
 	go func() {
 		for ev := range events {
 			p.Send(tui.EventMsg{E: ev})

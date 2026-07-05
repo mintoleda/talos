@@ -12,9 +12,10 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/protocol"
@@ -38,14 +39,6 @@ const (
 	NormalMode
 )
 
-// focusedPane tracks which pane receives j/k scroll in normal mode.
-type focusedPane int
-
-const (
-	focusChat focusedPane = iota
-	focusTools
-	focusSubagents
-)
 
 // slashCommand describes one available slash command.
 type slashCommand struct {
@@ -63,6 +56,8 @@ var slashCommands = []slashCommand{
 	{"/login", "Add an API key for a provider"},
 	{"/model", "Switch provider/model (optionally: /model <query>)"},
 	{"/thinking", "Cycle thinking level"},
+	{"/subagents", "Toggle subagent delegation on/off"},
+	{"/mcp", "List connected MCP servers and their tools"},
 	{"/push", "Commit and push changes to GitHub"},
 	{"/exit", "Quit Talos"},
 }
@@ -103,6 +98,7 @@ type Config struct {
 	// Used by attach mode to forward interrupts to a remote server.
 	InterruptFn func()
 	InterruptCh chan<- struct{}
+	Shutdown func()
 	NewSession  func() (string, error)
 	Stats       func() string // returns formatted stats string for /stats
 	// ResumeSession loads an existing session by id, sets it on the loop, and
@@ -156,6 +152,15 @@ type Config struct {
 	// StatsSnapshot returns the current cumulative stats from the loop.
 	// Used by /resume to refresh the TUI counters after switching transcripts.
 	StatsSnapshot func() (input, output, cacheMiss int, cost float64)
+
+	// MCPStatus returns a human-readable summary of connected MCP servers.
+	MCPStatus func() string
+	// MCPCount returns the number of connected MCP servers.
+	MCPCount func() int
+
+	// ToggleSubagents toggles subagent visibility on/off at runtime and
+	// returns a human-readable message describing the new state.
+	ToggleSubagents func() string
 }
 
 // SteerQueue is a thread-safe queue of pending steer messages shared between
@@ -218,16 +223,14 @@ type Model struct {
 	cfg           Config
 	mode          Mode
 	vimMode       VimMode
-	focusPane     focusedPane
 	quitConfirm    bool
 	escClearConfirm bool
 	width          int
 	height         int
 	paneH          int // height allocated to panes, updated in relayout
 	chat      panes.ChatModel
-	tools     panes.ToolsModel
 	subagents panes.SubagentsModel
-	input     textinput.Model
+	input     textarea.Model
 	busy      bool
 	spinner       spinner.Model
 	dialog        tea.Model
@@ -264,13 +267,45 @@ type Model struct {
 	// Slash-command autocompletion.
 	slashCompletions []slashCommand
 	slashSelected    int // index into slashCompletions, -1 when none
+
+	// File picker for @ autocomplete.
+	filePicker filePickerState
+
+	// mcpCount is the number of connected MCP servers; shown in the status bar.
+	mcpCount int
+
+	// subagentDisabled is true when the user has turned off subagents via
+	// /subagents. When disabled, the spawn-tool schemas and system-prompt
+	// listing are stripped from requests built by the PromptBuilder.
+	subagentDisabled bool
+
+	// pendingCmd carries a tea.Cmd produced inside handleSlash (which cannot
+	// return commands directly) out to the Update loop. Consumed and cleared by
+	// the caller. Used by /resume to force a full repaint.
+	pendingCmd tea.Cmd
+
+	// inputRows is the number of visual rows the prompt box currently displays
+	// for the (soft-wrapping) input, computed by relayout(). The textarea's own
+	// height is kept pinned at maxInputRows (see relayout) so its internal
+	// viewport never needs to scroll under the cap; inputRows only controls how
+	// many of its rendered rows promptBoxView prints.
+	inputRows int
 }
 
 // NewModel builds the initial TUI model.
 func NewModel(cfg Config) Model {
-	ti := textinput.New()
-	ti.Prompt = ""
+	ti := textarea.New()
+	ti.Prompt = ""                 // the "›" glyph is drawn by promptBoxView, not textarea
 	ti.Placeholder = "Type a message..."
+	ti.ShowLineNumbers = false
+	ti.CharLimit = 0               // no limit; long input soft-wraps instead
+	// Neutralize the default cursor-line background so the input reads as plain
+	// text inside our rounded box rather than a highlighted bar.
+	ti.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	ti.BlurredStyle.CursorLine = lipgloss.NewStyle()
+	// Enter submits (intercepted before textarea sees it); these insert a literal
+	// newline for multi-line messages.
+	ti.KeyMap.InsertNewline.SetKeys("shift+enter", "alt+enter", "ctrl+j")
 	ti.Focus()
 
 	sp := spinner.New()
@@ -281,7 +316,6 @@ func NewModel(cfg Config) Model {
 		cfg:              cfg,
 		mode:             cfg.Mode,
 		chat:             panes.NewChat(),
-		tools:            panes.NewTools(),
 		subagents:        panes.NewSubagents(),
 		input:            ti,
 		spinner:          sp,
@@ -293,13 +327,18 @@ func NewModel(cfg Config) Model {
 		slashCompletions: nil,
 		slashSelected:    -1,
 		cwd:              cwd,
+		filePicker:       filePickerState{},
 		totalInput:       cfg.SeedStats.InputTokens,
 		totalOutput:      cfg.SeedStats.OutputTokens,
 		totalCacheMiss:   cfg.SeedStats.CacheMiss,
 		totalCost:        cfg.SeedStats.Cost,
+		mcpCount:         0,
 	}
 	if cfg.CurrentThinkingLevel != nil {
 		m.thinkingLevel = cfg.CurrentThinkingLevel()
+	}
+	if cfg.MCPCount != nil {
+		m.mcpCount = cfg.MCPCount()
 	}
 	// Seed the context window from the pricing table so the status bar shows
 	// context usage from the very first turn instead of waiting for TurnEnded.
@@ -307,7 +346,7 @@ func NewModel(cfg Config) Model {
 		m.contextWin = cfg.Pricing.ContextWindow(cfg.Model)
 	}
 
-	// Replay any pre-loaded transcript into the chat/tools panes. This is what
+	// Replay any pre-loaded transcript into the chat pane. This is what
 	// makes `talos -c` visually feel like a continuation: without it the model
 	// has the context but the user sees a blank screen and assumes the session
 	// was reset. The relayout is deferred — terminal size isn't known yet, so
@@ -320,9 +359,8 @@ func NewModel(cfg Config) Model {
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
-		textinput.Blink,
+		textarea.Blink,
 		m.spinner.Tick,
-		m.tools.Init(),
 		m.subagents.Init(),
 	)
 }
@@ -368,15 +406,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err != nil {
 				m.chat = m.chat.AppendNotice("error", err.Error())
 			} else {
-				m.chat = panes.NewChat()
-				m.tools = panes.NewTools()
-				m.toolNames = make(map[string]string)
-				m.toolArgs = make(map[string]map[string]any)
-				m.busy = false
-				m.cfg.SessionID = newID
-				m.relayout()
-				m.replayTranscript(history)
-				m.reseedStats()
+				return m, m.applyResume(newID, history)
 			}
 		}
 		return m, nil
@@ -409,7 +439,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cur += " "
 				}
 				m.input.SetValue(cur + ref)
-				m.input.SetCursor(len(m.input.Value()))
+				m.input.CursorEnd()
+				m.relayout()
 			}
 			return m, nil
 		}
@@ -435,59 +466,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.vimMode == NormalMode {
-			// While kill-confirm is pending on the subagents pane, only y/n/esc
-			// are accepted; all other navigation is suppressed.
-			if m.focusPane == focusSubagents && m.subagents.KillConfirmActive() {
-				switch msg.String() {
-				case "y", "Y":
-					id := m.subagents.SelectedID()
-					m.subagents = m.subagents.KillConfirmCancel()
-					if id != "" && m.cfg.CancelSubagent != nil {
-						m.cfg.CancelSubagent(id)
-					}
-				case "n", "N", "esc":
-					m.subagents = m.subagents.KillConfirmCancel()
-				}
-				return m, nil
-			}
-
 			switch msg.String() {
 			case "i":
 				m.vimMode = InsertMode
-				m.input.Focus()
-			case "h":
-				m.cycleFocus(false)
-			case "l":
-				m.cycleFocus(true)
+				return m, m.input.Focus()
 			case "j":
-				switch m.focusPane {
-				case focusTools:
-					m.tools = m.tools.CursorDown()
-				case focusSubagents:
-					m.subagents = m.subagents.CursorDown()
-				default:
-					m.chat = m.chat.ScrollDown(1)
-				}
+				m.chat = m.chat.ScrollDown(2)
 			case "k":
-				switch m.focusPane {
-				case focusTools:
-					m.tools = m.tools.CursorUp()
-				case focusSubagents:
-					m.subagents = m.subagents.CursorUp()
-				default:
-					m.chat = m.chat.ScrollUp(1)
-				}
-			case "enter":
-				switch m.focusPane {
-				case focusTools:
-					m.tools = m.tools.ToggleExpand()
-				case focusSubagents:
-					m.subagents = m.subagents.ToggleExpand()
-				}
-			case "d":
-				if m.focusPane == focusSubagents && m.subagents.SelectedIsRunning() {
-					m.subagents = m.subagents.KillConfirmStart()
-				}
+				m.chat = m.chat.ScrollUp(2)
 			case "g":
 				m.chat = m.chat.ScrollTop()
 			case "G":
@@ -497,24 +483,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Insert mode key handling.
+		// File picker (@) takes priority when active.
+		if m.filePicker.active {
+			switch msg.String() {
+			case "up":
+				if len(m.filePicker.results) > 0 {
+					m.filePicker.selected = (m.filePicker.selected - 1 + len(m.filePicker.results)) % len(m.filePicker.results)
+				}
+				return m, nil
+			case "down":
+				if len(m.filePicker.results) > 0 {
+					m.filePicker.selected = (m.filePicker.selected + 1) % len(m.filePicker.results)
+				}
+				return m, nil
+			case "enter":
+				m.insertFilePickerSelection()
+				m.filePicker.deactivate()
+				m.slashCompletions = nil
+				m.slashSelected = -1
+				m.relayout()
+				return m, nil
+			case "tab":
+				m.insertFilePickerSelection()
+				m.filePicker.deactivate()
+				m.slashCompletions = nil
+				m.slashSelected = -1
+				m.relayout()
+				return m, nil
+			case "esc", "ctrl+c":
+				m.filePicker.deactivate()
+				m.relayout()
+				return m, nil
+			}
+		}
+
 		switch msg.String() {
 		case "esc":
 			if m.input.Value() == "" {
-				// No text to clear — act as normal blur / vim normal mode.
 				m.vimMode = NormalMode
 				m.input.Blur()
 				return m, nil
 			}
 			if m.escClearConfirm {
-				// Second esc: clear the prompt bar.
 				m.input.SetValue("")
 				m.escClearConfirm = false
 				m.slashCompletions = nil
 				m.slashSelected = -1
+				m.filePicker.deactivate()
 				m.relayout()
 				return m, nil
 			}
-			// First esc with non-empty input: show clear hint.
 			m.escClearConfirm = true
 			return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return clearEscClearConfirmMsg{} })
 		case "ctrl+l":
@@ -523,9 +541,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.chat = m.chat.AppendNotice("info", "model selection is managed on the server terminal")
 					return m, nil
 				}
-				m.dialog = dialogs.NewModelPickerDialog(m.cfg.Provider, m.cfg.Model, "", m.cfg.FetchModels)
+				m.dialog = dialogs.NewModelPickerDialog(m.cfg.Provider, m.cfg.Model, "", m.cfg.FetchModels).WithSize(m.width, m.height)
 				return m, m.dialog.Init()
 			}
+			return m, nil
+		case "ctrl+o":
+			m.chat = m.chat.ToggleToolExpand()
+			return m, nil
+		case "alt+g":
+			m.chat = m.chat.ScrollBottom()
+			return m, nil
+		case "alt+t":
+			m.chat = m.chat.ToggleThinkExpand()
 			return m, nil
 		case "ctrl+t":
 			if !m.busy {
@@ -541,30 +568,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab":
 			if len(m.slashCompletions) > 0 {
 				m.slashSelected = (m.slashSelected + 1) % len(m.slashCompletions)
-				return m, nil
-			}
-			if m.busy && (m.tools.Count() > 0 || m.subagents.Count() > 0) {
-				m.cycleFocus(true)
 			}
 			return m, nil
 		case "shift+tab":
 			if len(m.slashCompletions) > 0 {
 				m.slashSelected = (m.slashSelected - 1 + len(m.slashCompletions)) % len(m.slashCompletions)
-				return m, nil
-			}
-			if m.busy && (m.tools.Count() > 0 || m.subagents.Count() > 0) {
-				m.cycleFocus(false)
 			}
 			return m, nil
 		case "enter":
-			if m.busy && m.focusPane == focusTools && m.tools.Count() > 0 {
-				m.tools = m.tools.ToggleExpand()
-				return m, nil
-			}
-			if m.busy && m.focusPane == focusSubagents && m.subagents.Count() > 0 {
-				m.subagents = m.subagents.ToggleExpand()
-				return m, nil
-			}
 			if m.busy {
 				// While busy, Enter queues as a "steer" message — it gets
 				// injected after the current tool calls finish but before the
@@ -592,7 +603,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					completed := m.slashCompletions[m.slashSelected].Name
 					if text != completed {
 						m.input.SetValue(completed)
-						m.input.SetCursor(len(completed))
+						m.input.CursorEnd()
 						m.slashCompletions = nil
 						m.slashSelected = -1
 						m.relayout()
@@ -602,6 +613,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Clear completions and submit.
 				m.slashCompletions = nil
 				m.slashSelected = -1
+				m.filePicker.deactivate()
 				m.relayout()
 				m.input.Reset()
 				if text == "/exit" {
@@ -614,10 +626,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, nil
 					}
 					if handled {
+						cmd := m.pendingCmd
+						m.pendingCmd = nil
 						if m.dialog != nil {
-							return m, m.dialog.Init()
+							return m, tea.Batch(cmd, m.dialog.Init())
 						}
-						return m, nil // handled but no dialog (e.g. /new)
+						return m, cmd // handled but no dialog (e.g. /new)
 					}
 					// Save to input history (non-slash messages only).
 					m.inputHistory = append(m.inputHistory, text)
@@ -660,20 +674,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 						text := strings.Join(parts, " ")
 						m.input.SetValue(text)
-						m.input.SetCursor(len(text))
+						m.input.CursorEnd()
 						m.escClearConfirm = false
+						m.relayout()
 						return m, nil
 					}
 				}
-				// No pending steer — scroll behavior as before.
-				switch {
-				case m.focusPane == focusTools && m.tools.Count() > 0:
-					m.tools = m.tools.CursorUp()
-				case m.focusPane == focusSubagents && m.subagents.Count() > 0:
-					m.subagents = m.subagents.CursorUp()
-				default:
-					m.chat = m.chat.ScrollUp(1)
-				}
+				// No pending steer — scroll chat.
+				m.chat = m.chat.ScrollUp(2)
 				return m, nil
 			}
 			// Not busy, no completions: cycle input history backward.
@@ -687,8 +695,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.historyIdx--
 			}
 			m.input.SetValue(m.inputHistory[m.historyIdx])
-			m.input.SetCursor(len(m.inputHistory[m.historyIdx]))
+			m.input.CursorEnd()
 			m.escClearConfirm = false
+			m.filePicker.deactivate()
+			m.relayout()
 			return m, nil
 		case "down":
 			if len(m.slashCompletions) > 0 {
@@ -696,14 +706,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if m.busy {
-				switch {
-				case m.focusPane == focusTools && m.tools.Count() > 0:
-					m.tools = m.tools.CursorDown()
-				case m.focusPane == focusSubagents && m.subagents.Count() > 0:
-					m.subagents = m.subagents.CursorDown()
-				default:
-					m.chat = m.chat.ScrollDown(1)
-				}
+				m.chat = m.chat.ScrollDown(2)
 				return m, nil
 			}
 			// Not busy, no completions: cycle input history forward.
@@ -713,57 +716,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.historyIdx < len(m.inputHistory)-1 {
 				m.historyIdx++
 				m.input.SetValue(m.inputHistory[m.historyIdx])
-				m.input.SetCursor(len(m.inputHistory[m.historyIdx]))
+				m.input.CursorEnd()
 			} else {
 				m.historyIdx = -1
 				m.input.SetValue(m.historyDraft)
-				m.input.SetCursor(len(m.historyDraft))
+				m.input.CursorEnd()
 				m.historyDraft = ""
 			}
 			m.escClearConfirm = false
+			m.filePicker.deactivate()
+			m.relayout()
 			return m, nil
 		default:
 			m.escClearConfirm = false
 			var cmd tea.Cmd
 			m.input, cmd = m.input.Update(msg)
 			m.updateSlashCompletions()
+			m.updateFilePicker()
+			m.relayout() // input height may have changed (soft-wrap / newline)
 			return m, cmd
 		}
 
 	case tea.MouseMsg:
 		switch msg.Button {
 		case tea.MouseButtonLeft:
-			if msg.Y >= 0 && msg.Y < m.paneH {
-				chatW := m.width * 7 / 10
-				// Click in the right column toggles the item under the cursor.
-				if msg.X >= chatW+1 {
-					m.handlePaneClick(msg.Y)
-					return m, nil
-				}
-				// Click in the chat focuses it.
-				if msg.X >= 0 && msg.X < chatW {
-					m.focusPane = focusChat
-					return m, nil
-				}
-			}
 		case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
-			up := msg.Button == tea.MouseButtonWheelUp
-			// Route to tools pane when mouse is over it (right 30% when tools visible).
-			if m.tools.Count() > 0 {
-				chatW := m.width * 7 / 10
-				if msg.X >= chatW+1 {
-					if up {
-						m.tools = m.tools.ScrollUp(1)
-					} else {
-						m.tools = m.tools.ScrollDown(1)
-					}
-					return m, nil
-				}
-			}
-			if up {
-				m.chat = m.chat.ScrollUp(1)
+			if msg.Button == tea.MouseButtonWheelUp {
+				m.chat = m.chat.ScrollUp(2)
 			} else {
-				m.chat = m.chat.ScrollDown(1)
+				m.chat = m.chat.ScrollDown(2)
 			}
 		}
 		return m, nil
@@ -777,14 +758,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		if m.busy {
-			// Each spinner instance carries a unique ID and rejects TickMsgs
-			// whose ID doesn't match. Sub-model spinners (tools, subagents)
-			// never receive their own ticks because (a) their Init() tick
-			// arrives while m.busy is false, and (b) their returned commands
-			// are discarded.  Send a broadcast tick (ID=0, tag=0) that all
-			// spinners accept so the sub-model animations actually advance.
+			// Send a broadcast tick (ID=0, tag=0) that all spinners accept so
+			// the chat's active-tool animation advances.
 			broadcast := spinner.TickMsg{}
-			m.tools, _ = m.tools.Update(broadcast)
 			m.subagents, _ = m.subagents.Update(broadcast)
 			m.chat, _ = m.chat.Update(broadcast)
 		}
@@ -792,10 +768,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// Allow panes to handle their own updates (viewport scrolling, etc.).
-	var chatCmd, toolsCmd tea.Cmd
+	var chatCmd tea.Cmd
 	m.chat, chatCmd = m.chat.Update(msg)
-	m.tools, toolsCmd = m.tools.Update(msg)
-	return m, tea.Batch(chatCmd, toolsCmd)
+	return m, chatCmd
 }
 
 // replayTranscript populates the chat and tools panes from a loaded transcript.
@@ -843,13 +818,10 @@ func (m *Model) replayTranscript(msgs []protocol.FrozenMessage) {
 			for _, b := range msg.Content {
 				if b.Type == protocol.BlockToolUse && b.ToolUse != nil {
 					tu := b.ToolUse
-					first := m.tools.Count() == 0
-					m.tools = m.tools.AddTool(tu.ID, tu.Name, tu.Args)
-					if first {
-						m.relayout()
-					}
 					if result, ok := toolResults[tu.ID]; ok {
-						m.tools = m.tools.FinishTool(tu.ID, result)
+						m.chat = m.chat.AppendToolUse(tu.Name, tu.Args, !result.IsError, result.Content)
+					} else {
+						m.chat = m.chat.AppendToolUse(tu.Name, tu.Args, true, "")
 					}
 				}
 			}
@@ -868,6 +840,24 @@ func (m *Model) replayTranscript(msgs []protocol.FrozenMessage) {
 	m.relayout()
 }
 
+// applyResume swaps the TUI over to a freshly loaded session: it resets the
+// per-session panes and counters, replays the transcript, and reseeds the
+// cumulative stats. It returns tea.ClearScreen to force a full repaint —
+// replacing the whole transcript changes the rendered height, and the standard
+// renderer would otherwise leave the previous session's status bar ghosted
+// above the new one. Shared by the /resume picker and the direct /resume <id>.
+func (m *Model) applyResume(newID string, history []protocol.FrozenMessage) tea.Cmd {
+	m.chat = panes.NewChat()
+	m.toolNames = make(map[string]string)
+	m.toolArgs = make(map[string]map[string]any)
+	m.busy = false
+	m.cfg.SessionID = newID
+	m.relayout()
+	m.replayTranscript(history)
+	m.reseedStats()
+	return tea.ClearScreen
+}
+
 // reseedStats refreshes the cumulative token and cost counters from the
 // loop's StatsSnapshot callback. Used after /resume to show the loaded
 // session's historical stats instead of stale values from the old session.
@@ -881,60 +871,77 @@ func (m *Model) reseedStats() {
 	}
 }
 
-func (m *Model) relayout() {
-	// Layout: panes + (if busy: thinking line = 1) + rounded prompt box (3) + completions.
-	// The box folds the old separate status line and input border into a single 3-line unit.
-	thinkingH := 0
-	if m.busy {
-		thinkingH = 1
-	}
-	paneH := m.height - 3 - thinkingH - m.completionHeight()
+// maxInputRows caps how tall the input box may grow before it starts scrolling
+// internally (like Claude Code / pi.dev, which grow to a point then scroll).
+const maxInputRows = 10
 
-	// Tell the textinput how much room it has so it handles horizontal scrolling.
+func (m *Model) relayout() {
+	// Layout (top to bottom): chat pane + (if busy: thinking line) + completions
+	// + file picker + rounded prompt box. The prompt box is (top border) +
+	// (input rows) + (bottom border), and the input rows grow with soft-wrapped
+	// content instead of overflowing on one line.
 	inputContentW := m.width - 5 // │ > [content] │
 	if inputContentW < 1 {
 		inputContentW = 1
 	}
-	m.input.Width = inputContentW
+	m.input.SetWidth(inputContentW)
+
+	// Cap the box height, always leaving room for the borders and a little chat.
+	maxRows := maxInputRows
+	if lim := m.height - 4; lim < maxRows {
+		maxRows = lim
+	}
+	if maxRows < 1 {
+		maxRows = 1
+	}
+
+	// Keep the textarea's own height pinned at the cap at all times. textarea
+	// scrolls its internal viewport to keep the cursor visible on every
+	// keystroke (repositionView), using whatever height was set last. If we
+	// shrink it to fit content (e.g. down to 1 row) after each render, the next
+	// keystroke's Update runs against that stale small height, scrolls the
+	// viewport to follow the cursor, and hides every row above it — the box
+	// then only ever shows the current line. Pinning at the cap means
+	// repositionView never has cause to scroll while content stays under the
+	// cap; only measurement/display use the actual content row count.
+	m.input.SetHeight(maxRows)
+	inputRows := visibleRowCount(m.input.View())
+	if inputRows > maxRows {
+		inputRows = maxRows
+	}
+	if inputRows < 1 {
+		inputRows = 1
+	}
+	m.inputRows = inputRows
+
+	thinkingH := 0
+	if m.busy {
+		thinkingH = 1
+	}
+	boxH := inputRows + 2 // top border + input rows + bottom border
+	paneH := m.height - boxH - thinkingH - m.completionHeight() - m.filePicker.height()
 	if paneH < 1 {
 		paneH = 1
 	}
 	m.paneH = paneH
-	if m.tools.Count() > 0 || m.subagents.Count() > 0 {
-		// Split into chat + right column once a tool has run or a subagent spawned.
-		chatW := m.width * 7 / 10
-		rightW := m.width - chatW - 1
-		m.chat.SetSize(chatW, paneH)
-		switch {
-		case m.tools.Count() > 0 && m.subagents.Count() > 0:
-			// Stack tools over subagents in the right column.
-			toolsH := paneH / 2
-			subsH := paneH - toolsH
-			m.tools.SetSize(rightW, toolsH)
-			m.subagents.SetSize(rightW, subsH)
-		case m.subagents.Count() > 0:
-			m.subagents.SetSize(rightW, paneH)
-		default:
-			m.tools.SetSize(rightW, paneH)
-		}
-	} else {
-		m.chat.SetSize(m.width, paneH)
-	}
+	m.chat.SetSize(m.width, paneH)
 }
 
-// clipHeight truncates s to at most n lines. lipgloss's Height() only pads
-// content up to n lines — it never clips — so we enforce the ceiling here to
-// keep each pane truly independent of the other's content length.
-func clipHeight(s string, n int) string {
-	if n <= 0 {
-		return ""
+// visibleRowCount returns the number of visual rows a textarea View occupies,
+// ignoring the blank end-of-buffer rows textarea pads out to its height.
+func visibleRowCount(view string) int {
+	last := 0
+	for i, ln := range strings.Split(view, "\n") {
+		if strings.TrimSpace(ansi.Strip(ln)) != "" {
+			last = i + 1
+		}
 	}
-	lines := strings.SplitN(s, "\n", n+1)
-	if len(lines) > n {
-		lines = lines[:n]
+	if last < 1 {
+		last = 1
 	}
-	return strings.Join(lines, "\n")
+	return last
 }
+
 
 // handleSlash processes a slash command. Returns (handled, error) where handled=true
 // means the input was a slash command and should not be forwarded to the AI.
@@ -952,7 +959,7 @@ func (m *Model) handleSlash(text string) (bool, error) {
 			}
 			m.cfg.SessionID = newID
 			m.chat = panes.NewChat()
-			m.tools = panes.NewTools()
+
 			m.subagents = panes.NewSubagents()
 			m.toolNames = make(map[string]string)
 			m.toolArgs = make(map[string]map[string]any)
@@ -979,18 +986,11 @@ func (m *Model) handleSlash(text string) (bool, error) {
 			if err != nil {
 				return true, err
 			}
-			m.chat = panes.NewChat()
-			m.tools = panes.NewTools()
-			m.toolNames = make(map[string]string)
-			m.toolArgs = make(map[string]map[string]any)
-			m.busy = false
-			m.cfg.SessionID = newID
-			m.relayout()
-			m.replayTranscript(history)
+			m.pendingCmd = m.applyResume(newID, history)
 			return true, nil
 		}
 		// No ID: open the session picker dialog.
-		dlg := dialogs.NewSessionPickerDialog(m.cfg.FetchSessions)
+		dlg := dialogs.NewSessionPickerDialog(m.cfg.FetchSessions).WithSize(m.width, m.height)
 		if m.cfg.DeleteSession != nil {
 			dlg = dlg.WithDeleteFn(m.cfg.DeleteSession)
 		}
@@ -1002,7 +1002,7 @@ func (m *Model) handleSlash(text string) (bool, error) {
 		if m.cfg.LoginProviders == nil {
 			return true, fmt.Errorf("login not available in this mode")
 		}
-		m.dialog = dialogs.NewLoginDialog(m.cfg.LoginProviders())
+		m.dialog = dialogs.NewLoginDialog(m.cfg.LoginProviders()).WithSize(m.width, m.height)
 		return true, nil
 	case "/stats":
 		if m.cfg.Stats != nil {
@@ -1017,7 +1017,7 @@ func (m *Model) handleSlash(text string) (bool, error) {
 			if len(parts) >= 2 {
 				query = strings.Join(parts[1:], " ")
 			}
-			m.dialog = dialogs.NewModelPickerDialog(m.cfg.Provider, m.cfg.Model, query, m.cfg.FetchModels)
+			m.dialog = dialogs.NewModelPickerDialog(m.cfg.Provider, m.cfg.Model, query, m.cfg.FetchModels).WithSize(m.width, m.height)
 			return true, nil
 		}
 		if m.cfg.SubmitSlash != nil {
@@ -1064,6 +1064,23 @@ func (m *Model) handleSlash(text string) (bool, error) {
 			}
 		}
 		return true, nil
+	case "/subagents":
+		if m.cfg.ToggleSubagents != nil {
+			m.subagentDisabled = !m.subagentDisabled
+			msg := m.cfg.ToggleSubagents()
+			m.chat = m.chat.AppendNotice("info", msg)
+		} else {
+			m.chat = m.chat.AppendNotice("info", "subagents unavailable")
+		}
+		return true, nil
+	case "/mcp":
+		if m.cfg.MCPStatus != nil {
+			status := m.cfg.MCPStatus()
+			m.chat = m.chat.AppendNotice("info", status)
+		} else {
+			m.chat = m.chat.AppendNotice("error", "mcp status unavailable")
+		}
+		return true, nil
 	case "/help", "/":
 		m.chat = m.chat.AppendNotice("info", m.slashHelp())
 		return true, nil
@@ -1079,6 +1096,54 @@ func (m *Model) slashHelp() string {
 		fmt.Fprintf(&b, "  %-12s %s\n", sc.Name, sc.Desc)
 	}
 	return b.String()
+}
+
+func (m *Model) updateFilePicker() {
+	val := m.input.Value()
+
+	atIdx, query := extractLastAt(val)
+	if atIdx < 0 {
+		// No valid @ — deactivate if active.
+		if m.filePicker.active {
+			m.filePicker.deactivate()
+			m.relayout()
+		}
+		return
+	}
+
+	// Don't re-activate if the file picker was manually closed (query unchanged
+	// and still showing the same @ position).
+	if m.filePicker.active && m.filePicker.atIndex == atIdx && m.filePicker.query == query {
+		return
+	}
+
+	// Activate / refresh the file picker.
+	m.filePicker.activate(m.cwd, query, atIdx)
+	m.relayout()
+}
+
+func (m *Model) insertFilePickerSelection() {
+	path := m.filePicker.selectedPath()
+	if path == "" {
+		return
+	}
+	val := m.input.Value()
+	atIdx := m.filePicker.atIndex
+	if atIdx < 0 || atIdx >= len(val) {
+		return
+	}
+	// Replace from @ to end of current word with @path.
+	// Find where the current word after @ ends (next space or end).
+	end := atIdx + 1
+	for end < len(val) && val[end] != ' ' {
+		end++
+	}
+	newVal := val[:atIdx] + "@" + path
+	if end < len(val) && val[end] == ' ' {
+		newVal += " "
+	}
+	m.input.SetValue(newVal)
+	m.input.CursorEnd()
 }
 
 func (m *Model) updateSlashCompletions() {
@@ -1169,6 +1234,10 @@ func (m Model) handleEvent(e protocol.Event) Model {
 		if m.contextWin == 0 && ev.ContextLimit > 0 {
 			m.contextWin = ev.ContextLimit
 		}
+	case protocol.ThinkingBlock:
+		m.chat = m.chat.AppendThinkingBlock(ev.Text)
+	case protocol.ThinkingDelta:
+		m.chat = m.chat.AppendThinkDelta(ev.Text)
 	case protocol.TextDelta:
 		m.chat = m.chat.AppendDelta(ev.Text)
 		m.streamTextLen += len(ev.Text)
@@ -1178,6 +1247,7 @@ func (m Model) handleEvent(e protocol.Event) Model {
 	case protocol.ToolStarted:
 		m.chat = m.chat.FlushStreaming()
 		m.chat = m.chat.AddActiveTool(ev.ID, ev.Name)
+		m.chat = m.chat.AddProvisionalTool(ev.ID, ev.Name, ev.Args)
 		if m.toolNames == nil {
 			m.toolNames = make(map[string]string)
 		}
@@ -1186,20 +1256,13 @@ func (m Model) handleEvent(e protocol.Event) Model {
 		}
 		m.toolNames[ev.ID] = ev.Name
 		m.toolArgs[ev.ID] = ev.Args
-		first := m.tools.Count() == 0
-		m.tools = m.tools.AddTool(ev.ID, ev.Name, ev.Args)
-		if first {
-			// First tool just appeared: shrink the chat to make room.
-			m.relayout()
-		}
+	case protocol.ToolOutputDelta:
+		m.chat = m.chat.AppendToolDelta(ev.ID, ev.Text)
 	case protocol.ToolFinished:
 		m.chat = m.chat.RemoveActiveTool(ev.ID)
-		m.tools = m.tools.FinishTool(ev.ID, ev.Result)
-		if name, ok := m.toolNames[ev.ID]; ok {
-			m.chat = m.chat.AppendToolUse(name, m.toolArgs[ev.ID], !ev.Result.IsError)
-			delete(m.toolNames, ev.ID)
-			delete(m.toolArgs, ev.ID)
-		}
+		m.chat = m.chat.FinalizeProvisionalTool(ev.ID, !ev.Result.IsError, ev.Result.Content)
+		delete(m.toolNames, ev.ID)
+		delete(m.toolArgs, ev.ID)
 	case protocol.BatchFinished:
 	case protocol.Notice:
 		m.chat = m.chat.AppendNotice(ev.Level, ev.Text)
@@ -1220,14 +1283,33 @@ func (m Model) handleEvent(e protocol.Event) Model {
 		m.streamTextLen = 0
 		m.relayout()
 	case protocol.PermissionRequested:
-		m.dialog = dialogs.NewConfirmDialog(ev)
-	case protocol.SubagentStarted:
-		first := m.subagents.Count() == 0
-		m.subagents = m.subagents.HandleEvent(ev)
-		if first {
-			// First subagent appeared: split the right column to make room.
+		m.dialog = dialogs.NewConfirmDialog(ev).WithSize(m.width, m.height)
+	case protocol.EngineSnapshot:
+		// Newly-attached client syncing with a server that is mid-turn.
+		m.busy = ev.Busy
+		if ev.Busy {
+			m.busySince = time.Now()
+		}
+		if ev.StreamedText != "" {
+			m.chat = m.chat.AppendDelta(ev.StreamedText)
+			m.streamTextLen = len(ev.StreamedText)
+		}
+		for _, t := range ev.ActiveTools {
+			m.chat = m.chat.AddActiveTool(t.ID, t.Name)
+			if m.toolNames == nil {
+				m.toolNames = make(map[string]string)
+			}
+			if m.toolArgs == nil {
+				m.toolArgs = make(map[string]map[string]any)
+			}
+			m.toolNames[t.ID] = t.Name
+			m.toolArgs[t.ID] = t.Args
+		}
+		if ev.Busy || len(ev.ActiveTools) > 0 {
 			m.relayout()
 		}
+	case protocol.SubagentStarted:
+		m.subagents = m.subagents.HandleEvent(ev)
 	case protocol.SubagentEvent:
 		m.subagents = m.subagents.HandleEvent(ev)
 	case protocol.SubagentFinished:
@@ -1244,22 +1326,7 @@ func (m Model) View() string {
 }
 
 func (m Model) mainView() string {
-	var body string
-	if m.tools.Count() > 0 || m.subagents.Count() > 0 {
-		rightFocused := m.vimMode == NormalMode && (m.focusPane == focusTools || m.focusPane == focusSubagents)
-		sepColor := lipgloss.Color("238")
-		if rightFocused {
-			sepColor = lipgloss.Color("39")
-		}
-		sep := lipgloss.NewStyle().Foreground(sepColor).Render(panes.VerticalRule(m.paneH))
-		body = lipgloss.JoinHorizontal(lipgloss.Top,
-			clipHeight((&m.chat).View(), m.paneH),
-			sep,
-			clipHeight(m.rightColumn(), m.paneH),
-		)
-	} else {
-		body = (&m.chat).View()
-	}
+	body := (&m.chat).View()
 	var sections []string
 	sections = append(sections, body)
 	if m.busy {
@@ -1268,79 +1335,13 @@ func (m Model) mainView() string {
 	if comps := m.renderCompletions(); comps != "" {
 		sections = append(sections, comps)
 	}
+	if fp := m.filePicker.render(m.width); fp != "" {
+		sections = append(sections, fp)
+	}
 	sections = append(sections, m.promptBoxView())
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
-// rightColumn renders the chat-adjacent column: the tools pane, the subagents
-// pane, or both stacked (tools over subagents). The focused pane renders in its
-// focused (navigable) variant.
-func (m Model) rightColumn() string {
-	toolsOn := m.tools.Count() > 0
-	subsOn := m.subagents.Count() > 0
-	toolsView := func() string {
-		if m.vimMode == NormalMode && m.focusPane == focusTools {
-			return m.tools.ViewFocused()
-		}
-		return m.tools.View()
-	}
-	subsView := func() string {
-		if m.vimMode == NormalMode && m.focusPane == focusSubagents {
-			return m.subagents.ViewFocused()
-		}
-		return m.subagents.View()
-	}
-	switch {
-	case toolsOn && subsOn:
-		return lipgloss.JoinVertical(lipgloss.Left, toolsView(), subsView())
-	case subsOn:
-		return subsView()
-	default:
-		return toolsView()
-	}
-}
-
-func (m Model) availFocus() []focusedPane {
-	out := []focusedPane{focusChat}
-	if m.tools.Count() > 0 {
-		out = append(out, focusTools)
-	}
-	if m.subagents.Count() > 0 {
-		out = append(out, focusSubagents)
-	}
-	return out
-}
-
-func (m *Model) cycleFocus(forward bool) {
-	av := m.availFocus()
-	idx := 0
-	for i, f := range av {
-		if f == m.focusPane {
-			idx = i
-		}
-	}
-	if forward {
-		idx = (idx + 1) % len(av)
-	} else {
-		idx = (idx - 1 + len(av)) % len(av)
-	}
-	m.focusPane = av[idx]
-}
-
-func (m *Model) handlePaneClick(y int) {
-	toolsH := m.paneH
-	if m.tools.Count() > 0 && m.subagents.Count() > 0 {
-		toolsH = m.paneH / 2
-	}
-	switch {
-	case m.tools.Count() > 0 && y < toolsH:
-		m.tools = m.tools.Click(y)
-		m.focusPane = focusTools
-	case m.subagents.Count() > 0 && y >= toolsH:
-		m.subagents = m.subagents.Click(y - toolsH)
-		m.focusPane = focusSubagents
-	}
-}
 
 // thinkingMessages are cycled while the model is busy (one per 4 seconds).
 var thinkingMessages = []string{
@@ -1393,6 +1394,9 @@ func (m Model) statusParts() (left, right string) {
 	lp = append(lp, styles.StatusDirStyle.Render(shortenDir(m.cwd)))
 	lp = append(lp, styles.StatusModelStyle.Render(provider+"/"+model))
 	lp = append(lp, styles.StatusLevelStyle.Render(level))
+	if m.mcpCount > 0 {
+		lp = append(lp, styles.StatusMCPStyle.Render(fmt.Sprintf("mcp:%d", m.mcpCount)))
+	}
 	if active := m.subagents.ActiveCount(); active > 0 {
 		lp = append(lp, styles.StatusDirStyle.Render(fmt.Sprintf("sub:%d", active)))
 	}
@@ -1455,7 +1459,33 @@ func (m Model) promptBoxView() string {
 	rw := lipgloss.Width(rightStatus)
 
 	// Top border: ╭─ leftStatus ─────── rightStatus ─╮
-	// Fixed chars: "╭─ " (3) + " " (1) + dashes + " " (1) + " ─╮" (3) = 8 + lw + fillN + rw = m.width
+	// Fixed chars: "╭─ " (3) + " " (1) + dashes + " " (1) + " ─╮" (3) = 8 + lw + fillN + rw = m.width.
+	// On a narrow terminal the two statuses can exceed the available room; if we
+	// let them, the border overflows m.width and the terminal wraps it, which
+	// desyncs the renderer and ghosts a stale bar. Truncate to fit instead:
+	// keep whichever side is shorter intact and shrink the longer one, splitting
+	// evenly when both are long. budget leaves room for the fixed chars + 1 dash.
+	budget := m.width - 9
+	if budget < 1 {
+		budget = 1
+	}
+	if lw+rw > budget {
+		half := budget / 2
+		var lBudget, rBudget int
+		switch {
+		case lw <= half:
+			lBudget, rBudget = lw, budget-lw
+		case rw <= half:
+			lBudget, rBudget = budget-rw, rw
+		default:
+			lBudget, rBudget = budget-half, half
+		}
+		leftStatus = ansi.Truncate(leftStatus, lBudget, "…")
+		rightStatus = ansi.Truncate(rightStatus, rBudget, "…")
+		lw = lipgloss.Width(leftStatus)
+		rw = lipgloss.Width(rightStatus)
+	}
+
 	fillN := m.width - 8 - lw - rw
 	if fillN < 1 {
 		fillN = 1
@@ -1464,15 +1494,33 @@ func (m Model) promptBoxView() string {
 		b.Render(" "+strings.Repeat("─", fillN)+" ") +
 		rightStatus + b.Render(" ─╮")
 
-	// Input line: │ > inputContent │
-	// Fixed: "│" (1) + " " (1) + ">" (1) + " " (1) + content + "│" (1) = 5 + inputW = m.width
+	// Input area: one "│ > line │" row per visual line of the (soft-wrapping)
+	// textarea. The ">" glyph is drawn only on the first row; wrapped/continuation
+	// rows get a blank gutter so the text keeps aligned inside the box.
+	// Fixed: "│" (1) + " " (1) + glyph (1) + " " (1) + content + "│" (1) = 5 + inputW = m.width
 	inputW := m.width - 5
 	if inputW < 1 {
 		inputW = 1
 	}
-	prompt := styles.StatusModelStyle.Render(">")
-	inputContent := lipgloss.NewStyle().Width(inputW).Render(m.input.View())
-	inputLine := b.Render("│") + " " + prompt + " " + inputContent + b.Render("│")
+	glyph := styles.StatusModelStyle.Render(">")
+	blank := styles.StatusModelStyle.Render(" ")
+	pad := lipgloss.NewStyle().Width(inputW).MaxWidth(inputW)
+	// The textarea itself always renders at the (taller) cap height — see the
+	// comment in relayout() — so trim its output down to the rows relayout()
+	// determined actually hold content.
+	rendered := strings.Split(m.input.View(), "\n")
+	if len(rendered) > m.inputRows {
+		rendered = rendered[:m.inputRows]
+	}
+	var inputRows []string
+	for i, ln := range rendered {
+		g := glyph
+		if i > 0 {
+			g = blank
+		}
+		inputRows = append(inputRows, b.Render("│")+" "+g+" "+pad.Render(ln)+b.Render("│"))
+	}
+	inputArea := strings.Join(inputRows, "\n")
 
 	// Bottom border: ╰──────────╯
 	bottomDashes := m.width - 2
@@ -1481,7 +1529,7 @@ func (m Model) promptBoxView() string {
 	}
 	bottomBorder := b.Render("╰" + strings.Repeat("─", bottomDashes) + "╯")
 
-	return lipgloss.JoinVertical(lipgloss.Left, topBorder, inputLine, bottomBorder)
+	return lipgloss.JoinVertical(lipgloss.Left, topBorder, inputArea, bottomBorder)
 }
 
 func humanCount(n int) string {

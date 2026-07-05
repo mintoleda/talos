@@ -32,18 +32,33 @@ type segment struct {
 
 	// Tool-call segments are rendered lazily in body() so they reflow to the
 	// current pane width (a pre-styled string could not).
-	isTool   bool
-	toolName string
-	toolArgs map[string]any
-	toolOK   bool
+	isTool     bool
+	toolName   string
+	toolArgs   map[string]any
+	toolOK     bool
+	toolOutput string // raw result content; shown truncated when expanded
+
+	// Thinking segments hold the model's extended-thinking text for one block.
+	isThinking bool
+	thinkText  string
+}
+
+// provisionalTool holds the in-progress state of a running tool whose output
+// is streaming to the TUI before the tool finishes.
+type provisionalTool struct {
+	name   string
+	args   map[string]any
+	output strings.Builder // accumulated output chunks
 }
 
 // ChatModel renders the scrollback transcript for a single agent.
 type ChatModel struct {
 	vp          viewport.Model
 	segments    []segment // finalized turns
-	streaming   string    // current in-progress assistant response
-	activeTools map[string]string // id -> name of currently-running tools
+	streaming      string // current in-progress assistant response
+	streamingThink string // current in-progress thinking text
+	activeTools    map[string]string // id -> name of currently-running tools
+	provisionalTools map[string]*provisionalTool // id -> running tool with partial output
 	sp          spinner.Model
 	width       int
 	height      int
@@ -51,6 +66,8 @@ type ChatModel struct {
 	autoscroll  bool // pin viewport to bottom unless user has scrolled up
 	dirty       bool // viewport content needs recomputation (body() + SetContent)
 	mdCacheVersion int // incremented on SetSize; invalidates per-segment markdown cache
+	toolExpanded   bool // ctrl+o global toggle: show truncated output under each tool line
+	thinkExpanded  bool // alt+t global toggle: show thinking block text
 }
 
 func NewChat() ChatModel {
@@ -136,6 +153,8 @@ func (c ChatModel) body() string {
 		s := &c.segments[i]
 		b.WriteString(s.before)
 		switch {
+		case s.isThinking:
+			b.WriteString(c.renderThinkingSegment(*s))
 		case s.isTool:
 			b.WriteString(c.renderToolLine(*s))
 		case s.renderAsMarkdown:
@@ -155,11 +174,25 @@ func (c ChatModel) body() string {
 		}
 		b.WriteString(s.after)
 	}
+	if c.streamingThink != "" {
+		before := "\n"
+		if n := len(c.segments); n > 0 && c.segments[n-1].isThinking {
+			before = ""
+		}
+		b.WriteString(before)
+		b.WriteString(c.renderThinkingSegment(segment{thinkText: c.streamingThink}))
+		b.WriteString("\n")
+	}
 	if c.streaming != "" {
 		// Streaming text changes on every delta; there is no cache.
 		b.WriteString(c.md.Render(c.streaming))
 	}
-	if len(c.activeTools) > 0 {
+	// Provisional tools: render running tools with their partial output.
+	// These appear between streaming text and the active-tools spinner.
+	for _, pt := range c.provisionalTools {
+		b.WriteString(c.renderProvisionalTool(*pt))
+	}
+	if len(c.activeTools) > 0 && len(c.provisionalTools) == 0 {
 		b.WriteString("  ")
 		b.WriteString(styles.ToolRunningStyle.Render(strings.TrimRight(c.sp.View(), " ")))
 		b.WriteString(" ")
@@ -188,6 +221,43 @@ func (c ChatModel) RemoveActiveTool(id string) ChatModel {
 	delete(c.activeTools, id)
 	c.dirty = true
 	return c
+}
+
+// AddProvisionalTool creates a provisional segment for a running tool.
+// Called on ToolStarted alongside AddActiveTool so the tool's output can
+// stream live when Ctrl+O is toggled.
+func (c ChatModel) AddProvisionalTool(id, name string, args map[string]any) ChatModel {
+	if c.provisionalTools == nil {
+		c.provisionalTools = make(map[string]*provisionalTool)
+	}
+	c.provisionalTools[id] = &provisionalTool{name: name, args: args}
+	c.dirty = true
+	return c
+}
+
+// AppendToolDelta appends a chunk of live output to a running tool's buffer.
+func (c ChatModel) AppendToolDelta(id, text string) ChatModel {
+	if pt, ok := c.provisionalTools[id]; ok {
+		pt.output.WriteString(text)
+		c.dirty = true
+	}
+	return c
+}
+
+// FinalizeProvisionalTool converts a provisional tool into a finalized
+// tool segment using the accumulated output. If no output was streamed
+// (non-streaming tool), falls back to resultContent from ToolFinished.
+func (c ChatModel) FinalizeProvisionalTool(id string, ok bool, resultContent string) ChatModel {
+	pt, exists := c.provisionalTools[id]
+	if !exists {
+		return c
+	}
+	delete(c.provisionalTools, id)
+	out := pt.output.String()
+	if out == "" {
+		out = resultContent
+	}
+	return c.AppendToolUse(pt.name, pt.args, ok, out)
 }
 
 // markdownSegment pre-renders a segment's text through glamour so body() can
@@ -246,8 +316,8 @@ func (c ChatModel) AppendBatchHeading(_ int) ChatModel {
 
 // AppendToolUse adds a completed tool-call entry inline in the chat transcript.
 // The call descriptor (path/command/query) is derived from the arguments and
-// rendered lazily so it reflows on resize; full output lives in the tools pane.
-func (c ChatModel) AppendToolUse(name string, args map[string]any, ok bool) ChatModel {
+// rendered lazily so it reflows on resize.
+func (c ChatModel) AppendToolUse(name string, args map[string]any, ok bool, output string) ChatModel {
 	// Group a run of consecutive tool calls into a compact block: only the
 	// first one (preceded by text) gets a blank separator line above it.
 	before := "\n"
@@ -255,17 +325,105 @@ func (c ChatModel) AppendToolUse(name string, args map[string]any, ok bool) Chat
 		before = ""
 	}
 	return c.append(segment{
-		isTool:   true,
-		toolName: name,
-		toolArgs: args,
-		toolOK:   ok,
-		before:   before,
-		after:    "\n",
+		isTool:     true,
+		toolName:   name,
+		toolArgs:   args,
+		toolOK:     ok,
+		toolOutput: output,
+		before:     before,
+		after:      "\n",
 	})
 }
 
+// ToggleToolExpand flips the global tool-output expansion flag (ctrl+o).
+func (c ChatModel) ToggleToolExpand() ChatModel {
+	c.toolExpanded = !c.toolExpanded
+	c.syncViewportContent()
+	return c
+}
+
+// AppendThinkingBlock adds a completed thinking-block entry to the transcript.
+func (c ChatModel) AppendThinkingBlock(text string) ChatModel {
+	// Clear any in-progress streaming think to avoid duplication — the
+	// finalized segment will contain the same text.
+	c.streamingThink = ""
+	before := "\n"
+	if n := len(c.segments); n > 0 && c.segments[n-1].isThinking {
+		before = ""
+	}
+	return c.append(segment{
+		isThinking: true,
+		thinkText:  text,
+		before:     before,
+		after:      "\n",
+	})
+}
+
+// AppendThinkDelta accumulates streaming thinking text without touching the
+// viewport. View() will render it as a live thinking segment each frame.
+func (c ChatModel) AppendThinkDelta(text string) ChatModel {
+	c.streamingThink += text
+	c.dirty = true
+	return c
+}
+
+// FlushThinkStreaming moves the in-progress streaming thinking text into a
+// finalized thinking segment.
+func (c ChatModel) FlushThinkStreaming() ChatModel {
+	if c.streamingThink == "" {
+		return c
+	}
+	before := "\n"
+	if n := len(c.segments); n > 0 && c.segments[n-1].isThinking {
+		before = ""
+	}
+	c.segments = append(c.segments, segment{
+		isThinking: true,
+		thinkText:  c.streamingThink,
+		before:     before,
+		after:      "\n",
+	})
+	c.streamingThink = ""
+	c.dirty = true
+	return c
+}
+
+// ToggleThinkExpand flips the global thinking-block expansion flag (alt+t).
+func (c ChatModel) ToggleThinkExpand() ChatModel {
+	c.thinkExpanded = !c.thinkExpanded
+	c.syncViewportContent()
+	return c
+}
+
+// renderThinkingSegment renders a collapsed or expanded thinking block.
+func (c ChatModel) renderThinkingSegment(s segment) string {
+	width := c.width
+	if width < 1 {
+		width = 80
+	}
+	header := "  " + styles.ThinkStyle.Render("⟨thinking…⟩")
+	if !c.thinkExpanded || s.thinkText == "" {
+		return header
+	}
+	return header + "\n" + renderThinkingOutput(s.thinkText, width)
+}
+
+func renderThinkingOutput(text string, width int) string {
+	innerW := width - 4
+	if innerW < 1 {
+		innerW = 1
+	}
+	wrapped := ansi.Wordwrap(strings.TrimRight(text, "\n"), innerW, "")
+	var b strings.Builder
+	for _, ln := range strings.Split(wrapped, "\n") {
+		b.WriteString(styles.DimStyle.Render("    "+ln) + "\n")
+	}
+	return b.String()
+}
+
 // renderToolLine styles a single inline tool entry, indented under the assistant
-// text and truncated to the pane width.
+// text and truncated to the pane width. When toolExpanded is true it appends a
+// truncated preview of the tool output (up to toolOutputPreviewLines lines).
 func (c ChatModel) renderToolLine(s segment) string {
 	icon := "✓"
 	style := styles.ToolOKStyle
@@ -278,7 +436,75 @@ func (c ChatModel) renderToolLine(s segment) string {
 		width = 80
 	}
 	desc := formatToolCall(s.toolName, s.toolArgs)
-	return "  " + toolLine(icon, style, s.toolName, desc, width-2, lipgloss.Width(s.toolName))
+	header := "  " + toolLine(icon, style, s.toolName, desc, width-2, lipgloss.Width(s.toolName))
+	if !c.toolExpanded || s.toolOutput == "" {
+		return header
+	}
+	return header + "\n" + renderToolOutput(s.toolOutput, width)
+}
+
+const toolOutputPreviewLines = 5
+
+// renderToolOutput renders a truncated, dimmed preview of raw tool output.
+func renderToolOutput(output string, width int) string {
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	total := len(lines)
+	shown := lines
+	truncated := false
+	if total > toolOutputPreviewLines {
+		shown = lines[:toolOutputPreviewLines]
+		truncated = true
+	}
+	var b strings.Builder
+	for _, ln := range shown {
+		b.WriteString(styles.DimStyle.Render("    "+truncate(ln, width-4)) + "\n")
+	}
+	if truncated {
+		b.WriteString(styles.DimStyle.Render(fmt.Sprintf("    … %d more lines", total-toolOutputPreviewLines)) + "\n")
+	}
+	return b.String()
+}
+
+// renderProvisionalTool renders a running tool with its streaming output.
+// Shows a spinner icon instead of ✓/✗, and renders the last 20 lines of
+// accumulated output as a rolling window when toolExpanded is true.
+func (c ChatModel) renderProvisionalTool(pt provisionalTool) string {
+	width := c.width
+	if width < 1 {
+		width = 80
+	}
+	desc := formatToolCall(pt.name, pt.args)
+	icon := strings.TrimRight(c.sp.View(), " ")
+	header := "  " + toolLine(icon, styles.ToolRunningStyle, pt.name, desc, width-2, lipgloss.Width(pt.name))
+
+	out := pt.output.String()
+	if !c.toolExpanded || out == "" {
+		return header + "\n"
+	}
+	return header + "\n" + renderProvisionalOutput(out, width) + "\n"
+}
+
+const provisionalOutputLines = 20
+
+// renderProvisionalOutput renders a rolling window of the last N lines of
+// streaming tool output, so the user sees what's happening now (tail -f style).
+func renderProvisionalOutput(output string, width int) string {
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	total := len(lines)
+	var shown []string
+	var header string
+	if total > provisionalOutputLines {
+		header = styles.DimStyle.Render(fmt.Sprintf("    … %d lines above", total-provisionalOutputLines)) + "\n"
+		shown = lines[total-provisionalOutputLines:]
+	} else {
+		shown = lines
+	}
+	var b strings.Builder
+	b.WriteString(header)
+	for _, ln := range shown {
+		b.WriteString(styles.DimStyle.Render("    "+truncate(ln, width-4)) + "\n")
+	}
+	return b.String()
 }
 
 func (c ChatModel) AppendNotice(level, text string) ChatModel {
@@ -302,6 +528,7 @@ func (c ChatModel) AppendAssistantText(text string) ChatModel {
 // Call this before inserting a tool-call entry so text before the tool is
 // separated from text that follows it.
 func (c ChatModel) FlushStreaming() ChatModel {
+	c = c.FlushThinkStreaming()
 	if c.streaming == "" {
 		return c
 	}
@@ -326,6 +553,7 @@ func (c ChatModel) PopLastSegment() ChatModel {
 }
 
 func (c ChatModel) FinalizeTurn(usage protocol.Usage) ChatModel {
+	c = c.FlushThinkStreaming()
 	if c.streaming != "" {
 		seg := c.markdownSegment(segment{
 			style:            styles.AssistantStyle,

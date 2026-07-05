@@ -22,6 +22,11 @@ func NewConfirmDialog(ev protocol.PermissionRequested) *ConfirmDialog {
 	return &ConfirmDialog{ev: ev}
 }
 
+func (d *ConfirmDialog) WithSize(w, h int) *ConfirmDialog {
+	d.width, d.height = w, h
+	return d
+}
+
 func (d *ConfirmDialog) Init() tea.Cmd { return nil }
 
 func (d *ConfirmDialog) Update(msg tea.Msg) (tea.Model, tea.Cmd) {

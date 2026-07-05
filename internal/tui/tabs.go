@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -25,6 +25,7 @@ type newTabReadyMsg struct {
 	id      int
 	model   Model
 	eventCh <-chan protocol.Event
+	cleanup func()
 	err     error
 }
 
@@ -34,12 +35,12 @@ type tabState struct {
 	model   Model
 	title   string
 	eventCh <-chan protocol.Event
+	cleanup func()
 }
 
 // NewTabFunc creates the engine and channels for a new tab.
 // ctx is a lifecycle context; tabID is the unique tab identifier.
-// Returns the Config for the tab's Model, a read-only event channel, and any error.
-type NewTabFunc func(ctx context.Context, tabID int) (Config, <-chan protocol.Event, error)
+type NewTabFunc func(ctx context.Context, tabID int) (Config, <-chan protocol.Event, func(), error)
 
 // TabsModel is the root BubbleTea model when tabs are enabled.
 type TabsModel struct {
@@ -60,6 +61,7 @@ func NewTabsModel(ctx context.Context, initialCfg Config, initialEventCh <-chan 
 		model:   NewModel(initialCfg),
 		title:   "1",
 		eventCh: initialEventCh,
+		cleanup: initialCfg.Shutdown,
 	}
 	return TabsModel{
 		tabs:   []tabState{tab},
@@ -150,6 +152,7 @@ func (m TabsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			model:   sizedModel,
 			title:   fmt.Sprintf("%d", len(m.tabs)+1),
 			eventCh: msg.eventCh,
+			cleanup: msg.cleanup,
 		})
 		m.active = len(m.tabs) - 1
 		// Resize existing tabs now that the tab bar has appeared.
@@ -172,7 +175,13 @@ func (m TabsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.spawnTab(tabID)
 		case "ctrl+w":
 			if len(m.tabs) == 1 {
+				if m.tabs[0].cleanup != nil {
+					m.tabs[0].cleanup()
+				}
 				return m, tea.Quit
+			}
+			if m.tabs[m.active].cleanup != nil {
+				m.tabs[m.active].cleanup()
 			}
 			m.tabs = append(m.tabs[:m.active], m.tabs[m.active+1:]...)
 			if m.active >= len(m.tabs) {
@@ -185,17 +194,17 @@ func (m TabsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.tabs[0].model = updated.(Model)
 			}
 			// Restart cursor blink for the tab that's now active.
-			return m, textinput.Blink
+			return m, textarea.Blink
 		case "alt+l":
 			if len(m.tabs) > 1 {
 				m.active = (m.active + 1) % len(m.tabs)
-				return m, textinput.Blink
+				return m, textarea.Blink
 			}
 			return m, nil
 		case "alt+h":
 			if len(m.tabs) > 1 {
 				m.active = (m.active - 1 + len(m.tabs)) % len(m.tabs)
-				return m, textinput.Blink
+				return m, textarea.Blink
 			}
 			return m, nil
 		case "alt+1", "alt+2", "alt+3", "alt+4", "alt+5",
@@ -204,7 +213,7 @@ func (m TabsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			idx := digit - 1
 			if idx >= 0 && idx < len(m.tabs) {
 				m.active = idx
-				return m, textinput.Blink
+				return m, textarea.Blink
 			}
 			return m, nil
 		}
@@ -219,11 +228,19 @@ func (m TabsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *TabsModel) ShutdownAll() {
+	for _, tab := range m.tabs {
+		if tab.cleanup != nil {
+			tab.cleanup()
+		}
+	}
+}
+
 func (m TabsModel) spawnTab(tabID int) tea.Cmd {
 	ctx := m.ctx
 	fn := m.newTab
 	return func() tea.Msg {
-		cfg, eventCh, err := fn(ctx, tabID)
+		cfg, eventCh, cleanup, err := fn(ctx, tabID)
 		if err != nil {
 			return newTabReadyMsg{id: tabID, err: err}
 		}
@@ -231,6 +248,7 @@ func (m TabsModel) spawnTab(tabID int) tea.Cmd {
 			id:      tabID,
 			model:   NewModel(cfg),
 			eventCh: eventCh,
+			cleanup: cleanup,
 		}
 	}
 }
