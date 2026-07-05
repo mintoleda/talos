@@ -24,6 +24,10 @@ type Engine interface {
 	// Steer injects a steer message (text typed while the agent was busy)
 	// that gets processed before the next LLM call.
 	Steer(blocks []protocol.ContentBlock)
+	// WithdrawSteer removes the most recently queued steer message, if any.
+	WithdrawSteer() []protocol.ContentBlock
+	// PendingSteers reports how many steer messages are queued.
+	PendingSteers() int
 
 	// NewSession starts a fresh conversation and returns its ID.
 	NewSession() (id string, err error)
@@ -56,6 +60,14 @@ type Engine interface {
 	MCPCount() int
 	// CancelSubagent cancels a running subagent by ID.
 	CancelSubagent(id string)
+	// History returns the current transcript backlog for newly attached clients.
+	History() ([]protocol.FrozenMessage, error)
+	// ListFiles returns file-picker candidates for @ completion.
+	ListFiles(prefix string) ([]string, error)
+	// ResolveInput turns user text into content blocks on the engine machine.
+	ResolveInput(text string) ([]protocol.ContentBlock, string, error)
+	// PushInstruction builds the /push agent instruction on the engine machine.
+	PushInstruction() (msg string, notice string, err error)
 
 	// Events returns a read-only channel of protocol events emitted by the
 	// engine (text deltas, tool calls, notices, turn-end, etc.).

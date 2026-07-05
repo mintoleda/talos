@@ -67,6 +67,24 @@ func (q *steerQueue) Drain() [][]protocol.ContentBlock {
 	return msgs
 }
 
+func (q *steerQueue) Withdraw() []protocol.ContentBlock {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := len(q.messages)
+	if n == 0 {
+		return nil
+	}
+	last := q.messages[n-1]
+	q.messages = q.messages[:n-1]
+	return last
+}
+
+func (q *steerQueue) Len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.messages)
+}
+
 // LocalEngine implements the Engine interface by driving a loop.Loop
 // in-process with background goroutines for input processing and compaction.
 type LocalEngine struct {
@@ -180,6 +198,11 @@ func NewLocalEngine(p Params) *LocalEngine {
 // Submit sends user content blocks to the engine for processing.
 func (e *LocalEngine) Submit(blocks []protocol.ContentBlock) {
 	select {
+	case <-e.closed:
+		return
+	default:
+	}
+	select {
 	case e.inCh <- blocks:
 	case <-e.closed:
 	}
@@ -202,6 +225,14 @@ func (e *LocalEngine) Approve(ok bool, plan []byte) {}
 // Steer enqueues a steer message that is processed before the next LLM call.
 func (e *LocalEngine) Steer(blocks []protocol.ContentBlock) {
 	e.sq.Enqueue(blocks)
+}
+
+func (e *LocalEngine) WithdrawSteer() []protocol.ContentBlock {
+	return e.sq.Withdraw()
+}
+
+func (e *LocalEngine) PendingSteers() int {
+	return e.sq.Len()
 }
 
 // NewSession starts a fresh conversation and returns its ID.
@@ -371,6 +402,11 @@ func (e *LocalEngine) CurrentThinkingLevel() string {
 // channel.
 func (e *LocalEngine) Compact(focus string) error {
 	select {
+	case <-e.closed:
+		return fmt.Errorf("engine closed")
+	default:
+	}
+	select {
 	case e.cmpCh <- focus:
 		return nil
 	default:
@@ -430,6 +466,22 @@ func (e *LocalEngine) CancelSubagent(id string) {
 	if e.agentBuilder != nil {
 		e.agentBuilder.CancelSubagent(id)
 	}
+}
+
+func (e *LocalEngine) History() ([]protocol.FrozenMessage, error) {
+	return e.lp.History(), nil
+}
+
+func (e *LocalEngine) ListFiles(prefix string) ([]string, error) {
+	return ListFiles(e.cwd, prefix)
+}
+
+func (e *LocalEngine) ResolveInput(text string) ([]protocol.ContentBlock, string, error) {
+	return ResolveInput(e.cwd, text)
+}
+
+func (e *LocalEngine) PushInstruction() (string, string, error) {
+	return PushInstruction(e.cwd)
 }
 
 // Events returns the read-only event channel for protocol events.

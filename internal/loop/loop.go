@@ -82,6 +82,13 @@ func (l *Loop) Stats() Stats { return l.stats }
 
 func (l *Loop) ResetStats() { l.stats = Stats{} }
 
+func (l *Loop) History() []protocol.FrozenMessage {
+	if l.tx == nil {
+		return nil
+	}
+	return l.tx.Frozen()
+}
+
 func (l *Loop) Close() {
 	if l.tx != nil {
 		_ = l.tx.WriteStats(session.StatsRecord{
@@ -264,9 +271,9 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 		if l.SteerFunc != nil && iter > 0 {
 			if steerMessages := l.SteerFunc(); len(steerMessages) > 0 {
 				for _, blocks := range steerMessages {
-			if err := l.tx.Append(protocol.Message{Role: protocol.RoleUser, Content: blocks}); err != nil {
-				return fmt.Errorf("append steer message: %w", err)
-			}
+					if err := l.tx.Append(protocol.Message{Role: protocol.RoleUser, Content: blocks}); err != nil {
+						return fmt.Errorf("append steer message: %w", err)
+					}
 				}
 				emit(protocol.Notice{Level: "info", Text: fmt.Sprintf("✎ steer: %d message(s) injected", len(steerMessages))})
 			}
