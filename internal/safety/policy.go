@@ -14,15 +14,15 @@ type Mode int
 const (
 	ModeAuto Mode = iota
 	ModeAsk
-	ModeBlock
+	ModePanic
 )
 
 func ParseMode(s string) Mode {
 	switch strings.ToLower(s) {
 	case "ask":
 		return ModeAsk
-	case "block":
-		return ModeBlock
+	case "panic":
+		return ModePanic
 	default:
 		return ModeAuto
 	}
@@ -42,7 +42,7 @@ func NewPolicy(mode Mode, workDir string, classifier *Classifier, interactive bo
 
 func (p *Policy) Check(tu protocol.ToolUse) (Decision, string) {
 	switch tu.Name {
-	case "bash":
+	case "bash", "bash_background":
 		cmd, _ := tu.Args["command"].(string)
 		d, reason := p.classifier.Classify(cmd)
 		return p.resolve(d, reason)
@@ -64,13 +64,13 @@ func (p *Policy) Check(tu protocol.ToolUse) (Decision, string) {
 //   - auto + headless     -> Block  (no human present, fail safe)
 //   - ask  + interactive  -> Prompt (ask the human)
 //   - ask  + headless      -> Block
-//   - block (any)          -> Block
+//   - panic (any)          -> Block
 func (p *Policy) resolve(base Decision, reason string) (Decision, string) {
 	if base == Block {
 		return Block, reason
 	}
-	if p.mode == ModeBlock {
-		return Block, "permission mode is block"
+	if p.mode == ModePanic {
+		return Block, "permission mode is PANIC"
 	}
 	if base == Allow {
 		return Allow, ""

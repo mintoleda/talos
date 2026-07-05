@@ -23,6 +23,19 @@ func NewClassifier() *Classifier {
 			`\bmkfs\b`,
 			`\bdd\b.*of=/dev/`,
 			`\b(fdisk|diskpart)\b`,
+
+			`sed\b.*-i[^>]*\.(go|py|js|ts|rs|java|rb|sh|toml|ya?ml|json|md|c|h|cpp|css|html|tex)`,
+			`perl\b.*-i\b.*\.(go|py|js|ts|rs|java|rb|sh|toml|ya?ml|json|md|c|h|cpp|css|html|tex)`,
+
+			`(python3?|node|ruby|perl|php)\s+(-[a-zA-Z]+\s+)*-[a-zA-Z]*[cer]\b`,
+
+			`(cat|tee|dd)\b[^|]*>\s*\S+\.(go|py|js|ts|rs|java|rb|sh|toml|ya?ml|json|md|c|h|cpp|css|html|tex)`,
+			`tee\b\s+\S+\.(go|py|js|ts|rs|java|rb|sh|toml|ya?ml|json|md|c|h|cpp|css|html|tex)`,
+			`dd\b.*\bof=\S+\.(go|py|js|ts|rs|java|rb|sh|toml|ya?ml|json|md|c|h|cpp|css|html|tex)`,
+
+			`<<\s*(EOF|END|DELIM|HEREDOC|DOC)\b.*>\s*\S+\.(go|py|js|ts|rs|java|rb|sh|toml|ya?ml|json|md)`,
+
+			`>\s*\S+\.(go|py|js|ts|rs|java|rb|sh|toml|ya?ml|json|md|c|h|cpp|css|html|tex)\s*$`,
 		),
 		prompt: compile(
 			`\bsudo\b`,
@@ -34,15 +47,6 @@ func NewClassifier() *Classifier {
 			`git\s+restore\s+\.`,
 			`(chmod|chown)\s+-R`,
 			`>\s*/dev/(sd|nvme|disk)`,
-
-			`(python3?|node|ruby|perl|php)\s+-[ce]\b`,
-
-			`(cat|tee|dd)\b[^|]*>\s*\S+\.(go|py|js|ts|rs|java|rb|sh|toml|ya?ml|json|md|c|h|cpp|css|html|tex)`,
-			`sed\b.*-i[^>]*\.(go|py|js|ts|rs|java|rb|sh|toml|ya?ml|json|md|c|h|cpp|css|html|tex)`,
-
-			`<<\s*(EOF|END|DELIM|HEREDOC|DOC)\b.*>\s*\S+\.(go|py|js|ts|rs|java|rb|sh|toml|ya?ml|json|md)`,
-
-			`>\s*\S+\.(go|py|js|ts|rs|java|rb|sh|toml|ya?ml|json|md|c|h|cpp|css|html|tex)\s*$`,
 		),
 	}
 }
