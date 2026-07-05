@@ -28,11 +28,12 @@ func (e *testEngine) Subscribe(fn func(protocol.Event)) {
 func (e *testEngine) Submit(text string) {
 	e.inputs = append(e.inputs, text)
 }
+func (e *testEngine) Steer(text string) {}
 func (e *testEngine) Interrupt() {
 	e.interrupts++
 }
 func (e *testEngine) Approve(approved bool, plan []byte) {}
-func (e *testEngine) Snapshot() protocol.EngineSnapshot { return protocol.EngineSnapshot{} }
+func (e *testEngine) Snapshot() protocol.EngineSnapshot  { return protocol.EngineSnapshot{} }
 
 func TestSocketPath(t *testing.T) {
 	path := SocketPath("/tmp/talos", "abc123")

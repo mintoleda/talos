@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/websocket"
 
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/transport"
@@ -31,16 +34,23 @@ type Engine interface {
 	SessionID() string
 	Subscribe(fn func(protocol.Event))
 	Submit(text string)
+	Steer(text string)
 	Interrupt()
 	Approve(approved bool, plan []byte)
 	Snapshot() protocol.EngineSnapshot
 }
+
+type RequestHandler func(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error)
 
 type Server struct {
 	engine      Engine
 	sockPath    string
 	pidPath     string
 	idleTimeout time.Duration
+	requests    RequestHandler
+	network     string
+	address     string
+	token       string
 
 	mu            sync.Mutex
 	subscribers   map[int]func(protocol.Event)
@@ -59,6 +69,8 @@ func New(engine Engine, sockPath, pidPath string, idleTimeout time.Duration) *Se
 		sockPath:     sockPath,
 		pidPath:      pidPath,
 		idleTimeout:  idleTimeout,
+		network:      "unix",
+		address:      sockPath,
 		subscribers:  make(map[int]func(protocol.Event)),
 		lastActivity: time.Now(),
 	}
@@ -66,6 +78,21 @@ func New(engine Engine, sockPath, pidPath string, idleTimeout time.Duration) *Se
 		s.broadcast(e)
 	})
 	return s
+}
+
+func (s *Server) SetListen(network, address string) {
+	s.network = network
+	s.address = address
+}
+
+func (s *Server) SetToken(token string) {
+	s.token = token
+}
+
+func (s *Server) SetRequestHandler(h RequestHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests = h
 }
 
 func (s *Server) broadcast(e protocol.Event) {
@@ -83,15 +110,28 @@ func (s *Server) broadcast(e protocol.Event) {
 // Start listens on the Unix socket and serves clients until ctx is done or
 // the idle timeout fires with no clients connected.
 func (s *Server) Start(ctx context.Context) error {
-	_ = os.Remove(s.sockPath)
-	if err := os.MkdirAll(filepath.Dir(s.sockPath), 0o755); err != nil {
-		return err
+	if s.network == "" {
+		s.network = "unix"
 	}
-	ln, err := net.Listen("unix", s.sockPath)
+	if s.address == "" {
+		s.address = s.sockPath
+	}
+	if s.network == "ws" {
+		return s.startWebSocket(ctx)
+	}
+	if s.network == "unix" {
+		_ = os.Remove(s.address)
+		if err := os.MkdirAll(filepath.Dir(s.address), 0o755); err != nil {
+			return err
+		}
+	}
+	ln, err := net.Listen(s.network, s.address)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", s.sockPath, err)
+		return fmt.Errorf("listen %s %s: %w", s.network, s.address, err)
 	}
-	defer os.Remove(s.sockPath)
+	if s.network == "unix" {
+		defer os.Remove(s.address)
+	}
 
 	if err := writePID(s.pidPath); err != nil {
 		return err
@@ -117,8 +157,8 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 
 		// Accept with a short timeout so we can check ctx/idle above.
-		if tcpLn, ok := ln.(*net.UnixListener); ok {
-			tcpLn.SetDeadline(time.Now().Add(2 * time.Second))
+		if deadlineLn, ok := ln.(interface{ SetDeadline(time.Time) error }); ok {
+			_ = deadlineLn.SetDeadline(time.Now().Add(2 * time.Second))
 		}
 		conn, err := ln.Accept()
 		if err != nil {
@@ -132,6 +172,25 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		go s.handleConn(ctx, conn)
 	}
+}
+
+func (s *Server) startWebSocket(ctx context.Context) error {
+	mux := http.NewServeMux()
+	mux.Handle("/ws", websocket.Handler(func(conn *websocket.Conn) {
+		s.handleConn(ctx, conn)
+	}))
+	srv := &http.Server{Addr: s.address, Handler: mux}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	err := srv.ListenAndServe()
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
 }
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
@@ -150,9 +209,21 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
+	var encMu sync.Mutex
 
-	if err := enc.Encode(transport.ServerMsg{Type: "hello", Version: version.VERSION, Session: s.engine.SessionID()}); err != nil {
+	if err := encodeServerMsg(enc, &encMu, transport.ServerMsg{Type: "hello", Version: version.VERSION, Session: s.engine.SessionID()}); err != nil {
 		return
+	}
+
+	if s.token != "" {
+		var auth transport.ClientMsg
+		if err := dec.Decode(&auth); err != nil {
+			return
+		}
+		if auth.Type != "auth" || auth.Token != s.token {
+			_ = encodeServerMsg(enc, &encMu, transport.ServerMsg{Type: "error", Err: "unauthorized"})
+			return
+		}
 	}
 
 	events := make(chan protocol.Event, 64)
@@ -177,12 +248,12 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	// Send a snapshot of the engine's current state so the newly-attached
 	// client sees any in-progress turn (busy indicator, streamed text, tools).
 	if snap := s.engine.Snapshot(); snap.Busy || snap.StreamedText != "" || len(snap.ActiveTools) > 0 {
-		s.encodeEvent(enc, snap)
+		s.encodeEvent(enc, &encMu, snap)
 	}
 
 	go func() {
 		for e := range events {
-			if err := s.encodeEvent(enc, e); err != nil {
+			if err := s.encodeEvent(enc, &encMu, e); err != nil {
 				return
 			}
 		}
@@ -199,15 +270,42 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		switch cm.Type {
 		case "input":
 			s.engine.Submit(cm.Text)
+		case "steer":
+			s.engine.Steer(cm.Text)
 		case "interrupt":
 			s.engine.Interrupt()
 		case "approve":
 			s.engine.Approve(cm.Approved, cm.Plan)
+		case "request":
+			result, err := s.handleRequest(ctx, cm.Method, cm.Params)
+			resp := transport.ServerMsg{Type: "response", ID: cm.ID, Result: result}
+			if err != nil {
+				resp.Err = err.Error()
+			}
+			if err := encodeServerMsg(enc, &encMu, resp); err != nil {
+				return
+			}
 		}
 	}
 }
 
-func (s *Server) encodeEvent(enc *json.Encoder, e protocol.Event) error {
+func (s *Server) handleRequest(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	s.mu.Lock()
+	h := s.requests
+	s.mu.Unlock()
+	if h == nil {
+		return nil, fmt.Errorf("unknown method")
+	}
+	return h(ctx, method, params)
+}
+
+func encodeServerMsg(enc *json.Encoder, mu *sync.Mutex, sm transport.ServerMsg) error {
+	mu.Lock()
+	defer mu.Unlock()
+	return enc.Encode(sm)
+}
+
+func (s *Server) encodeEvent(enc *json.Encoder, mu *sync.Mutex, e protocol.Event) error {
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return err
@@ -237,7 +335,7 @@ func (s *Server) encodeEvent(enc *json.Encoder, e protocol.Event) error {
 	case protocol.EngineSnapshot:
 		etype = "EngineSnapshot"
 	}
-	return enc.Encode(transport.ServerMsg{Type: "event", EType: etype, Event: raw})
+	return encodeServerMsg(enc, mu, transport.ServerMsg{Type: "event", EType: etype, Event: raw})
 }
 
 func writePID(path string) error {
@@ -290,8 +388,8 @@ func ListRunning(baseDir string) ([]string, error) {
 		return nil, err
 	}
 	type item struct {
-		id   string
-		mod  time.Time
+		id  string
+		mod time.Time
 	}
 	var items []item
 	for _, e := range entries {

@@ -55,6 +55,30 @@ func TestClientMsgMarshalApprove(t *testing.T) {
 	}
 }
 
+func TestClientMsgMarshalRequest(t *testing.T) {
+	msg := ClientMsg{
+		Type:   "request",
+		ID:     42,
+		Method: "engine.echo",
+		Params: json.RawMessage(`{"text":"hi"}`),
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded ClientMsg
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Type != "request" || decoded.ID != 42 || decoded.Method != "engine.echo" {
+		t.Fatalf("unexpected request fields: %+v", decoded)
+	}
+	if string(decoded.Params) != `{"text":"hi"}` {
+		t.Fatalf("expected params, got %s", decoded.Params)
+	}
+}
+
 func TestServerMsgMarshalHello(t *testing.T) {
 	msg := ServerMsg{Type: "hello", Version: "0.2.0", Session: "abc"}
 	data, err := json.Marshal(msg)
@@ -94,6 +118,25 @@ func TestServerMsgMarshalEvent(t *testing.T) {
 	}
 	if decoded.EType != "TextDelta" {
 		t.Fatalf("expected etype=TextDelta, got %q", decoded.EType)
+	}
+}
+
+func TestServerMsgMarshalResponse(t *testing.T) {
+	msg := ServerMsg{Type: "response", ID: 42, Result: json.RawMessage(`{"ok":true}`)}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded ServerMsg
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Type != "response" || decoded.ID != 42 {
+		t.Fatalf("unexpected response fields: %+v", decoded)
+	}
+	if string(decoded.Result) != `{"ok":true}` {
+		t.Fatalf("expected result, got %s", decoded.Result)
 	}
 }
 

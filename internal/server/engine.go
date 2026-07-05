@@ -30,15 +30,16 @@ type LoopEngine struct {
 	interruptCh chan struct{}
 	ctx         context.Context
 	cancel      context.CancelFunc
+	steer       serverSteerQueue
 
 	slash     SlashHandler
 	notifyCfg notify.Config
 
 	// Live state for the benefit of newly-attached clients.
-	stateMu      sync.Mutex
-	stateBusy    bool
-	stateText    string
-	stateTools   []protocol.ToolSnapshot
+	stateMu    sync.Mutex
+	stateBusy  bool
+	stateText  string
+	stateTools []protocol.ToolSnapshot
 }
 
 func NewLoopEngine(parentCtx context.Context, lp *loop.Loop, cp *safety.Checkpointer, sessionID string) *LoopEngine {
@@ -52,6 +53,7 @@ func NewLoopEngine(parentCtx context.Context, lp *loop.Loop, cp *safety.Checkpoi
 		ctx:         ctx,
 		cancel:      cancel,
 	}
+	lp.SteerFunc = e.steer.Drain
 	go e.run()
 	return e
 }
@@ -64,10 +66,20 @@ func (e *LoopEngine) SetNotifyConfig(cfg notify.Config) {
 
 func (e *LoopEngine) SessionID() string { return e.session }
 
+func (e *LoopEngine) SetSessionID(id string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.session = id
+}
+
 func (e *LoopEngine) Subscribe(fn func(protocol.Event)) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.subscribers = append(e.subscribers, fn)
+}
+
+func (e *LoopEngine) Emit(ev protocol.Event) {
+	e.emit(ev)
 }
 
 func (e *LoopEngine) emit(ev protocol.Event) {
@@ -94,10 +106,53 @@ func (e *LoopEngine) Interrupt() {
 	}
 }
 
+func (e *LoopEngine) Steer(text string) {
+	e.steer.Enqueue(text)
+}
+
+func (e *LoopEngine) WithdrawSteer() []protocol.ContentBlock {
+	return e.steer.Withdraw()
+}
+
 // SetSlashHandler installs a handler for slash commands received from
 // clients. Without one, slash commands are treated as ordinary user input.
 func (e *LoopEngine) SetSlashHandler(h SlashHandler) {
 	e.slash = h
+}
+
+type serverSteerQueue struct {
+	mu       sync.Mutex
+	messages []string
+}
+
+func (q *serverSteerQueue) Enqueue(text string) {
+	q.mu.Lock()
+	q.messages = append(q.messages, text)
+	q.mu.Unlock()
+}
+
+func (q *serverSteerQueue) Drain() [][]protocol.ContentBlock {
+	q.mu.Lock()
+	msgs := q.messages
+	q.messages = nil
+	q.mu.Unlock()
+	out := make([][]protocol.ContentBlock, 0, len(msgs))
+	for _, msg := range msgs {
+		out = append(out, protocol.TextBlocks(msg))
+	}
+	return out
+}
+
+func (q *serverSteerQueue) Withdraw() []protocol.ContentBlock {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := len(q.messages)
+	if n == 0 {
+		return nil
+	}
+	last := q.messages[n-1]
+	q.messages = q.messages[:n-1]
+	return protocol.TextBlocks(last)
 }
 
 func (e *LoopEngine) Approve(approved bool, plan []byte) {
