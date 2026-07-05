@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -60,6 +61,19 @@ func (t *bashTool) Schema() json.RawMessage {
 }
 
 func (t *bashTool) Execute(ctx context.Context, args map[string]any) (protocol.ToolResult, error) {
+	cw := &cappedWriter{max: t.maxOutput}
+	return t.runBash(ctx, args, cw)
+}
+
+// ExecuteStreaming is the StreamingTool implementation. It runs the command
+// and emits ToolOutputDelta events for every chunk of output so the TUI can
+// show live output when Ctrl+O is toggled.
+func (t *bashTool) ExecuteStreaming(ctx context.Context, args map[string]any, emit protocol.EmitFunc) (protocol.ToolResult, error) {
+	cw := &streamingWriter{cappedWriter: cappedWriter{max: t.maxOutput}, emit: emit}
+	return t.runBash(ctx, args, cw)
+}
+
+func (t *bashTool) runBash(ctx context.Context, args map[string]any, cw io.Writer) (protocol.ToolResult, error) {
 	command, err := str(args, "command")
 	if err != nil {
 		return errResult(err), nil
@@ -90,11 +104,14 @@ func (t *bashTool) Execute(ctx context.Context, args map[string]any) (protocol.T
 	}
 	cmd.WaitDelay = 2 * time.Second
 
-	cw := &cappedWriter{max: t.maxOutput}
 	cmd.Stdout, cmd.Stderr = cw, cw
 
 	runErr := cmd.Run()
-	out := cw.String()
+
+	var out string
+	if scw, ok := cw.(interface{ String() string }); ok {
+		out = scw.String()
+	}
 
 	if t.reads != nil && before != nil {
 		after, _ := walkModTimes(t.cwd, t.maxWalkFiles)
@@ -172,6 +189,21 @@ func clamp(v, min, max int) int {
 		return max
 	}
 	return v
+}
+
+// streamingWriter wraps cappedWriter and emits ToolOutputDelta events for every
+// Write call so the TUI can show live output. The ID field on each delta is left
+// empty — the executor injects the correct tool-use ID before forwarding.
+type streamingWriter struct {
+	cappedWriter
+	emit protocol.EmitFunc
+}
+
+func (s *streamingWriter) Write(p []byte) (int, error) {
+	if s.emit != nil {
+		s.emit(protocol.ToolOutputDelta{Text: string(p)})
+	}
+	return s.cappedWriter.Write(p)
 }
 
 // cappedWriter keeps the first half and last half of the output (head+tail) up

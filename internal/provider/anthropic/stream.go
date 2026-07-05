@@ -47,7 +47,7 @@ func parseSSE(body io.ReadCloser, out chan<- protocol.ProviderEvent) {
 			}
 			out <- protocol.PEToolCall{ToolUse: protocol.ToolUse{ID: bs.id, Name: bs.name, Args: args}}
 		case "thinking":
-			out <- protocol.PEThinking{Text: bs.thinkSB.String()}
+			// Deltas were already emitted as PEThinking events; nothing to flush.
 		}
 		delete(blocks, idx)
 	}
@@ -115,6 +115,7 @@ func processEvent(
 			bs.jsonSB.WriteString(ev.Delta.PartialJSON)
 		case "thinking_delta":
 			bs.thinkSB.WriteString(ev.Delta.Thinking)
+			out <- protocol.PEThinking{Text: ev.Delta.Thinking}
 		}
 	case "content_block_stop":
 		flush(ev.Index)

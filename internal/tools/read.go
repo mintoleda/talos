@@ -69,7 +69,7 @@ func (t *readTool) Execute(ctx context.Context, args map[string]any) (protocol.T
 	}
 	var out strings.Builder
 	for i := start - 1; i < end-1 && i < len(lines); i++ {
-		fmt.Fprintf(&out, "%6d\t%s\n", i+1, lines[i])
+		fmt.Fprintf(&out, "%6d | %s\n", i+1, lines[i])
 	}
 	if len(lines) > limit && (end-start) < len(lines) {
 		fmt.Fprintf(&out, "\n[truncated: %d total lines]\n", len(lines))

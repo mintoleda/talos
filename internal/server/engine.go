@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/mintoleda/talos/internal/loop"
+	"github.com/mintoleda/talos/internal/notify"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/safety"
 )
@@ -30,7 +31,14 @@ type LoopEngine struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 
-	slash SlashHandler
+	slash     SlashHandler
+	notifyCfg notify.Config
+
+	// Live state for the benefit of newly-attached clients.
+	stateMu      sync.Mutex
+	stateBusy    bool
+	stateText    string
+	stateTools   []protocol.ToolSnapshot
 }
 
 func NewLoopEngine(parentCtx context.Context, lp *loop.Loop, cp *safety.Checkpointer, sessionID string) *LoopEngine {
@@ -46,6 +54,12 @@ func NewLoopEngine(parentCtx context.Context, lp *loop.Loop, cp *safety.Checkpoi
 	}
 	go e.run()
 	return e
+}
+
+// SetNotifyConfig sets the desktop notification configuration for events
+// emitted during turn execution. Safe to call before the engine starts.
+func (e *LoopEngine) SetNotifyConfig(cfg notify.Config) {
+	e.notifyCfg = cfg
 }
 
 func (e *LoopEngine) SessionID() string { return e.session }
@@ -102,6 +116,55 @@ func (e *LoopEngine) setPending(fn func(bool, []byte)) {
 	e.pendingReply = fn
 }
 
+// Snapshot returns the engine's current turn state so newly-attached clients
+// can sync their UI (busy indicator, streamed text, active tools).
+func (e *LoopEngine) Snapshot() protocol.EngineSnapshot {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	tools := make([]protocol.ToolSnapshot, len(e.stateTools))
+	copy(tools, e.stateTools)
+	return protocol.EngineSnapshot{
+		Busy:         e.stateBusy,
+		StreamedText: e.stateText,
+		ActiveTools:  tools,
+	}
+}
+
+// trackState returns an emit wrapper that updates the engine's live state
+// as events flow through, so Snapshot() always returns current data.
+func (e *LoopEngine) trackState(inner func(protocol.Event)) func(protocol.Event) {
+	return func(ev protocol.Event) {
+		switch evt := ev.(type) {
+		case protocol.TextDelta:
+			e.stateMu.Lock()
+			e.stateText += evt.Text
+			e.stateMu.Unlock()
+		case protocol.ToolStarted:
+			e.stateMu.Lock()
+			e.stateTools = append(e.stateTools, protocol.ToolSnapshot{
+				ID: evt.ID, Name: evt.Name, Args: evt.Args,
+			})
+			e.stateMu.Unlock()
+		case protocol.ToolFinished:
+			e.stateMu.Lock()
+			for i, t := range e.stateTools {
+				if t.ID == evt.ID {
+					e.stateTools = append(e.stateTools[:i], e.stateTools[i+1:]...)
+					break
+				}
+			}
+			e.stateMu.Unlock()
+		case protocol.TurnEnded:
+			e.stateMu.Lock()
+			e.stateBusy = false
+			e.stateText = ""
+			e.stateTools = nil
+			e.stateMu.Unlock()
+		}
+		inner(ev)
+	}
+}
+
 func (e *LoopEngine) run() {
 	for {
 		select {
@@ -129,6 +192,14 @@ func (e *LoopEngine) run() {
 				case <-turnCtx.Done():
 				}
 			}()
+
+			// Mark the engine as busy and reset tracking state.
+			e.stateMu.Lock()
+			e.stateBusy = true
+			e.stateText = ""
+			e.stateTools = nil
+			e.stateMu.Unlock()
+
 			emit := func(ev protocol.Event) {
 				// Intercept permission/plan/merge requests so the Approve method
 				// can reply to the original channel owned by the executor.
@@ -142,6 +213,10 @@ func (e *LoopEngine) run() {
 				}
 				e.emit(ev)
 			}
+			// Wrap with state tracking (before notify wrapping so state
+			// is updated before notification dispatch).
+			emit = e.trackState(emit)
+			emit = notify.Wrap(emit, e.notifyCfg)
 			if err := e.lp.RunTurn(turnCtx, protocol.TextBlocks(text), emit); err != nil && !errors.Is(err, context.Canceled) {
 				e.emit(protocol.Notice{Level: "error", Text: err.Error()})
 				e.emit(protocol.TurnEnded{})

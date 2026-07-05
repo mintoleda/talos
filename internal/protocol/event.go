@@ -15,6 +15,14 @@ type ToolFinished struct {
 	ID     string
 	Result ToolResult
 }
+
+// ToolOutputDelta carries a chunk of live output from a running tool.
+// The TUI accumulates these into a provisional tool segment so the user
+// sees output appear in real-time when Ctrl+O is toggled.
+type ToolOutputDelta struct {
+	ID   string // matches ToolStarted/ToolFinished ID
+	Text string // a single chunk of output
+}
 type Notice struct {
 	Level string
 	Text  string
@@ -99,6 +107,31 @@ type ModelChanged struct {
 	ThinkingLevel string
 }
 
+// ThinkingBlock carries the complete extended-thinking text for one thinking
+// block. Emitted after the block finishes streaming, before text streaming begins.
+type ThinkingBlock struct{ Text string }
+
+// ThinkingDelta carries a partial chunk of extended-thinking text as it
+// streams in. The TUI accumulates these into a live thinking segment.
+type ThinkingDelta struct{ Text string }
+
+// EngineSnapshot is sent to newly-attached clients so they can sync with the
+// server's current turn state (busy flag, streamed text, active tools).
+// Without this, a client that attaches mid-turn sees a blank idle screen.
+type EngineSnapshot struct {
+	Busy          bool
+	StreamedText  string
+	ActiveTools   []ToolSnapshot
+}
+
+type ToolSnapshot struct {
+	ID   string
+	Name string
+	Args map[string]any
+}
+
+func (ThinkingBlock) isEvent()        {}
+func (ThinkingDelta) isEvent()       {}
 func (UserInput) isEvent()           {}
 func (ModelChanged) isEvent()        {}
 func (BatchStarted) isEvent()        {}
@@ -106,13 +139,15 @@ func (BatchFinished) isEvent()       {}
 func (TextDelta) isEvent()           {}
 func (ToolStarted) isEvent()         {}
 func (ToolFinished) isEvent()        {}
+func (ToolOutputDelta) isEvent()     {}
 func (Notice) isEvent()              {}
 func (TurnEnded) isEvent()           {}
 func (PermissionRequested) isEvent() {}
 func (SubagentStarted) isEvent()     {}
 func (SubagentEvent) isEvent()       {}
-func (PromptEstimate) isEvent()    {}
+func (PromptEstimate) isEvent()      {}
 func (SubagentFinished) isEvent()    {}
+func (EngineSnapshot) isEvent()      {}
 
 type Usage struct {
 	PromptTokens       int

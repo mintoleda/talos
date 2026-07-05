@@ -13,6 +13,7 @@ import (
 type Executor interface {
 	Run(ctx context.Context, tu protocol.ToolUse, emit protocol.EmitFunc) protocol.ToolResult
 	Close()
+	KillBg()
 }
 
 type InProcExecutor struct {
@@ -23,6 +24,12 @@ type InProcExecutor struct {
 
 func New(registry *tools.Registry, policy *safety.Policy) *InProcExecutor {
 	return &InProcExecutor{registry: registry, policy: policy}
+}
+
+func (e *InProcExecutor) KillBg() {
+	if e.registry != nil {
+		e.registry.KillBg()
+	}
 }
 
 func (e *InProcExecutor) Close() {
@@ -73,14 +80,27 @@ func (e *InProcExecutor) Run(ctx context.Context, tu protocol.ToolUse, emit prot
 	if !ok {
 		return protocol.ToolResult{ToolUseID: tu.ID, IsError: true, Content: "unknown tool: " + tu.Name}
 	}
+	// Wrap emit to inject the tool-use ID into any ToolOutputDelta events
+	// the tool emits. This keeps tools agnostic of their own execution ID.
+	var toolEmit protocol.EmitFunc
+	if emit != nil {
+		toolEmit = func(ev protocol.Event) {
+			if delta, ok := ev.(protocol.ToolOutputDelta); ok {
+				delta.ID = tu.ID
+			}
+			emit(ev)
+		}
+	}
 	// Tools that surface live activity (e.g. subagent spawn tools) receive the
 	// turn's emit function so their child events reach the frontend.
 	var (
 		res protocol.ToolResult
 		err error
 	)
-	if et, ok := tool.(tools.EmittingTool); ok {
-		res, err = et.ExecuteWithEmit(ctx, tu.Args, emit)
+	if st, ok := tool.(tools.StreamingTool); ok {
+		res, err = st.ExecuteStreaming(ctx, tu.Args, toolEmit)
+	} else if et, ok := tool.(tools.EmittingTool); ok {
+		res, err = et.ExecuteWithEmit(ctx, tu.Args, toolEmit)
 	} else {
 		res, err = tool.Execute(ctx, tu.Args)
 	}

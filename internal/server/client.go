@@ -90,6 +90,12 @@ func decodeEvent(sm transport.ServerMsg) (protocol.Event, error) {
 	case "TextDelta":
 		var e protocol.TextDelta
 		return e, json.Unmarshal(sm.Event, &e)
+	case "ThinkingDelta":
+		var e protocol.ThinkingDelta
+		return e, json.Unmarshal(sm.Event, &e)
+	case "ThinkingBlock":
+		var e protocol.ThinkingBlock
+		return e, json.Unmarshal(sm.Event, &e)
 	case "ToolStarted":
 		var e protocol.ToolStarted
 		return e, json.Unmarshal(sm.Event, &e)
@@ -104,6 +110,9 @@ func decodeEvent(sm transport.ServerMsg) (protocol.Event, error) {
 		return e, json.Unmarshal(sm.Event, &e)
 	case "PermissionRequested":
 		var e protocol.PermissionRequested
+		return e, json.Unmarshal(sm.Event, &e)
+	case "EngineSnapshot":
+		var e protocol.EngineSnapshot
 		return e, json.Unmarshal(sm.Event, &e)
 	}
 	return nil, fmt.Errorf("unknown event type %q", sm.EType)

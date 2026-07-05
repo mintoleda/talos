@@ -33,6 +33,7 @@ type Engine interface {
 	Submit(text string)
 	Interrupt()
 	Approve(approved bool, plan []byte)
+	Snapshot() protocol.EngineSnapshot
 }
 
 type Server struct {
@@ -173,6 +174,12 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		s.mu.Unlock()
 	}()
 
+	// Send a snapshot of the engine's current state so the newly-attached
+	// client sees any in-progress turn (busy indicator, streamed text, tools).
+	if snap := s.engine.Snapshot(); snap.Busy || snap.StreamedText != "" || len(snap.ActiveTools) > 0 {
+		s.encodeEvent(enc, snap)
+	}
+
 	go func() {
 		for e := range events {
 			if err := s.encodeEvent(enc, e); err != nil {
@@ -213,6 +220,10 @@ func (s *Server) encodeEvent(enc *json.Encoder, e protocol.Event) error {
 		etype = "ModelChanged"
 	case protocol.TextDelta:
 		etype = "TextDelta"
+	case protocol.ThinkingDelta:
+		etype = "ThinkingDelta"
+	case protocol.ThinkingBlock:
+		etype = "ThinkingBlock"
 	case protocol.ToolStarted:
 		etype = "ToolStarted"
 	case protocol.ToolFinished:
@@ -223,6 +234,8 @@ func (s *Server) encodeEvent(enc *json.Encoder, e protocol.Event) error {
 		etype = "TurnEnded"
 	case protocol.PermissionRequested:
 		etype = "PermissionRequested"
+	case protocol.EngineSnapshot:
+		etype = "EngineSnapshot"
 	}
 	return enc.Encode(transport.ServerMsg{Type: "event", EType: etype, Event: raw})
 }

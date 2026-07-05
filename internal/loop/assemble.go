@@ -77,24 +77,34 @@ func (l *Loop) streamAndAssemble(ctx context.Context, req protocol.Request, emit
 	}
 
 	var (
-		textSB   strings.Builder
-		toolUses []protocol.ContentBlock
-		usage    protocol.Usage
-		stop     string
+		textSB    strings.Builder
+		thinkSB   strings.Builder
+		toolUses  []protocol.ContentBlock
+		usage     protocol.Usage
+		stop      string
 	)
+
+	// emitThinking flushes the accumulated thinking text as a single block.
+	// Called just before the first text delta so it appears before the response
+	// regardless of whether the provider streams one chunk or many per block.
+	thinkEmitted := false
+	emitThinking := func() {
+		if !thinkEmitted && thinkSB.Len() > 0 {
+			emit(protocol.ThinkingBlock{Text: thinkSB.String()})
+			thinkEmitted = true
+		}
+	}
 
 	for ev := range stream {
 		switch e := ev.(type) {
 		case protocol.PEText:
+			emitThinking()
 			normalized := normalizeMarkdown(e.Text)
 			textSB.WriteString(normalized)
 			emit(protocol.TextDelta{Text: normalized})
 		case protocol.PEThinking:
-			// Thinking blocks are the model's internal reasoning process.
-			// We intentionally drop them here rather than emitting them as
-			// notices, because the raw thinking text is noisy and users found
-			// it confusing when it appeared inline in the chat transcript.
-			// The thinking level is controlled via /thinking in the TUI.
+			thinkSB.WriteString(e.Text)
+			emit(protocol.ThinkingDelta{Text: e.Text})
 		case protocol.PEToolCall:
 			tu := e.ToolUse
 			toolUses = append(toolUses, protocol.ContentBlock{
@@ -108,6 +118,7 @@ func (l *Loop) streamAndAssemble(ctx context.Context, req protocol.Request, emit
 			return protocol.Message{}, usage, fmt.Errorf("stream: %w", e.Err)
 		}
 	}
+	emitThinking() // flush if the turn had no text (tool-only or pure thinking)
 	_ = stop
 
 	var content []protocol.ContentBlock

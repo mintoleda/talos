@@ -12,6 +12,11 @@ import (
 	"github.com/mintoleda/talos/internal/session"
 )
 
+var exclusiveTools = map[string]bool{
+	"edit":  true,
+	"write": true,
+}
+
 type Stats struct {
 	Calls        int
 	InputTokens  int
@@ -40,6 +45,8 @@ type Loop struct {
 	// make. 0 (the default) means unlimited — the turn runs until the model
 	// stops requesting tools or the context is cancelled.
 	MaxIterations int
+
+	KillBgOnInterrupt bool
 
 	// SteerFunc is called after tool execution to drain pending steer messages
 	// queued by the TUI while the agent was busy. Each element is a single
@@ -75,7 +82,6 @@ func (l *Loop) Stats() Stats { return l.stats }
 
 func (l *Loop) ResetStats() { l.stats = Stats{} }
 
-// Close flushes aggregate stats to the transcript before closing.
 func (l *Loop) Close() {
 	if l.tx != nil {
 		_ = l.tx.WriteStats(session.StatsRecord{
@@ -146,38 +152,60 @@ type indexedResult struct {
 }
 
 // runToolsParallel executes all tool calls concurrently, preserving the order
-// required by the LLM. If the context is cancelled before a tool goroutine
-// starts, that tool returns a placeholder error.
+// required by the LLM. If the batch contains more than one exclusive tool
+// (edit/write) they are serialised to prevent file-state races.
 func (l *Loop) runToolsParallel(ctx context.Context, toolUses []protocol.ToolUse, emit protocol.EmitFunc) ([]protocol.ContentBlock, error) {
 	results := make([]indexedResult, len(toolUses))
-	var wg sync.WaitGroup
-	for i, tu := range toolUses {
-		emit(protocol.ToolStarted{ID: tu.ID, Name: tu.Name, Args: tu.Args})
-		wg.Add(1)
-		go func(idx int, tu protocol.ToolUse) {
-			defer wg.Done()
+
+	if needsSerial(toolUses) {
+		for i, tu := range toolUses {
+			emit(protocol.ToolStarted{ID: tu.ID, Name: tu.Name, Args: tu.Args})
 			res := l.executor.Run(ctx, tu, emit)
 			emit(protocol.ToolFinished{ID: tu.ID, Result: res})
-			results[idx] = indexedResult{
-				idx: idx,
+			results[i] = indexedResult{
+				idx: i,
 				ContentBlock: protocol.ContentBlock{
 					Type:       protocol.BlockToolResult,
 					ToolResult: &res,
 				},
 			}
-		}(i, tu)
-	}
+			if ctx.Err() != nil {
+				break
+			}
+		}
+	} else {
+		var wg sync.WaitGroup
+		for i, tu := range toolUses {
+			emit(protocol.ToolStarted{ID: tu.ID, Name: tu.Name, Args: tu.Args})
+			wg.Add(1)
+			go func(idx int, tu protocol.ToolUse) {
+				defer wg.Done()
+				res := l.executor.Run(ctx, tu, emit)
+				emit(protocol.ToolFinished{ID: tu.ID, Result: res})
+				results[idx] = indexedResult{
+					idx: idx,
+					ContentBlock: protocol.ContentBlock{
+						Type:       protocol.BlockToolResult,
+						ToolResult: &res,
+					},
+				}
+			}(i, tu)
+		}
 
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
 
-	select {
-	case <-done:
-	case <-ctx.Done():
-		<-done // wait for partial results
+		select {
+		case <-done:
+		case <-ctx.Done():
+			if l.KillBgOnInterrupt {
+				l.executor.KillBg()
+			}
+			<-done
+		}
 	}
 
 	// Fill in any gaps left by context cancellation that prevented a goroutine
@@ -204,6 +232,23 @@ func (l *Loop) runToolsParallel(ctx context.Context, toolUses []protocol.ToolUse
 	return blocks, nil
 }
 
+func needsSerial(toolUses []protocol.ToolUse) bool {
+	if len(toolUses) < 2 {
+		return false
+	}
+	seen := make(map[string]int)
+	for _, tu := range toolUses {
+		if exclusiveTools[tu.Name] {
+			path, _ := tu.Args["path"].(string)
+			seen[path]++
+			if seen[path] > 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, emit protocol.EmitFunc) error {
 	msg := protocol.Message{Role: protocol.RoleUser, Content: userInput}
 	if err := l.tx.Append(msg); err != nil {
@@ -219,9 +264,9 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 		if l.SteerFunc != nil && iter > 0 {
 			if steerMessages := l.SteerFunc(); len(steerMessages) > 0 {
 				for _, blocks := range steerMessages {
-					if err := l.tx.Append(protocol.Message{Role: protocol.RoleUser, Content: blocks}); err != nil {
-						return fmt.Errorf("append steer message: %w", err)
-					}
+			if err := l.tx.Append(protocol.Message{Role: protocol.RoleUser, Content: blocks}); err != nil {
+				return fmt.Errorf("append steer message: %w", err)
+			}
 				}
 				emit(protocol.Notice{Level: "info", Text: fmt.Sprintf("✎ steer: %d message(s) injected", len(steerMessages))})
 			}
@@ -268,15 +313,19 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 			return nil
 		}
 
-		l.batchNum++
-		emit(protocol.BatchStarted{Num: l.batchNum})
+		if len(toolUses) > 1 {
+			l.batchNum++
+			emit(protocol.BatchStarted{Num: l.batchNum})
+		}
 
 		results, err := l.runToolsParallel(ctx, toolUses, emit)
 		if err != nil {
 			return err
 		}
 
-		emit(protocol.BatchFinished{Num: l.batchNum})
+		if len(toolUses) > 1 {
+			emit(protocol.BatchFinished{Num: l.batchNum})
+		}
 		if err := l.tx.Append(protocol.Message{Role: protocol.RoleTool, Content: results}); err != nil {
 			return fmt.Errorf("append tool results: %w", err)
 		}

@@ -43,6 +43,8 @@ func (e *fakeExecutor) Run(ctx context.Context, tu protocol.ToolUse, _ protocol.
 	return protocol.ToolResult{ToolUseID: tu.ID, Content: "ok"}
 }
 
+func (e *fakeExecutor) KillBg() {}
+
 func (e *fakeExecutor) Close() {}
 
 func newTestLoop(t *testing.T, prov *fakeProvider, exec executor.Executor) *Loop {
@@ -81,6 +83,8 @@ func (e *concurrentExecutor) Run(ctx context.Context, tu protocol.ToolUse, _ pro
 	atomic.AddInt32(&e.inside, -1)
 	return protocol.ToolResult{ToolUseID: tu.ID, Content: "ok"}
 }
+
+func (e *concurrentExecutor) KillBg() {}
 
 func (e *concurrentExecutor) Close() {}
 

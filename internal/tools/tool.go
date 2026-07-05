@@ -25,6 +25,16 @@ type EmittingTool interface {
 	ExecuteWithEmit(ctx context.Context, args map[string]any, emit protocol.EmitFunc) (protocol.ToolResult, error)
 }
 
+// StreamingTool is an optional capability for tools that produce incremental
+// output (e.g. bash). The executor calls ExecuteStreaming instead of Execute,
+// and the tool emits ToolOutputDelta events as output arrives. The final
+// return value is the complete ToolResult captured by ToolFinished.
+// A nil emit is possible (headless callers), so implementations must tolerate it.
+type StreamingTool interface {
+	Tool
+	ExecuteStreaming(ctx context.Context, args map[string]any, emit protocol.EmitFunc) (protocol.ToolResult, error)
+}
+
 func str(args map[string]any, key string) (string, error) {
 	v, ok := args[key]
 	if !ok {

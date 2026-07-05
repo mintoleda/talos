@@ -42,10 +42,14 @@ func DefaultRegistry(cwd string, reads *ReadSet, bash BashConfig, searchURL stri
 	}
 }
 
-func (r *Registry) Close() {
+func (r *Registry) KillBg() {
 	if r.bg != nil {
 		r.bg.KillAll()
 	}
+}
+
+func (r *Registry) Close() {
+	r.KillBg()
 }
 
 func EmptyRegistry() *Registry {

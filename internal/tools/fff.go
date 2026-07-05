@@ -21,7 +21,7 @@ func ensureFFFIndex(cwd string) *fff.Index {
 	}
 	idxDir := filepath.Join(home, ".talos", "fff")
 	idx := fff.NewIndex(cwd, idxDir)
-	_ = idx.Load() // ignore missing index
+	_ = idx.Load()
 	if idx.Stats() == 0 {
 		_ = idx.Build()
 	}

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -97,6 +98,17 @@ func (b *Builder) spawnTools(allowed []string, depth int) []tools.Tool {
 		out = append(out, &spawnTool{builder: b, def: def, depth: depth})
 	}
 	return out
+}
+
+// SubagentToolNames returns the sorted list of subagent definition names,
+// corresponding to the spawn tool names registered in the primary agent.
+func (b *Builder) SubagentToolNames() []string {
+	names := make([]string, 0, len(b.defs))
+	for name := range b.defs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // builtLoop bundles a constructed subagent loop with the data needed to account

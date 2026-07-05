@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 
 	"github.com/mintoleda/talos/internal/provider"
 	"github.com/mintoleda/talos/internal/protocol"
@@ -11,12 +12,19 @@ import (
 )
 
 type PromptBuilder struct {
-	system        string
-	tools         []protocol.ToolSchema
-	model         string
-	ctxLimit      int
-	thinkingLevel string
-	contextFn     func() string
+	system             string
+	tools              []protocol.ToolSchema
+	model              string
+	ctxLimit           int
+	thinkingLevel      string
+	contextFn          func() string
+	permissionModeText string
+
+	// subagentListing is the "## Subagents you can delegate to" section,
+	// conditionally included in the system prompt at Build time.
+	subagentListing   string
+	subagentToolNames map[string]bool
+	subagentEnabled   bool // default true when SetSubagentData has been called
 }
 
 func NewPromptBuilder(system string, tools []protocol.ToolSchema, model string) *PromptBuilder {
@@ -27,19 +35,59 @@ func (b *PromptBuilder) SetThinkingLevel(level string) {
 	b.thinkingLevel = provider.ClampThinkingLevel(b.model, level)
 }
 
+// SetSubagentData stores the subagent listing and the set of subagent tool
+// names so the builder can conditionally exclude them from the tool schema and
+// system prompt when subagents are disabled at runtime.
+func (b *PromptBuilder) SetSubagentData(listing string, toolNames map[string]bool) {
+	b.subagentListing = listing
+	b.subagentToolNames = toolNames
+	b.subagentEnabled = true
+}
+
+// SetSubagentEnabled enables or disables subagent inclusion in the built request.
+func (b *PromptBuilder) SetSubagentEnabled(enabled bool) {
+	b.subagentEnabled = enabled
+}
+
+// SubagentEnabled reports whether subagents are currently enabled.
+func (b *PromptBuilder) SubagentEnabled() bool { return b.subagentEnabled }
+
 func (b *PromptBuilder) ThinkingLevel() string { return b.thinkingLevel }
 
-// SetContextFn installs a per-turn reminder that is prepended to the last
-// user message at request-build time. Used to surface dynamic state (e.g.
-// "files read this session") without invalidating the cacheable prefix —
-// the last user message is excluded from PrefixHash on purpose, so changes
-// here never bust the cache. The function should be cheap and must not
-// mutate the transcript.
+// SetContextFn installs a per-turn reminder that is surfaced via
+// Request.Volatile at request-build time. Used to surface dynamic state
+// (e.g. "files read this session") without invalidating the cacheable
+// prefix — Volatile is rendered outside any cache breakpoint, so changes
+// here never bust the cache and the transcript itself is never mutated.
+// The function should be cheap and must not mutate the transcript.
 func (b *PromptBuilder) SetContextFn(fn func() string) {
 	b.contextFn = fn
 }
 
+// SetPermissionModeText sets a brief description of the current permission
+// mode that is surfaced via Request.Volatile so the model knows how its tool
+// calls will be handled. Since Volatile is rendered outside any cache
+// breakpoint, it never busts the cacheable prefix.
+func (b *PromptBuilder) SetPermissionModeText(text string) {
+	b.permissionModeText = text
+}
+
 func (b *PromptBuilder) Build(tx *session.Transcript) protocol.Request {
+	// Build tools list, conditionally filtering out subagent spawn tools.
+	var schemas []protocol.ToolSchema
+	for _, t := range b.tools {
+		if !b.subagentEnabled && b.subagentToolNames[t.Name] {
+			continue
+		}
+		schemas = append(schemas, t)
+	}
+
+	// Build system prompt, conditionally stripping the subagent listing.
+	system := b.system
+	if !b.subagentEnabled && b.subagentListing != "" {
+		system = strings.Replace(system, b.subagentListing, "", 1)
+	}
+
 	msgs := tx.Frozen()
 	if summaries := tx.Summaries(); len(summaries) > 0 {
 		combined := make([]protocol.FrozenMessage, 0, len(summaries)+len(msgs))
@@ -47,43 +95,29 @@ func (b *PromptBuilder) Build(tx *session.Transcript) protocol.Request {
 		combined = append(combined, msgs...)
 		msgs = combined
 	}
-	if b.contextFn != nil {
-		// Copy the messages slice so a contextFn injection never mutates the
-		// transcript's underlying storage — tx.Frozen() returns the live slice.
-		msgs = append([]protocol.FrozenMessage(nil), msgs...)
-		if reminder := b.contextFn(); reminder != "" && len(msgs) > 0 {
-			last := msgs[len(msgs)-1]
-			if last.Msg.Role == protocol.RoleUser {
-				// Copy on write: don't mutate the frozen transcript.
-				augmented := last
-				augmented.Msg = last.Msg
-				augmented.Msg.Content = append([]protocol.ContentBlock(nil), last.Msg.Content...)
-				prepended := false
-				for i, blk := range augmented.Msg.Content {
-					if blk.Type == protocol.BlockText {
-						augmented.Msg.Content[i].Text = reminder + "\n\n" + blk.Text
-						prepended = true
-						break
-					}
-				}
-				if !prepended {
-					augmented.Msg.Content = append([]protocol.ContentBlock{{
-						Type: protocol.BlockText,
-						Text: reminder,
-					}}, augmented.Msg.Content...)
-				}
-				// Drop the cached Raw so callers that re-serialise see the
-				// new text. PrefixHash still uses the original Raw for older
-				// messages, which is what we want.
-				augmented.Raw = nil
-				msgs[len(msgs)-1] = augmented
+	var volatile []protocol.ContentBlock
+	if len(msgs) > 0 {
+		var reminders []string
+		if b.permissionModeText != "" {
+			reminders = append(reminders, b.permissionModeText)
+		}
+		if b.contextFn != nil {
+			if r := b.contextFn(); r != "" {
+				reminders = append(reminders, r)
 			}
+		}
+		if len(reminders) > 0 {
+			volatile = append(volatile, protocol.ContentBlock{
+				Type: protocol.BlockText,
+				Text: strings.Join(reminders, "\n\n"),
+			})
 		}
 	}
 	return protocol.Request{
-		System:        b.system,
-		Tools:         b.tools,
+		System:        system,
+		Tools:         schemas,
 		Messages:      msgs,
+		Volatile:      volatile,
 		Model:         b.model,
 		ThinkingLevel: b.thinkingLevel,
 	}

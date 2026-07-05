@@ -47,26 +47,38 @@ func buildBody(req protocol.Request, cfg Config) ([]byte, error) {
 		ar.Tools[len(ar.Tools)-1].CacheControl = &cacheControl{Type: "ephemeral"}
 	}
 
-	// Zone B: conversation history. Breakpoint on the last user message.
+	// Zone B: conversation history. Breakpoint on the last message whenever
+	// its wire role is "user" — this includes protocol.RoleTool messages,
+	// which protoToAPI converts to wire role "user" (tool_result carriers).
+	// cache_control is valid on tool_result blocks, so this gives incremental
+	// caching on every tool-loop iteration, not just plain user turns.
 	ar.Messages = make([]apiMsg, 0, len(req.Messages))
 	for i, fm := range req.Messages {
 		am, err := protoToAPI(fm.Msg)
 		if err != nil {
 			return nil, err
 		}
-		if i == len(req.Messages)-1 && fm.Msg.Role == protocol.RoleUser && len(am.Content) > 0 {
+		if i == len(req.Messages)-1 && am.Role == "user" && len(am.Content) > 0 {
 			am.Content[len(am.Content)-1].CacheControl = &cacheControl{Type: "ephemeral"}
 		}
 		ar.Messages = append(ar.Messages, am)
 	}
 
-	// Zone C: volatile tail.
+	// Zone C: volatile tail. When the last message is wire-role "user", merge
+	// the volatile blocks into it — appended after the block carrying the
+	// cache breakpoint above, so they sit outside the cached prefix without
+	// breaking role alternation. Otherwise (last message is assistant, or
+	// there are no messages), fall back to a separate trailing user message.
 	if len(req.Volatile) > 0 {
 		tail, err := volatileToAPI(req.Volatile)
 		if err != nil {
 			return nil, err
 		}
-		ar.Messages = append(ar.Messages, tail)
+		if n := len(ar.Messages); n > 0 && ar.Messages[n-1].Role == "user" {
+			ar.Messages[n-1].Content = append(ar.Messages[n-1].Content, tail.Content...)
+		} else {
+			ar.Messages = append(ar.Messages, tail)
+		}
 	}
 
 	if budget := thinkingBudget(cfg); budget > 0 {
