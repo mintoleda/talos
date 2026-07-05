@@ -2,6 +2,8 @@ package agents
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -56,38 +58,40 @@ func TestParseNoFrontmatter(t *testing.T) {
 	}
 }
 
-func TestLoadBuiltins(t *testing.T) {
+func TestLoadNoDirsEmpty(t *testing.T) {
 	defs, err := Load(nil)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	for _, name := range []string{"scout", "researcher", "worker"} {
-		if _, ok := defs[name]; !ok {
-			t.Errorf("missing builtin agent %q", name)
-		}
+	if len(defs) != 0 {
+		t.Fatalf("expected no builtins, got %d definitions", len(defs))
 	}
+}
 
-	// The "who may spawn whom" rule lives in the definitions: worker may spawn
-	// scout and researcher, but no builtin may spawn worker.
-	worker := defs["worker"]
-	if got := worker.Subagents; len(got) != 2 || got[0] != "scout" || got[1] != "researcher" {
-		t.Errorf("worker.subagents = %v", got)
+func TestLoadFromDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "scout.md"), []byte(`---
+name: scout
+description: Read-only scout.
+tools: [read]
+---
+Scout prompt.`), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if !contains(worker.Tools, "bash") {
-		t.Errorf("worker should have bash; tools=%v", worker.Tools)
+	defs, err := Load([]Dir{{Path: dir, Label: "test"}})
+	if err != nil {
+		t.Fatalf("load: %v", err)
 	}
-	if contains(defs["scout"].Tools, "bash") {
-		t.Errorf("scout must be read-only; tools=%v", defs["scout"].Tools)
-	}
-	for name, d := range defs {
-		if contains(d.Subagents, "worker") {
-			t.Errorf("agent %q must not be able to spawn worker", name)
-		}
+	if _, ok := defs["scout"]; !ok {
+		t.Fatal("expected scout definition")
 	}
 }
 
 func TestSpawnToolsSchema(t *testing.T) {
-	defs, _ := Load(nil)
+	defs := map[string]Definition{
+		"scout":  {Name: "scout", Description: "Scout"},
+		"worker": {Name: "worker", Description: "Worker"},
+	}
 	b := NewBuilder(Config{Model: "deepseek-chat"}, defs)
 	got := b.SpawnTools([]string{"scout", "worker", "does-not-exist"})
 	if len(got) != 2 {

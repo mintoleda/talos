@@ -4,15 +4,14 @@
 // tools, the subagents it may itself spawn, and its model/thinking level; the
 // body is the agent's system prompt.
 //
-// Definitions are loaded from three layers, later overriding earlier by name:
+// Definitions are loaded from user/project directories, later overriding
+// earlier directories by name:
 //
-//	embedded builtin/*.md      (scout, researcher, worker — model inherits from caller)
 //	~/.talos/subagents/*.md    (global, user-defined)
 //	<repo>/.talos/subagents/*.md (project-local)
 package agents
 
 import (
-	"embed"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,9 +19,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
-
-//go:embed builtin/*.md
-var builtinFS embed.FS
 
 // Definition is a fully-parsed agent loadout.
 type Definition struct {
@@ -34,7 +30,7 @@ type Definition struct {
 	Model       string   // model override (empty = inherit caller's model); also accepts "provider/model"
 	Thinking    string   // thinking level override (empty = inherit)
 	Prompt      string   // system prompt (markdown body after frontmatter)
-	Path        string   // source path ("<builtin>" for embedded)
+	Path        string   // source path
 }
 
 // frontmatter mirrors the YAML header of an agent markdown file.
@@ -54,24 +50,10 @@ type Dir struct {
 	Label string // diagnostic only
 }
 
-// Load builds the agent set: embedded builtins first, then each dir in order,
-// later definitions overriding earlier ones with the same name.
+// Load builds the agent set from each dir in order, later definitions
+// overriding earlier ones with the same name.
 func Load(dirs []Dir) (map[string]Definition, error) {
 	out := map[string]Definition{}
-
-	entries, err := builtinFS.ReadDir("builtin")
-	if err != nil {
-		return nil, fmt.Errorf("read builtin agents: %w", err)
-	}
-	for _, e := range entries {
-		data, err := builtinFS.ReadFile("builtin/" + e.Name())
-		if err != nil {
-			continue
-		}
-		if d, err := parse(e.Name(), data, "<builtin>"); err == nil {
-			out[d.Name] = d
-		}
-	}
 
 	for _, dir := range dirs {
 		des, err := os.ReadDir(dir.Path)
