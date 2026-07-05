@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,8 +14,11 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mintoleda/talos/internal/agents"
+	"github.com/mintoleda/talos/internal/client"
+	"github.com/mintoleda/talos/internal/client/rpc"
 	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/executor"
 	"github.com/mintoleda/talos/internal/loop"
@@ -35,7 +39,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-
 type Flags struct {
 	Print        string
 	Continue     bool
@@ -45,7 +48,6 @@ type Flags struct {
 	Provider     string
 	BaseURL      string
 	NoTools      bool
-	NoSubagents  bool
 	SystemPrompt string
 	DebugCache   bool
 }
@@ -75,7 +77,6 @@ func run() error {
 	flag.StringVar(&f.Provider, "provider", "", "provider: openai or anthropic")
 	flag.StringVar(&f.BaseURL, "base-url", "", "base URL override")
 	flag.BoolVar(&f.NoTools, "no-tools", false, "disable tools")
-	flag.BoolVar(&f.NoSubagents, "no-subagents", false, "disable subagents at startup")
 	flag.StringVar(&f.SystemPrompt, "system-prompt", "", "system prompt override")
 	flag.BoolVar(&f.DebugCache, "debug-cache", false, "log cache prefix hashes")
 	flag.BoolVar(&serverMode, "server", false, "run as a long-lived daemon")
@@ -87,6 +88,10 @@ func run() error {
 	}
 	cfg.Override(f.BaseURL, f.Model, "")
 	cfg.OverrideProvider(f.Provider)
+
+	if len(flag.Args()) > 0 && flag.Args()[0] == "dream" {
+		return runDream(cfg, flag.Args()[1:])
+	}
 
 	if len(flag.Args()) > 0 && flag.Args()[0] == "server" {
 		if len(flag.Args()) == 1 || (len(flag.Args()) >= 2 && flag.Args()[1] == "start") {
@@ -216,10 +221,13 @@ func run() error {
 		cfg.SystemPrompt += listing
 	}
 
-	if mem, err := memory.Load(cfg.BaseDir); err != nil {
+	projectID := memory.ProjectID(repoRoot)
+	memStore, err := memory.Open(cfg.BaseDir, projectID)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "[warning] loading memory: %v\n", err)
-	} else if mem != "" {
-		cfg.SystemPrompt += "\n\n## Persistent Memory\n\nThe following was remembered from previous sessions:\n\n" + mem
+	}
+	if memStore != nil {
+		cfg.SystemPrompt += memory.Render(memStore.TopN(30, 4096))
 	}
 
 	cp := safety.NewCheckpointer(repoRoot)
@@ -238,8 +246,8 @@ func run() error {
 	}
 
 	var (
-		reg              *tools.Registry
-		agentBuilder     *agents.Builder
+		reg             *tools.Registry
+		agentBuilder    *agents.Builder
 		subagentListing string
 	)
 	if f.NoTools {
@@ -255,44 +263,56 @@ func run() error {
 			filepath.Join(repoRoot, ".talos", "skills"),
 		}))
 
-		agentDirs := []agents.Dir{
-			{Path: filepath.Join(cfg.BaseDir, "subagents"), Label: "global"},
-			{Path: filepath.Join(repoRoot, ".talos", "subagents"), Label: "project"},
-		}
-		if defs, err := agents.Load(agentDirs); err != nil {
-			fmt.Fprintf(os.Stderr, "[warning] loading agents: %v\n", err)
-		} else if len(defs) > 0 {
-			agentBuilder = agents.NewBuilder(agents.Config{
-				Provider:       cfg.Provider,
-				BaseURL:        cfg.BaseURL,
-				APIKey:         cfg.APIKey,
-				Model:          cfg.Model,
-				ThinkingLevel:  cfg.ThinkingLevel,
-				MaxAgentDepth:  cfg.MaxAgentDepth,
-				Mode:           cfg.PermissionMode,
-				BashTimeout:    cfg.BashTimeout,
-				BashMaxTimeout: cfg.BashMaxTimeout,
-				BashMaxOutput:  cfg.BashMaxOutput,
-				SearchURL:      cfg.SearchURL,
-				Cwd:            cwd,
-				BaseDir:        cfg.BaseDir,
-			}, defs)
-			allAgents := make([]string, 0, len(defs))
-			for name := range defs {
-				allAgents = append(allAgents, name)
+		if cfg.EnableSubagents {
+			agentDirs := []agents.Dir{
+				{Path: filepath.Join(cfg.BaseDir, "subagents"), Label: "global"},
+				{Path: filepath.Join(repoRoot, ".talos", "subagents"), Label: "project"},
 			}
-			sort.Strings(allAgents)
-			reg.Add(agentBuilder.SpawnTools(allAgents)...)
-			subagentListing = agents.RenderListing(defs, allAgents)
-			cfg.SystemPrompt += subagentListing
+			if defs, err := agents.Load(agentDirs); err != nil {
+				fmt.Fprintf(os.Stderr, "[warning] loading agents: %v\n", err)
+			} else if len(defs) > 0 {
+				agentBuilder = agents.NewBuilder(agents.Config{
+					Provider:       cfg.Provider,
+					BaseURL:        cfg.BaseURL,
+					APIKey:         cfg.APIKey,
+					Model:          cfg.Model,
+					ThinkingLevel:  cfg.ThinkingLevel,
+					MaxAgentDepth:  cfg.MaxAgentDepth,
+					Mode:           cfg.PermissionMode,
+					BashTimeout:    cfg.BashTimeout,
+					BashMaxTimeout: cfg.BashMaxTimeout,
+					BashMaxOutput:  cfg.BashMaxOutput,
+					SearchURL:      cfg.SearchURL,
+					Cwd:            cwd,
+					BaseDir:        cfg.BaseDir,
+				}, defs)
+				allAgents := make([]string, 0, len(defs))
+				for name := range defs {
+					allAgents = append(allAgents, name)
+				}
+				sort.Strings(allAgents)
+				reg.Add(agentBuilder.SpawnTools(allAgents)...)
+				subagentListing = agents.RenderListing(defs, allAgents)
+				cfg.SystemPrompt += subagentListing
+			}
 		}
-		reg.Add(tools.NewMemoryWrite(cfg.BaseDir))
+		if memStore != nil {
+			reg.Add(tools.NewMemoryWrite(memStore), tools.NewMemorySearch(memStore), tools.NewMemoryDelete(memStore))
+		}
 		reg.Add(mcpManager.Tools()...)
 	}
 
 	prov, compactor, err := newProvider(cfg, f.NoTools)
 	if err != nil {
 		return fmt.Errorf("provider: %w", err)
+	}
+	if compactor != nil && cfg.Historian && memStore != nil {
+		hist, err := newHistorian(cfg, memStore)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[warning] historian disabled: %v\n", err)
+		} else {
+			compactor.Historian = hist
+		}
 	}
 
 	pol := safety.NewPolicy(cfg.PermissionMode, cwd, safety.NewClassifier(), f.Print == "")
@@ -304,16 +324,13 @@ func run() error {
 
 	// Wire subagent data into the prompt builder so subagent listing and
 	// spawn-tool schemas can be toggled at runtime without losing them from
-	// the registry. Apply the --no-subagents flag as the initial state.
+	// the registry.
 	if agentBuilder != nil {
 		subagentToolNames := make(map[string]bool)
 		for _, n := range agentBuilder.SubagentToolNames() {
 			subagentToolNames[n] = true
 		}
 		pb.SetSubagentData(subagentListing, subagentToolNames)
-		if f.NoSubagents {
-			pb.SetSubagentEnabled(false)
-		}
 	}
 	// Inject a per-turn reminder listing files the model has actually opened
 	// in this session. Surfaced via Request.Volatile so it does not break
@@ -348,6 +365,7 @@ func run() error {
 		exec:         exec,
 		agentBuilder: agentBuilder,
 		mcpManager:   mcpManager,
+		memStore:     memStore,
 		cwd:          cwd,
 		noTools:      f.NoTools,
 	}
@@ -390,110 +408,32 @@ func run() error {
 
 	default:
 		tuiCtx := context.Background()
-		inCh, steerQueue, intCh, cmpCh, evCh, engineCleanup := tui.StartEngine(tuiCtx, lp, cp, cfg.Notifications)
-
-		ls := lp.Stats()
-		cacheMiss := ls.InputTokens - ls.CachedTokens
-		seedCost := 0.0
-		if prices != nil && cfg.Model != "" {
-			seedCost = prices.Cost(cfg.Model, ls.InputTokens, ls.OutputTokens)
-		}
+		engine := newLocalEngine(tuiCtx, a, lp, cp, prices, cfg.Notifications)
+		inputTokens, outputTokens, cacheMiss, seedCost, _ := engine.Stats()
 
 		initialCfg := tui.Config{
-			SessionID:   sess.ID,
-			Mode:        tui.ModeSingleAgent,
-			InputCh:     inCh,
-			SteerQueue:  steerQueue,
-			InterruptCh: intCh,
-			CompactCh:   cmpCh,
-			Shutdown:    engineCleanup,
-			Provider:    cfg.Provider,
-			Model:       cfg.Model,
-			Pricing:     prices,
+			SessionID: sess.ID,
+			Mode:      tui.ModeSingleAgent,
+			Engine:    engine,
+			Shutdown:  engine.Close,
+			Provider:  cfg.Provider,
+			Model:     cfg.Model,
+			Pricing:   prices,
 			SeedStats: struct {
 				InputTokens  int
 				OutputTokens int
 				CacheMiss    int
 				Cost         float64
 			}{
-				InputTokens:  ls.InputTokens,
-				OutputTokens: ls.OutputTokens,
+				InputTokens:  inputTokens,
+				OutputTokens: outputTokens,
 				CacheMiss:    cacheMiss,
 				Cost:         seedCost,
 			},
 			InitialHistory: tx.Frozen(),
-			NewSession: func() (string, error) {
-				ntx, id, err := a.newSession()
-				if err != nil {
-					return "", err
-				}
-				lp.SetTranscript(ntx)
-				fmt.Fprintf(os.Stderr, "[started new session %s]\n", id)
-				return id, nil
-			},
-			Stats: func() string {
-				s := lp.Stats()
-				if s.Calls == 0 {
-					return "[stats] no API calls yet"
-				}
-				return fmt.Sprintf("[stats] calls=%d | input=%d | output=%d | cached=%d (%.1f%%)",
-					s.Calls, s.InputTokens, s.OutputTokens, s.CachedTokens, s.CacheHitRate()*100)
-			},
-			ResumeSession: func(id string) (string, []protocol.FrozenMessage, error) {
-				ntx, sid, err := a.resumeSession(id)
-				if err != nil {
-					return "", nil, err
-				}
-				lp.SetTranscript(ntx)
-				fmt.Fprintf(os.Stderr, "[resumed session %s]\n", sid)
-				return sid, ntx.Frozen(), nil
-			},
-			SwitchProvider: a.switchProvider,
-			CycleThinking: func() string {
-				caps := provider.SupportedLevels(pb.Model())
-				cur := pb.ThinkingLevel()
-				if cur == "" {
-					cur = caps[0]
-				}
-				for i, l := range caps {
-					if l == cur {
-						next := caps[(i+1)%len(caps)]
-						pb.SetThinkingLevel(next)
-						if err := config.SaveThinkingLevel(cfg.BaseDir, next); err != nil {
-							fmt.Fprintf(os.Stderr, "[warning] save thinking level: %v\n", err)
-						}
-						return next
-					}
-				}
-				pb.SetThinkingLevel(caps[0])
-				_ = config.SaveThinkingLevel(cfg.BaseDir, caps[0])
-				return caps[0]
-			},
-			CurrentThinkingLevel: func() string { return pb.ThinkingLevel() },
-			DeleteSession:        func(id string) error { return session.DeleteSession(a.cwd, id) },
-			FetchSessions:        a.fetchSessions,
-			FetchModels:          a.fetchModels,
-			LoginProviders:       a.loginProviders,
-			SaveLogin:            a.saveLogin,
-			CancelSubagent: func(id string) {
-				if agentBuilder != nil {
-					agentBuilder.CancelSubagent(id)
-				}
-			},
-			StatsSnapshot: func() (int, int, int, float64) {
-				s := lp.Stats()
-				cm := s.InputTokens - s.CachedTokens
-				c := 0.0
-				if prices != nil && cfg.Model != "" {
-					c = prices.Cost(cfg.Model, s.InputTokens, s.OutputTokens)
-				}
-				return s.InputTokens, s.OutputTokens, cm, c
-			},
-			MCPStatus: func() string { return mcpManager.Status() },
-			MCPCount: func() int { return mcpManager.ConnectedCount() },
 			ToggleSubagents: func() string {
-				if pb == nil {
-					return "subagents not configured"
+				if agentBuilder == nil {
+					return "subagents not enabled in config"
 				}
 				enabled := !pb.SubagentEnabled()
 				pb.SetSubagentEnabled(enabled)
@@ -504,19 +444,22 @@ func run() error {
 			},
 		}
 
-		return tui.RunTabs(tuiCtx, initialCfg, evCh, a.makeNewTabFn(tuiCtx, cp, prices, cfg.Notifications))
+		return tui.RunTabs(tuiCtx, initialCfg, engine.Events(), a.makeNewTabFn(tuiCtx, cp, prices, cfg.Notifications))
 	}
 }
 
-// renderTo returns an EmitFunc that writes events to out in a human-readable
-// format suitable for one-shot (-p) mode.
+// renderTo returns an EmitFunc that writes events in a format suitable for
+// one-shot (-p) mode. Text deltas go to stdout (the agent's response); all
+// metadata — tool calls, notices, turn summaries, permission prompts — goes
+// to stderr so that stdout contains only the answer, suitable for piping.
 func renderTo(out *os.File, debugCache bool) protocol.EmitFunc {
+	errOut := os.Stderr
 	return func(ev protocol.Event) {
 		switch e := ev.(type) {
 		case protocol.TextDelta:
 			fmt.Fprint(out, e.Text)
 		case protocol.ToolStarted:
-			fmt.Fprintf(out, "\n▶ %s\n", e.Name)
+			fmt.Fprintf(errOut, "\n▶ %s\n", e.Name)
 		case protocol.ToolFinished:
 			mark := "✓"
 			if e.Result.IsError {
@@ -526,38 +469,38 @@ func renderTo(out *os.File, debugCache bool) protocol.EmitFunc {
 			if len(text) > 400 {
 				text = text[:200] + "\n[...]\n" + text[len(text)-200:]
 			}
-			fmt.Fprintf(out, "\n%s %s\n%s\n", mark, e.Result.ToolUseID, text)
+			fmt.Fprintf(errOut, "\n%s %s\n%s\n", mark, e.Result.ToolUseID, text)
 		case protocol.Notice:
-			fmt.Fprintf(out, "\n[%s] %s\n", e.Level, e.Text)
+			fmt.Fprintf(errOut, "\n[%s] %s\n", e.Level, e.Text)
 		case protocol.TurnEnded:
 			extra := ""
 			if e.Usage.CachedPromptTokens > 0 {
 				extra = fmt.Sprintf(" | cached=%d", e.Usage.CachedPromptTokens)
 			}
-			fmt.Fprintf(out, "\n[turn ended: %s | prompt=%d completion=%d%s]\n",
+			fmt.Fprintf(errOut, "\n[turn ended: %s | prompt=%d completion=%d%s]\n",
 				e.StopReason, e.Usage.PromptTokens, e.Usage.CompletionTokens, extra)
 		case protocol.PermissionRequested:
-			fmt.Fprintf(out, "\n⚠ %s requires approval: %s\nAllow? [y/N] ", e.ToolName, e.Reason)
+			fmt.Fprintf(errOut, "\n⚠ %s requires approval: %s\nAllow? [y/N] ", e.ToolName, e.Reason)
 			var ans string
 			fmt.Scanln(&ans)
 			if e.ReplyCh != nil {
 				e.ReplyCh <- ans == "y" || ans == "Y"
 			}
 		case protocol.SubagentStarted:
-			fmt.Fprintf(out, "\n  ⊳ %s: %s\n", e.Agent, e.Task)
+			fmt.Fprintf(errOut, "\n  ⊳ %s: %s\n", e.Agent, e.Task)
 		case protocol.SubagentEvent:
 			switch ie := e.Inner.(type) {
 			case protocol.ToolStarted:
-				fmt.Fprintf(out, "    [%s] ▶ %s\n", e.Agent, ie.Name)
+				fmt.Fprintf(errOut, "    [%s] ▶ %s\n", e.Agent, ie.Name)
 			case protocol.ToolFinished:
 				mark := "✓"
 				if ie.Result.IsError {
 					mark = "✗"
 				}
-				fmt.Fprintf(out, "    [%s] %s\n", e.Agent, mark)
+				fmt.Fprintf(errOut, "    [%s] %s\n", e.Agent, mark)
 			}
 		case protocol.SubagentFinished:
-			fmt.Fprintf(out, "  ⊲ %s done (in=%d out=%d $%.4f)\n",
+			fmt.Fprintf(errOut, "  ⊲ %s done (in=%d out=%d $%.4f)\n",
 				e.Agent, e.Usage.InputTokens, e.Usage.OutputTokens, e.Usage.Cost)
 		default:
 			// Unknown event type: ignore safely so new events don't break
@@ -592,11 +535,9 @@ func newProvider(cfg *config.Config, noTools bool) (provider.Provider, *session.
 		if a, ok := aliases[name]; ok {
 			name = a
 		}
-		base := ""
-		if kp, ok := provider.ByName(name); ok {
-			base = kp.BaseURL
-		} else {
-			base = cleanBaseURL(cfg.BaseURL)
+		base, err := openAICompatibleBaseURL(name, cfg.BaseURL)
+		if err != nil {
+			return nil, nil, err
 		}
 		prov = openai.New(base, cfg.APIKey)
 	}
@@ -623,6 +564,88 @@ func newProvider(cfg *config.Config, noTools bool) (provider.Provider, *session.
 	return prov, compactor, nil
 }
 
+func openAICompatibleBaseURL(name, configured string) (string, error) {
+	base := cleanBaseURL(configured)
+	if name == "cloudflare" {
+		if base == "" || base == "https://api.deepseek.com" {
+			accountID := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+			if accountID == "" {
+				return "", fmt.Errorf("cloudflare provider requires CLOUDFLARE_ACCOUNT_ID or a base_url ending in /accounts/{id}/ai/v1")
+			}
+			base = fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/ai", accountID)
+		}
+		return base, nil
+	}
+	if kp, ok := provider.ByName(name); ok {
+		if base == "" || (base == "https://api.deepseek.com" && name != "deepseek") {
+			base = kp.BaseURL
+		}
+	}
+	return base, nil
+}
+
+func roleLLMConfig(cfg *config.Config, providerName, modelName, baseURL, apiKey string) *config.Config {
+	cc := *cfg
+	if providerName != "" {
+		cc.Provider = providerName
+		if baseURL == "" {
+			cc.BaseURL = ""
+		}
+	}
+	if modelName != "" {
+		cc.Model = modelName
+	}
+	if baseURL != "" {
+		cc.BaseURL = baseURL
+	}
+	if apiKey != "" {
+		cc.APIKey = apiKey
+	} else {
+		cc.ResolveAPIKey()
+	}
+	return &cc
+}
+
+func historianProvider(cfg *config.Config) (provider.Provider, string, error) {
+	model := cfg.HistorianModel
+	if model == "" {
+		model = cfg.SummaryModel
+	}
+	if model == "" {
+		model = cfg.Model
+	}
+	roleCfg := roleLLMConfig(cfg, cfg.HistorianProvider, model, cfg.HistorianBaseURL, cfg.HistorianAPIKey)
+	prov, _, err := newProvider(roleCfg, true)
+	return prov, model, err
+}
+
+func dreamerProvider(cfg *config.Config, overrideModel string) (provider.Provider, string, error) {
+	model := overrideModel
+	if model == "" {
+		model = cfg.DreamerModel
+	}
+	if model == "" {
+		model = cfg.SummaryModel
+	}
+	if model == "" {
+		model = cfg.Model
+	}
+	roleCfg := roleLLMConfig(cfg, cfg.DreamerProvider, model, cfg.DreamerBaseURL, cfg.DreamerAPIKey)
+	prov, _, err := newProvider(roleCfg, true)
+	return prov, model, err
+}
+
+func newHistorian(cfg *config.Config, store *memory.Store) (*session.Historian, error) {
+	if !cfg.Historian || store == nil {
+		return nil, nil
+	}
+	prov, model, err := historianProvider(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &session.Historian{Provider: prov, Model: model, Store: store}, nil
+}
+
 // cleanBaseURL strips trailing /v1 (and /v1/) suffixes from a provider base URL.
 // The anthropic and openai clients already append their own /v1/<endpoint> paths,
 // so a user-provided URL like https://api.openai.com/v1 would produce double /v1
@@ -633,6 +656,50 @@ func cleanBaseURL(raw string) string {
 		s = s[:len(s)-3]
 	}
 	return s
+}
+
+func rpcResult(v any, errs ...error) (json.RawMessage, error) {
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	if v == nil {
+		return json.RawMessage(`{}`), nil
+	}
+	return json.Marshal(v)
+}
+
+func decodeRPC[T any](raw json.RawMessage) (T, error) {
+	var v T
+	if len(raw) == 0 {
+		return v, nil
+	}
+	err := json.Unmarshal(raw, &v)
+	return v, err
+}
+
+func cycleThinkingLevel(cfg *config.Config, pb *loop.PromptBuilder) (string, error) {
+	caps := provider.SupportedLevels(pb.Model())
+	cur := pb.ThinkingLevel()
+	if cur == "" {
+		cur = caps[0]
+	}
+	for i, l := range caps {
+		if l == cur {
+			next := caps[(i+1)%len(caps)]
+			pb.SetThinkingLevel(next)
+			if err := config.SaveThinkingLevel(cfg.BaseDir, next); err != nil {
+				fmt.Fprintf(os.Stderr, "[warning] save thinking level: %v\n", err)
+			}
+			return next, nil
+		}
+	}
+	pb.SetThinkingLevel(caps[0])
+	if err := config.SaveThinkingLevel(cfg.BaseDir, caps[0]); err != nil {
+		fmt.Fprintf(os.Stderr, "[warning] save thinking level: %v\n", err)
+	}
+	return caps[0], nil
 }
 
 func runServer(ctx context.Context, cfg *config.Config, a *app, lp *loop.Loop, cp *safety.Checkpointer, sessionID string) error {
@@ -710,46 +777,230 @@ func runServer(ctx context.Context, cfg *config.Config, a *app, lp *loop.Loop, c
 		}
 	})
 	srv := server.New(engine, server.SocketPath(cfg.BaseDir, sessionID), server.PidFile(cfg.BaseDir, sessionID), 0)
+	if cfg.ServerListen != "" {
+		network := "tcp"
+		addr := cfg.ServerListen
+		if strings.HasPrefix(addr, "ws:") {
+			network = "ws"
+			addr = strings.TrimPrefix(addr, "ws:")
+		} else {
+			addr = strings.TrimPrefix(addr, "tcp:")
+		}
+		srv.SetListen(network, addr)
+		token := cfg.ServerToken
+		if token == "" {
+			token = generateID()
+			fmt.Fprintf(os.Stderr, "[server token %s]\n", token)
+		}
+		srv.SetToken(token)
+		fmt.Fprintf(os.Stderr, "[server listening on %s %s]\n", network, addr)
+	}
+	prices := pricing.Load(cfg.BaseDir)
+	srv.SetRequestHandler(func(reqCtx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+		switch method {
+		case rpc.NewSession:
+			tx, id, err := a.newSession()
+			if err != nil {
+				return nil, err
+			}
+			lp.SetTranscript(tx)
+			engine.SetSessionID(id)
+			fmt.Fprintf(os.Stderr, "[started new session %s]\n", id)
+			return rpcResult(struct {
+				ID string `json:"id"`
+			}{ID: id})
+		case rpc.Resume:
+			p, err := decodeRPC[rpc.ResumeParams](params)
+			if err != nil {
+				return nil, err
+			}
+			tx, id, err := a.resumeSession(p.ID)
+			if err != nil {
+				return nil, err
+			}
+			lp.SetTranscript(tx)
+			engine.SetSessionID(id)
+			fmt.Fprintf(os.Stderr, "[resumed session %s]\n", id)
+			return rpcResult(rpc.ResumeResult{ID: id, History: tx.Frozen()})
+		case rpc.ListSessions:
+			sessions, err := a.fetchSessions()
+			if err != nil {
+				return nil, err
+			}
+			return rpcResult(rpc.SessionsResult{Sessions: sessions})
+		case rpc.DeleteSession:
+			p, err := decodeRPC[rpc.DeleteSessionParams](params)
+			if err != nil {
+				return nil, err
+			}
+			return rpcResult(nil, session.DeleteSession(a.cwd, p.ID))
+		case rpc.ListModels:
+			models, err := a.fetchModels()
+			if err != nil {
+				return nil, err
+			}
+			return rpcResult(rpc.ModelsResult{Models: models})
+		case rpc.SwitchModel:
+			p, err := decodeRPC[rpc.SwitchModelParams](params)
+			if err != nil {
+				return nil, err
+			}
+			if err := a.switchProvider(p.Provider, p.Model); err != nil {
+				return nil, err
+			}
+			engine.Emit(protocol.ModelChanged{
+				Provider:      a.cfg.Provider,
+				Model:         a.cfg.Model,
+				ThinkingLevel: a.pb.ThinkingLevel(),
+			})
+			return rpcResult(nil)
+		case rpc.CycleThinking:
+			level, err := cycleThinkingLevel(a.cfg, a.pb)
+			if err != nil {
+				return nil, err
+			}
+			engine.Emit(protocol.ModelChanged{
+				Provider:      a.cfg.Provider,
+				Model:         a.cfg.Model,
+				ThinkingLevel: level,
+			})
+			return rpcResult(rpc.LevelResult{Level: level})
+		case rpc.CurrentThinking:
+			return rpcResult(rpc.LevelResult{Level: a.pb.ThinkingLevel()})
+		case rpc.WithdrawSteer:
+			return rpcResult(rpc.BlocksResult{Blocks: engine.WithdrawSteer()})
+		case rpc.Compact:
+			p, err := decodeRPC[rpc.CompactParams](params)
+			if err != nil {
+				return nil, err
+			}
+			go func() {
+				compactCtx, cancel := context.WithTimeout(reqCtx, 120*time.Second)
+				summary, err := lp.CompactNow(compactCtx, p.Focus)
+				cancel()
+				if err != nil {
+					engine.Emit(protocol.Notice{Level: "error", Text: "/compact failed: " + err.Error()})
+				} else if summary == "" {
+					engine.Emit(protocol.Notice{Level: "info", Text: "nothing to compact"})
+				} else {
+					engine.Emit(protocol.Notice{Level: "info", Text: "compacted oldest chunk - summary: " + summary})
+				}
+			}()
+			return rpcResult(nil)
+		case rpc.Stats:
+			s := lp.Stats()
+			cost := 0.0
+			if prices != nil && a.cfg.Model != "" {
+				cost = prices.Cost(a.cfg.Model, s.InputTokens, s.OutputTokens)
+			}
+			return rpcResult(rpc.StatsResult{
+				Input:     s.InputTokens,
+				Output:    s.OutputTokens,
+				CacheMiss: s.InputTokens - s.CachedTokens,
+				Cost:      cost,
+			})
+		case rpc.LoginProviders:
+			return rpcResult(rpc.LoginProvidersResult{Providers: a.loginProviders()})
+		case rpc.Login:
+			p, err := decodeRPC[rpc.LoginParams](params)
+			if err != nil {
+				return nil, err
+			}
+			return rpcResult(nil, a.saveLogin(p.Provider, p.Key))
+		case rpc.MCPStatus:
+			return rpcResult(rpc.StatusResult{Status: a.mcpManager.Status()})
+		case rpc.MCPCount:
+			return rpcResult(rpc.CountResult{Count: a.mcpManager.ConnectedCount()})
+		case rpc.CancelSubagent:
+			p, err := decodeRPC[rpc.CancelSubagentParams](params)
+			if err != nil {
+				return nil, err
+			}
+			if a.agentBuilder != nil {
+				a.agentBuilder.CancelSubagent(p.ID)
+			}
+			return rpcResult(nil)
+		case rpc.History:
+			return rpcResult(rpc.HistoryResult{History: lp.History()})
+		case rpc.ListFiles:
+			p, err := decodeRPC[rpc.ListFilesParams](params)
+			if err != nil {
+				return nil, err
+			}
+			files, err := client.ListFiles(a.cwd, p.Prefix)
+			if err != nil {
+				return nil, err
+			}
+			return rpcResult(rpc.ListFilesResult{Files: files})
+		case rpc.ResolveInput:
+			p, err := decodeRPC[rpc.ResolveInputParams](params)
+			if err != nil {
+				return nil, err
+			}
+			blocks, display, err := client.ResolveInput(a.cwd, p.Text)
+			if err != nil {
+				return nil, err
+			}
+			return rpcResult(rpc.ResolveInputResult{Blocks: blocks, Display: display})
+		case rpc.PushInstruction:
+			msg, notice, err := client.PushInstruction(a.cwd)
+			if err != nil {
+				return nil, err
+			}
+			return rpcResult(rpc.PushInstructionResult{Message: msg, Notice: notice})
+		default:
+			return nil, fmt.Errorf("unknown method %s", method)
+		}
+	})
 	fmt.Fprintf(os.Stderr, "[server running for session %s]\n", sessionID)
 	return srv.Start(ctx)
 }
 
 func runAttach(ctx context.Context, cfg *config.Config, sessionID string) error {
-	client, events, err := server.RunClient(ctx, server.SocketPath(cfg.BaseDir, sessionID))
+	var clientConn *server.ClientConn
+	var events <-chan protocol.Event
+	var err error
+	if cfg.ServerListen != "" {
+		isWS := strings.HasPrefix(cfg.ServerListen, "ws:")
+		addr := strings.TrimPrefix(cfg.ServerListen, "tcp:")
+		addr = strings.TrimPrefix(addr, "ws:")
+		addr = strings.Replace(addr, "0.0.0.0:", "127.0.0.1:", 1)
+		if isWS {
+			clientConn, events, err = server.RunClientWebSocket(ctx, "ws://"+addr+"/ws", cfg.ServerToken)
+		} else {
+			clientConn, events, err = server.RunClientNetwork(ctx, "tcp", addr, cfg.ServerToken)
+		}
+	} else {
+		clientConn, events, err = server.RunClient(ctx, server.SocketPath(cfg.BaseDir, sessionID))
+	}
 	if err != nil {
 		return err
 	}
 
 	prices := pricing.Load(cfg.BaseDir)
 
-	// Load the existing session transcript so newly-attached clients see
-	// messages and tool calls that happened before they connected.
-	cwd, _ := os.Getwd()
-	sessPath := filepath.Join(session.SessionsDir(), session.ProjectHash(cwd), sessionID+".jsonl")
-	var initialHistory []protocol.FrozenMessage
-	if tx, err := session.Load(sessPath); err == nil {
-		initialHistory = tx.Frozen()
-		_ = tx.Close()
-	}
+	engine := client.NewRemoteEngine(clientConn, events)
+	initialHistory, _ := engine.History()
+	inputTokens, outputTokens, cacheMiss, seedCost, _ := engine.Stats()
 
 	m := tui.NewModel(tui.Config{
-		SessionID:       sessionID,
-		Mode:            tui.ModeSingleAgent,
-		InitialHistory:  initialHistory,
-		SubmitFn: func(text string) {
-			_ = client.Send(text)
-		},
-		SubmitSlash: func(cmd string) {
-			_ = client.Send(cmd)
-		},
-		InterruptFn: func() {
-			_ = client.Interrupt()
-		},
-		Provider: cfg.Provider,
-		Model:    cfg.Model,
-		Pricing:  prices,
-		Stats: func() string {
-			return "[stats: attached to server — run /stats on the server terminal]"
+		SessionID:      sessionID,
+		Mode:           tui.ModeSingleAgent,
+		InitialHistory: initialHistory,
+		Engine:         engine,
+		Provider:       cfg.Provider,
+		Model:          cfg.Model,
+		Pricing:        prices,
+		SeedStats: struct {
+			InputTokens  int
+			OutputTokens int
+			CacheMiss    int
+			Cost         float64
+		}{
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
+			CacheMiss:    cacheMiss,
+			Cost:         seedCost,
 		},
 	})
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
@@ -825,4 +1076,141 @@ func generateID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func runDream(cfg *config.Config, args []string) error {
+	fs := flag.NewFlagSet("dream", flag.ContinueOnError)
+	dryRun := fs.Bool("dry-run", false, "show curation report without writing")
+	model := fs.String("model", "", "curation model override")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cwd, _ := os.Getwd()
+	repoRoot := findRepoRoot(cwd)
+	store, err := memory.Open(cfg.BaseDir, memory.ProjectID(repoRoot))
+	if err != nil {
+		return err
+	}
+	entries := store.All()
+	var downgraded int
+	for _, e := range entries {
+		if !memoryReferencesMissingPath(repoRoot, e) {
+			continue
+		}
+		downgraded++
+		if !*dryRun {
+			id := e.ID
+			_ = store.Update(id, func(en *memory.Entry) {
+				if en.Importance > 0.2 {
+					en.Importance = 0.2
+				}
+			})
+		}
+	}
+	var deleted int
+	prov, modelName, err := dreamerProvider(cfg, *model)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[dream] curation skipped: %v\n", err)
+	} else if modelName != "" {
+		decisions, err := dreamDecisions(prov, modelName, entries, repoRoot)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[dream] curation skipped: %v\n", err)
+		} else {
+			for _, d := range decisions {
+				switch d.Action {
+				case "delete":
+					deleted++
+					if !*dryRun {
+						_ = store.Delete(d.ID)
+					}
+				case "keep":
+					if !*dryRun {
+						_ = store.Update(d.ID, func(e *memory.Entry) {
+							if d.Importance > 0 {
+								e.Importance = d.Importance
+							}
+							if d.Text != "" {
+								e.Text = d.Text
+							}
+						})
+					}
+				case "merge":
+					deleted++
+					if !*dryRun {
+						_ = store.Delete(d.ID)
+					}
+				}
+			}
+		}
+	}
+	if !*dryRun {
+		if err := store.Compact(); err != nil {
+			return err
+		}
+	}
+	mode := "applied"
+	if *dryRun {
+		mode = "dry-run"
+	}
+	fmt.Fprintf(os.Stdout, "dream %s: kept=%d downgraded=%d deleted=%d\n", mode, len(entries)-deleted, downgraded, deleted)
+	return nil
+}
+
+type dreamDecision struct {
+	ID         string  `json:"id"`
+	Action     string  `json:"action"`
+	MergeInto  string  `json:"merge_into"`
+	Importance float64 `json:"importance"`
+	Text       string  `json:"text"`
+}
+
+func dreamDecisions(prov provider.Provider, model string, entries []memory.Entry, repoRoot string) ([]dreamDecision, error) {
+	data, _ := json.Marshal(entries)
+	msg := protocol.TextMessage(protocol.RoleUser, "Project root: "+repoRoot+"\nMemories JSON:\n"+string(data))
+	rawMsg, _ := json.Marshal(msg)
+	req := protocol.Request{
+		System: "Curate project memories. Return only a JSON array of {id, action, merge_into, importance, text}. action is keep, merge, or delete. Delete stale/wrong duplicates; merge near-duplicates by marking the duplicate action merge with merge_into set. Keep text concise.",
+		Messages: []protocol.FrozenMessage{{
+			Msg: msg,
+			Raw: rawMsg,
+		}},
+		Model: model,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	stream, err := prov.StreamTurn(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	var out string
+	for ev := range stream {
+		switch e := ev.(type) {
+		case protocol.PEText:
+			out += e.Text
+		case protocol.PEError:
+			return nil, e.Err
+		}
+	}
+	var decisions []dreamDecision
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &decisions); err != nil {
+		return nil, err
+	}
+	return decisions, nil
+}
+
+func memoryReferencesMissingPath(root string, e memory.Entry) bool {
+	fields := append(strings.Fields(e.Text), e.Tags...)
+	for _, f := range fields {
+		f = strings.Trim(f, "`'\".,:;()[]{}")
+		if !strings.Contains(f, "/") && !strings.Contains(f, ".") {
+			continue
+		}
+		if strings.HasPrefix(f, "http://") || strings.HasPrefix(f, "https://") {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(root, f)); err != nil {
+			return true
+		}
+	}
+	return false
 }

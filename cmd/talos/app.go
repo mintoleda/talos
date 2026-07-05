@@ -8,10 +8,12 @@ import (
 	"sync"
 
 	"github.com/mintoleda/talos/internal/agents"
+	"github.com/mintoleda/talos/internal/client"
 	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/executor"
 	"github.com/mintoleda/talos/internal/loop"
 	"github.com/mintoleda/talos/internal/mcp"
+	"github.com/mintoleda/talos/internal/memory"
 	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/notify"
 	"github.com/mintoleda/talos/internal/pricing"
@@ -32,6 +34,7 @@ type app struct {
 	exec         executor.Executor
 	agentBuilder *agents.Builder
 	mcpManager   *mcp.Manager
+	memStore     *memory.Store
 	cwd          string
 	noTools      bool
 
@@ -88,6 +91,14 @@ func (a *app) switchProviderFor(lp *loop.Loop, pName, pModel string) error {
 		return err
 	}
 	lp.SetProvider(prov)
+	if comp != nil && a.cfg.Historian && a.memStore != nil {
+		hist, err := newHistorian(a.cfg, a.memStore)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[warning] historian disabled: %v\n", err)
+		} else {
+			comp.Historian = hist
+		}
+	}
 	lp.SetCompactor(comp)
 	a.pb.SetModel(a.cfg.Model)
 	a.prov = prov
@@ -104,8 +115,8 @@ func (a *app) switchProvider(pName, pModel string) error {
 }
 
 func (a *app) toggleSubagents() string {
-	if a.pb == nil {
-		return "subagents not configured"
+	if a.agentBuilder == nil {
+		return "subagents not enabled in config"
 	}
 	enabled := !a.pb.SubagentEnabled()
 	a.pb.SetSubagentEnabled(enabled)
@@ -113,6 +124,33 @@ func (a *app) toggleSubagents() string {
 		return "subagents: on"
 	}
 	return "subagents: off"
+}
+
+// newLocalEngine constructs a client.Engine from the application's current
+// state and dependencies. It wires the same objects that the inline Config
+// closures in run() and makeNewTabFn build, but packaged behind the Engine
+// interface. This is step 2 of the engine seam refactor — the TUI still uses
+// the old Config path; step 3 switches it over.
+//
+// The returned Engine must be closed via Engine.Close() when done.
+func newLocalEngine(ctx context.Context, a *app, lp *loop.Loop, cp *safety.Checkpointer, prices *pricing.Table, notifyCfg notify.Config) client.Engine {
+	return client.NewLocalEngine(client.Params{
+		Loop:          lp,
+		PromptBuilder: a.pb,
+		Prices:        prices,
+		Provider:      a.cfg.Provider,
+		Model:         a.cfg.Model,
+		BaseDir:       a.cfg.BaseDir,
+		CWD:           a.cwd,
+		MCPManager:    a.mcpManager,
+		AgentBuilder:  a.agentBuilder,
+		Checkpointer:  cp,
+		NotifyConfig:  notifyCfg,
+		Context:       ctx,
+		SwitchProvider: func(pName, pModel string) error {
+			return a.switchProviderFor(lp, pName, pModel)
+		},
+	})
 }
 
 func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices *pricing.Table, notifyCfg notify.Config) tui.NewTabFunc {
@@ -138,104 +176,32 @@ func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices 
 			comp.ChunkSize = a.cfg.CompactChunkSize
 		}
 		comp.Clamp()
+		if a.cfg.Historian && a.memStore != nil {
+			hist, err := newHistorian(a.cfg, a.memStore)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[warning] historian disabled: %v\n", err)
+			} else {
+				comp.Historian = hist
+			}
+		}
 		newLp.SetCompactor(comp)
 
-		inCh, steerQueue, intCh, cmpCh, evCh, engineCleanup := tui.StartEngine(tabCtx, newLp, cp, notifyCfg)
-
-		// Wrap the engine cleanup to also close the per-tab loop.
-		cleanup := func() {
-			engineCleanup()
-			newLp.Close()
-		}
+		engine := newLocalEngine(tabCtx, a, newLp, cp, prices, notifyCfg)
 
 		cfg := tui.Config{
-			SessionID:   id,
-			Mode:        tui.ModeSingleAgent,
-			InputCh:     inCh,
-			SteerQueue:  steerQueue,
-			InterruptCh: intCh,
-			CompactCh:   cmpCh,
-			Shutdown:    cleanup,
-			Provider:    a.cfg.Provider,
-			Model:       a.cfg.Model,
-			Pricing:     prices,
-			NewSession: func() (string, error) {
-				ntx2, id2, err := a.newSession()
-				if err != nil {
-					return "", err
-				}
-				newLp.SetTranscript(ntx2)
-				fmt.Fprintf(os.Stderr, "[started new session %s]\n", id2)
-				return id2, nil
-			},
-			Stats: func() string {
-				s := newLp.Stats()
-				if s.Calls == 0 {
-					return "[stats] no API calls yet"
-				}
-				return fmt.Sprintf("[stats] calls=%d | input=%d | output=%d | cached=%d (%.1f%%)",
-					s.Calls, s.InputTokens, s.OutputTokens, s.CachedTokens, s.CacheHitRate()*100)
-			},
-			ResumeSession: func(sessID string) (string, []protocol.FrozenMessage, error) {
-				tx, sid, err := a.resumeSession(sessID)
-				if err != nil {
-					return "", nil, err
-				}
-				newLp.SetTranscript(tx)
-				fmt.Fprintf(os.Stderr, "[resumed session %s]\n", sid)
-				return sid, tx.Frozen(), nil
-			},
-			SwitchProvider: func(pName, pModel string) error {
-				return a.switchProviderFor(newLp, pName, pModel)
-			},
-			CycleThinking: func() string {
-				caps := provider.SupportedLevels(a.pb.Model())
-				cur := a.pb.ThinkingLevel()
-				if cur == "" {
-					cur = caps[0]
-				}
-				for i, l := range caps {
-					if l == cur {
-						next := caps[(i+1)%len(caps)]
-						a.pb.SetThinkingLevel(next)
-						if err := config.SaveThinkingLevel(a.cfg.BaseDir, next); err != nil {
-							fmt.Fprintf(os.Stderr, "[warning] save thinking level: %v\n", err)
-						}
-						return next
-					}
-				}
-				a.pb.SetThinkingLevel(caps[0])
-				_ = config.SaveThinkingLevel(a.cfg.BaseDir, caps[0])
-				return caps[0]
-			},
-			CurrentThinkingLevel: func() string { return a.pb.ThinkingLevel() },
-			DeleteSession:        func(id string) error { return session.DeleteSession(a.cwd, id) },
-			FetchSessions:        a.fetchSessions,
-			FetchModels:          a.fetchModels,
-			LoginProviders:       a.loginProviders,
-			SaveLogin:            a.saveLogin,
-			CancelSubagent: func(id string) {
-				if a.agentBuilder != nil {
-					a.agentBuilder.CancelSubagent(id)
-				}
-			},
-			MCPStatus: func() string { return a.mcpManager.Status() },
-			MCPCount: func() int { return a.mcpManager.ConnectedCount() },
+			SessionID: id,
+			Mode:      tui.ModeSingleAgent,
+			Engine:    engine,
+			Shutdown:  engine.Close,
+			Provider:  a.cfg.Provider,
+			Model:     a.cfg.Model,
+			Pricing:   prices,
 			ToggleSubagents: func() string {
 				return a.toggleSubagents()
 			},
-			StatsSnapshot: func() (int, int, int, float64) {
-				s := newLp.Stats()
-				cm := s.InputTokens - s.CachedTokens
-				c := 0.0
-				if prices != nil && a.cfg.Model != "" {
-					c = prices.Cost(a.cfg.Model, s.InputTokens, s.OutputTokens)
-				}
-				return s.InputTokens, s.OutputTokens, cm, c
-			},
 		}
 
-		return cfg, evCh, cleanup, nil
+		return cfg, engine.Events(), engine.Close, nil
 	}
 }
 
