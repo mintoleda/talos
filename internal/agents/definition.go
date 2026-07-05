@@ -145,14 +145,12 @@ func splitFrontmatter(text string) (yamlPart, body string) {
 	}
 	rest := strings.TrimPrefix(text[3:], "\r")
 	rest = strings.TrimPrefix(rest, "\n")
-	// Closing delimiter must start a line.
 	idx := strings.Index(rest, "\n---")
 	if idx < 0 {
 		return "", text
 	}
 	yamlPart = rest[:idx]
 	body = rest[idx+len("\n---"):]
-	// Drop the remainder of the closing "---" line.
 	if nl := strings.IndexByte(body, '\n'); nl >= 0 {
 		body = body[nl+1:]
 	} else {

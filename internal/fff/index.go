@@ -21,7 +21,7 @@ import (
 type Entry struct {
 	Path     string  `json:"path"`
 	Score    float64 `json:"score"`
-	LastRead int64   `json:"last_read"` // unix seconds
+	LastRead int64   `json:"last_read"`
 }
 
 type Index struct {
@@ -109,7 +109,6 @@ func (idx *Index) Build() error {
 			return nil
 		}
 		seen[path] = true
-		// Base score: prefer shorter paths and files closer to root.
 		depth := strings.Count(rel, string(filepath.Separator))
 		baseScore := 1.0 / float64(depth+1)
 		entries = append(entries, Entry{
@@ -152,7 +151,7 @@ func isIgnored(root, rel string) bool {
 	return false
 }
 
-var ignoreCache sync.Map // map[string]*ignore.GitIgnore
+var ignoreCache sync.Map
 
 func loadGitignore(path string) (*ignore.GitIgnore, bool) {
 	if cached, ok := ignoreCache.Load(path); ok {
@@ -290,7 +289,6 @@ func (idx *Index) SearchFiles(query string, limit int) ([]SearchResult, error) {
 			if !match {
 				continue
 			}
-			// Fuzzy-rank each token against the line and sum scores.
 			score := 0
 			for _, tok := range tokens {
 				fm := fuzzy.Find(tok, []string{lower})

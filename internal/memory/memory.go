@@ -12,7 +12,6 @@ func Path(baseDir string) string {
 	return filepath.Join(baseDir, "memory.md")
 }
 
-// Load reads the memory file and returns its content, or empty string if it doesn't exist.
 func Load(baseDir string) (string, error) {
 	data, err := os.ReadFile(Path(baseDir))
 	if err != nil {

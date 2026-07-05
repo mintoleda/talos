@@ -12,8 +12,8 @@ import (
 )
 
 type SkillTool struct {
-	byName map[string]string // skill name -> full path to SKILL.md
-	dirs   []string          // for error messages
+	byName map[string]string
+	dirs   []string
 }
 
 func NewSkillTool(dirs []string) *SkillTool {

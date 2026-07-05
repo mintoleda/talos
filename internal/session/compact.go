@@ -71,7 +71,7 @@ func (s *LLMSummarizer) WithFocus(focus string) Summarizer {
 	if focus == "" {
 		return s
 	}
-	ns := *s // copy
+	ns := *s
 	ns.System = s.System + "\n\nThe user has asked to prioritise the following in the summary: " + focus
 	return &ns
 }
@@ -184,7 +184,6 @@ func (c *Compactor) alignedChunk(frozen []protocol.FrozenMessage) []protocol.Fro
 				if block.Type != protocol.BlockToolUse || block.ToolUse == nil {
 					continue
 				}
-				// Check if this tool-call's result is in [i+1, end).
 				found := false
 				for j := i + 1; j < end; j++ {
 					if frozen[j].Msg.Role == protocol.RoleTool {
