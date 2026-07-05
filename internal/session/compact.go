@@ -113,6 +113,7 @@ func (s *LLMSummarizer) Summarize(ctx context.Context, msgs []protocol.Message) 
 // stable summary prefix.
 type Compactor struct {
 	Summarizer         Summarizer
+	Historian          *Historian
 	ChunkSize          int
 	Threshold          float64
 	EmergencyThreshold float64 // above this, compact regardless of chunk size
@@ -239,6 +240,9 @@ func (c *Compactor) compactChunk(ctx context.Context, tx *Transcript, chunk []pr
 	msgs := make([]protocol.Message, len(chunk))
 	for i, fm := range chunk {
 		msgs[i] = fm.Msg
+	}
+	if c.Historian != nil {
+		c.Historian.ExtractAsync(msgs)
 	}
 
 	summarizer := c.Summarizer

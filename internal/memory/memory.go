@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -35,4 +36,30 @@ func Append(baseDir, entry string) error {
 	defer f.Close()
 	_, err = fmt.Fprintf(f, "[%s] %s\n", time.Now().UTC().Format(time.RFC3339), strings.TrimSpace(entry))
 	return err
+}
+
+func Render(entries []Entry) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	byCat := make(map[string][]Entry)
+	for _, e := range entries {
+		byCat[e.Category] = append(byCat[e.Category], e)
+	}
+	cats := make([]string, 0, len(byCat))
+	for cat := range byCat {
+		cats = append(cats, cat)
+	}
+	sort.Strings(cats)
+	var b strings.Builder
+	b.WriteString("\n\n## Project memory\n\n")
+	for _, cat := range cats {
+		b.WriteString("### ")
+		b.WriteString(cat)
+		b.WriteByte('\n')
+		for _, e := range byCat[cat] {
+			fmt.Fprintf(&b, "- [%s] %s\n", e.ID, e.Text)
+		}
+	}
+	return b.String()
 }
