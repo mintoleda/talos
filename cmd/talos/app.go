@@ -145,6 +145,7 @@ func newLocalEngine(ctx context.Context, a *app, lp *loop.Loop, cp *safety.Check
 		MCPManager:    a.mcpManager,
 		AgentBuilder:  a.agentBuilder,
 		Checkpointer:  cp,
+		Policy:        a.exec.Policy(),
 		NotifyConfig:  notifyCfg,
 		Context:       ctx,
 		SwitchProvider: func(pName, pModel string) error {

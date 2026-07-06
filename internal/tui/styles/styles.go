@@ -56,6 +56,7 @@ var (
 	StatusOutStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("251"))
 	StatusMissStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	StatusMCPStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("140"))
+	StatusPermStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("167"))
 
 	DialogBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
