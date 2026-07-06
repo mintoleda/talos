@@ -52,6 +52,8 @@ var slashCommands = []slashCommand{
 	{"/login", "Add an API key for a provider"},
 	{"/model", "Switch provider/model (optionally: /model <query>)"},
 	{"/thinking", "Cycle thinking level"},
+	{"/permission", "Cycle permission mode (auto/ask/panic)"},
+	{"/panic", "Toggle panic mode (blocks all tools)"},
 	{"/subagents", "Toggle subagent delegation on/off"},
 	{"/mcp", "List connected MCP servers and their tools"},
 	{"/push", "Commit and push changes to GitHub"},
@@ -165,6 +167,9 @@ type Model struct {
 	// listing are stripped from requests built by the PromptBuilder.
 	subagentDisabled bool
 
+	// permissionMode tracks the current permission mode for the status bar.
+	permissionMode string
+
 	// pendingCmd carries a tea.Cmd produced inside handleSlash (which cannot
 	// return commands directly) out to the Update loop. Consumed and cleared by
 	// the caller. Used by /resume to force a full repaint.
@@ -225,6 +230,9 @@ func NewModel(cfg Config) Model {
 	}
 	if cfg.Engine != nil {
 		m.mcpCount = cfg.Engine.MCPCount()
+	}
+	if cfg.Engine != nil {
+		m.permissionMode = cfg.Engine.PermissionMode()
 	}
 	// Seed the context window from the pricing table so the status bar shows
 	// context usage from the very first turn instead of waiting for TurnEnded.
@@ -458,6 +466,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "shift+tab":
 			if len(m.slashCompletions) > 0 {
 				m.slashSelected = (m.slashSelected - 1 + len(m.slashCompletions)) % len(m.slashCompletions)
+				return m, nil
+			}
+			if !m.busy && m.cfg.Engine != nil {
+				newMode, err := m.cfg.Engine.CyclePermissionMode()
+				if err != nil {
+					m.chat = m.chat.AppendNotice("error", err.Error())
+					return m, nil
+				}
+				m.permissionMode = newMode
+				m.chat = m.chat.AppendNotice("info", "permission mode: "+newMode)
+			}
+			return m, nil
+		case "alt+p":
+			if m.cfg.Engine != nil {
+				newMode, err := m.cfg.Engine.TogglePanic()
+				if err != nil {
+					m.chat = m.chat.AppendNotice("error", err.Error())
+					return m, nil
+				}
+				m.permissionMode = newMode
+				m.chat = m.chat.AppendNotice("info", "panic mode: "+newMode)
 			}
 			return m, nil
 		case "enter":
@@ -930,6 +959,26 @@ func (m *Model) handleSlash(text string) (bool, error) {
 		m.thinkingLevel = newLevel
 		m.chat = m.chat.AppendNotice("info", "thinking level: "+newLevel)
 		return true, nil
+	case "/permission":
+		if m.cfg.Engine == nil {
+			return true, fmt.Errorf("engine unavailable")
+		}
+		newMode, err := m.cfg.Engine.CyclePermissionMode()
+		if err != nil {
+			return true, err
+		}
+		m.chat = m.chat.AppendNotice("info", "permission mode: "+newMode)
+		return true, nil
+	case "/panic":
+		if m.cfg.Engine == nil {
+			return true, fmt.Errorf("engine unavailable")
+		}
+		newMode, err := m.cfg.Engine.TogglePanic()
+		if err != nil {
+			return true, err
+		}
+		m.chat = m.chat.AppendNotice("info", "panic mode: "+newMode)
+		return true, nil
 	case "/push":
 		if m.cfg.Engine == nil {
 			return true, fmt.Errorf("engine unavailable")
@@ -1132,6 +1181,8 @@ func (m Model) renderCompletions() string {
 
 func (m Model) handleEvent(e protocol.Event) Model {
 	switch ev := e.(type) {
+	case protocol.PermissionModeChanged:
+		m.permissionMode = ev.Mode
 	case protocol.UserInput:
 		if _, ok := m.cfg.Engine.(*client.RemoteEngine); ok && !strings.HasPrefix(ev.Text, "/") {
 			break
@@ -1309,6 +1360,9 @@ func (m Model) statusParts() (left, right string) {
 	lp = append(lp, styles.StatusDirStyle.Render(shortenDir(m.cwd)))
 	lp = append(lp, styles.StatusModelStyle.Render(provider+"/"+model))
 	lp = append(lp, styles.StatusLevelStyle.Render(level))
+	if m.permissionMode != "" {
+		lp = append(lp, styles.StatusPermStyle.Render(m.permissionMode))
+	}
 	if m.mcpCount > 0 {
 		lp = append(lp, styles.StatusMCPStyle.Render(fmt.Sprintf("mcp:%d", m.mcpCount)))
 	}

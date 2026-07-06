@@ -812,6 +812,21 @@ func runServer(ctx context.Context, cfg *config.Config, a *app, lp *loop.Loop, c
 			return a.mcpManager.Status()
 		case "/subagents":
 			return a.toggleSubagents()
+		case "/permission":
+			cur := a.exec.Policy().Mode()
+			next := safety.NextMode(cur)
+			a.exec.Policy().SetMode(next)
+			modeStr := next.String()
+			emit(protocol.PermissionModeChanged{Mode: modeStr})
+			return fmt.Sprintf("permission mode: %s → %s", cur, modeStr)
+		case "/panic":
+			mode := a.exec.Policy().TogglePanic()
+			modeStr := mode.String()
+			emit(protocol.PermissionModeChanged{Mode: modeStr})
+			if modeStr == "panic" {
+				return "🔴 panic mode ON"
+			}
+			return "panic mode OFF — restored " + modeStr
 		default:
 			return fmt.Sprintf("unknown command: %s", parts[0])
 		}
@@ -907,6 +922,19 @@ func runServer(ctx context.Context, cfg *config.Config, a *app, lp *loop.Loop, c
 			return rpcResult(rpc.LevelResult{Level: level})
 		case rpc.CurrentThinking:
 			return rpcResult(rpc.LevelResult{Level: a.pb.ThinkingLevel()})
+		case rpc.CyclePermissionMode:
+			next := safety.NextMode(a.exec.Policy().Mode())
+			a.exec.Policy().SetMode(next)
+			modeStr := next.String()
+			engine.Emit(protocol.PermissionModeChanged{Mode: modeStr})
+			return rpcResult(rpc.LevelResult{Level: modeStr})
+		case rpc.PermissionMode:
+			return rpcResult(rpc.LevelResult{Level: a.exec.Policy().Mode().String()})
+		case rpc.TogglePanic:
+			mode := a.exec.Policy().TogglePanic()
+			modeStr := mode.String()
+			engine.Emit(protocol.PermissionModeChanged{Mode: modeStr})
+			return rpcResult(rpc.LevelResult{Level: modeStr})
 		case rpc.WithdrawSteer:
 			return rpcResult(rpc.BlocksResult{Blocks: engine.WithdrawSteer()})
 		case rpc.Compact:
