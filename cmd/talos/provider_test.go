@@ -1,21 +1,41 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
-func TestOpenAICompatibleBaseURLCloudflareFromAccountID(t *testing.T) {
-	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "acct_123")
-	base, err := openAICompatibleBaseURL("cloudflare", "")
+func TestOpenAICompatibleBaseURLCloudflareFromAuthJSON(t *testing.T) {
+	dir := t.TempDir()
+	data := []byte(`{"cloudflare":{"type":"api_key","key":"secret","account_id":"acct_auth"}}`)
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	base, err := openAICompatibleBaseURL(dir, "cloudflare", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "https://api.cloudflare.com/client/v4/accounts/acct_123/ai"
+	want := "https://api.cloudflare.com/client/v4/accounts/acct_auth/ai"
+	if base != want {
+		t.Fatalf("base=%q want %q", base, want)
+	}
+}
+
+func TestOpenAICompatibleBaseURLCloudflareFromEnvAccountID(t *testing.T) {
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "acct_env")
+	base, err := openAICompatibleBaseURL(t.TempDir(), "cloudflare", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://api.cloudflare.com/client/v4/accounts/acct_env/ai"
 	if base != want {
 		t.Fatalf("base=%q want %q", base, want)
 	}
 }
 
 func TestOpenAICompatibleBaseURLCloudflareStripsV1Override(t *testing.T) {
-	base, err := openAICompatibleBaseURL("cloudflare", "https://api.cloudflare.com/client/v4/accounts/acct_123/ai/v1")
+	base, err := openAICompatibleBaseURL(t.TempDir(), "cloudflare", "https://api.cloudflare.com/client/v4/accounts/acct_123/ai/v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +47,7 @@ func TestOpenAICompatibleBaseURLCloudflareStripsV1Override(t *testing.T) {
 
 func TestOpenAICompatibleBaseURLCloudflareRequiresAccountID(t *testing.T) {
 	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "")
-	if _, err := openAICompatibleBaseURL("cloudflare", ""); err == nil {
+	if _, err := openAICompatibleBaseURL(t.TempDir(), "cloudflare", ""); err == nil {
 		t.Fatal("expected missing account id error")
 	}
 }

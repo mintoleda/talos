@@ -7,8 +7,9 @@ import (
 )
 
 type authEntry struct {
-	Type string `json:"type"`
-	Key  string `json:"key"`
+	Type      string `json:"type"`
+	Key       string `json:"key"`
+	AccountID string `json:"account_id,omitempty"`
 }
 
 func ReadAuthKey(baseDir, providerName string) string {
@@ -23,13 +24,28 @@ func ReadAuthKey(baseDir, providerName string) string {
 	return entries[providerName].Key
 }
 
+func ReadAuthAccountID(baseDir, providerName string) string {
+	data, err := os.ReadFile(filepath.Join(baseDir, "auth.json"))
+	if err != nil {
+		return ""
+	}
+	var entries map[string]authEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return ""
+	}
+	return entries[providerName].AccountID
+}
+
 func WriteAuthKey(baseDir, providerName, key string) error {
 	path := filepath.Join(baseDir, "auth.json")
 	entries := map[string]authEntry{}
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &entries)
 	}
-	entries[providerName] = authEntry{Type: "api_key", Key: key}
+	entry := entries[providerName]
+	entry.Type = "api_key"
+	entry.Key = key
+	entries[providerName] = entry
 	data, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
 		return err
@@ -48,6 +64,13 @@ func ResolveKeyFor(baseDir, providerName, envVar string) string {
 		return ""
 	}
 	return os.Getenv(envVar)
+}
+
+func ResolveCloudflareAccountID(baseDir string) string {
+	if accountID := ReadAuthAccountID(baseDir, "cloudflare"); accountID != "" {
+		return accountID
+	}
+	return os.Getenv("CLOUDFLARE_ACCOUNT_ID")
 }
 
 func defaultKeyEnv(providerName string) string {

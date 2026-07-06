@@ -536,7 +536,7 @@ func newProvider(cfg *config.Config, noTools bool) (provider.Provider, *session.
 		if a, ok := aliases[name]; ok {
 			name = a
 		}
-		base, err := openAICompatibleBaseURL(name, cfg.BaseURL)
+		base, err := openAICompatibleBaseURL(cfg.BaseDir, name, cfg.BaseURL)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -565,13 +565,13 @@ func newProvider(cfg *config.Config, noTools bool) (provider.Provider, *session.
 	return prov, compactor, nil
 }
 
-func openAICompatibleBaseURL(name, configured string) (string, error) {
+func openAICompatibleBaseURL(baseDir, name, configured string) (string, error) {
 	base := cleanBaseURL(configured)
 	if name == "cloudflare" {
 		if base == "" || base == "https://api.deepseek.com" {
-			accountID := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
+			accountID := config.ResolveCloudflareAccountID(baseDir)
 			if accountID == "" {
-				return "", fmt.Errorf("cloudflare provider requires CLOUDFLARE_ACCOUNT_ID or a base_url ending in /accounts/{id}/ai/v1")
+				return "", fmt.Errorf("cloudflare provider requires auth.json account_id, CLOUDFLARE_ACCOUNT_ID, or a base_url ending in /accounts/{id}/ai/v1")
 			}
 			base = fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/ai", accountID)
 		}
