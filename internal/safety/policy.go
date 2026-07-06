@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/mintoleda/talos/internal/protocol"
 )
@@ -28,8 +29,35 @@ func ParseMode(s string) Mode {
 	}
 }
 
+func (m Mode) String() string {
+	switch m {
+	case ModeAuto:
+		return "auto"
+	case ModeAsk:
+		return "ask"
+	case ModePanic:
+		return "panic"
+	default:
+		return "auto"
+	}
+}
+
+// NextMode returns the next mode in the auto → ask → panic cycle.
+func NextMode(m Mode) Mode {
+	switch m {
+	case ModeAuto:
+		return ModeAsk
+	case ModeAsk:
+		return ModePanic
+	default:
+		return ModeAuto
+	}
+}
+
 type Policy struct {
+	mu          sync.Mutex
 	mode        Mode
+	savedMode   Mode // last non-panic mode, restored on toggle-off
 	workDir     string
 	classifier  *Classifier
 	interactive bool
@@ -37,24 +65,56 @@ type Policy struct {
 }
 
 func NewPolicy(mode Mode, workDir string, classifier *Classifier, interactive bool) *Policy {
-	return &Policy{mode: mode, workDir: workDir, classifier: classifier, interactive: interactive}
+	return &Policy{mode: mode, savedMode: mode, workDir: workDir, classifier: classifier, interactive: interactive}
 }
 
 func (p *Policy) Check(tu protocol.ToolUse) (Decision, string) {
+	p.mu.Lock()
+	mode := p.mode
+	p.mu.Unlock()
+
 	switch tu.Name {
 	case "bash", "bash_background":
 		cmd, _ := tu.Args["command"].(string)
 		d, reason := p.classifier.Classify(cmd)
-		return p.resolve(d, reason)
+		return p.resolve(d, reason, mode)
 	case "write", "edit":
 		path, _ := tu.Args["path"].(string)
 		if !p.withinWorkDir(path) {
 			return Block, fmt.Sprintf("path %s is outside the working directory", path)
 		}
-		return p.resolve(Allow, "")
+		return p.resolve(Allow, "", mode)
 	default:
-		return p.resolve(Allow, "")
+		return p.resolve(Allow, "", mode)
 	}
+}
+
+// SetMode changes the permission mode atomically.
+func (p *Policy) SetMode(m Mode) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.mode = m
+}
+
+// Mode returns the current permission mode.
+func (p *Policy) Mode() Mode {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.mode
+}
+
+// TogglePanic switches to panic if currently in a non-panic mode, or restores
+// the previous mode if currently in panic. Returns the resulting mode.
+func (p *Policy) TogglePanic() Mode {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.mode == ModePanic {
+		p.mode = p.savedMode
+	} else {
+		p.savedMode = p.mode
+		p.mode = ModePanic
+	}
+	return p.mode
 }
 
 // resolve applies the permission mode and interactivity to a base decision from
@@ -65,18 +125,18 @@ func (p *Policy) Check(tu protocol.ToolUse) (Decision, string) {
 //   - ask  + interactive  -> Prompt (ask the human)
 //   - ask  + headless      -> Block
 //   - panic (any)          -> Block
-func (p *Policy) resolve(base Decision, reason string) (Decision, string) {
+func (p *Policy) resolve(base Decision, reason string, mode Mode) (Decision, string) {
 	if base == Block {
 		return Block, reason
 	}
-	if p.mode == ModePanic {
+	if mode == ModePanic {
 		return Block, "permission mode is PANIC"
 	}
 	if base == Allow {
 		return Allow, ""
 	}
 	// base == Prompt
-	switch p.mode {
+	switch mode {
 	case ModeAuto:
 		if p.interactive {
 			return Allow, ""
