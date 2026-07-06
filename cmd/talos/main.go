@@ -21,6 +21,7 @@ import (
 	"github.com/mintoleda/talos/internal/client/rpc"
 	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/executor"
+	"github.com/mintoleda/talos/internal/jsonutil"
 	"github.com/mintoleda/talos/internal/loop"
 	"github.com/mintoleda/talos/internal/mcp"
 	"github.com/mintoleda/talos/internal/memory"
@@ -1192,7 +1193,7 @@ func dreamDecisions(prov provider.Provider, model string, entries []memory.Entry
 		}
 	}
 	var decisions []dreamDecision
-	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &decisions); err != nil {
+	if err := jsonutil.UnmarshalArrayFromText(out, &decisions); err != nil {
 		return nil, err
 	}
 	return decisions, nil

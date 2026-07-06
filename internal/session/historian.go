@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mintoleda/talos/internal/jsonutil"
 	"github.com/mintoleda/talos/internal/memory"
 	"github.com/mintoleda/talos/internal/protocol"
 )
@@ -52,7 +53,7 @@ func (h *Historian) Extract(ctx context.Context, msgs []protocol.Message) error 
 		Tags       []string `json:"tags"`
 		Importance float64  `json:"importance"`
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &rows); err != nil {
+	if err := jsonutil.UnmarshalArrayFromText(raw, &rows); err != nil {
 		return err
 	}
 	for _, r := range rows {
