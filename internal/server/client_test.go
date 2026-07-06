@@ -83,9 +83,9 @@ func TestDecodeEvent(t *testing.T) {
 		msg     transport.ServerMsg
 		wantErr bool
 	}{
-		{"UserInput", transport.ServerMsg{EType: "UserInput", Event: json.RawMessage(`{"text":"hi"}`)}, false},
-		{"TextDelta", transport.ServerMsg{EType: "TextDelta", Event: json.RawMessage(`{"text":"hi"}`)}, false},
-		{"Notice", transport.ServerMsg{EType: "Notice", Event: json.RawMessage(`{"level":"info","text":"test"}`)}, false},
+		{"UserInput", transport.ServerMsg{EType: "user_input", Event: json.RawMessage(`{"text":"hi"}`)}, false},
+		{"TextDelta", transport.ServerMsg{EType: "text_delta", Event: json.RawMessage(`{"text":"hi"}`)}, false},
+		{"Notice", transport.ServerMsg{EType: "notice", Event: json.RawMessage(`{"level":"info","text":"test"}`)}, false},
 		{"Unknown", transport.ServerMsg{EType: "Unknown", Event: json.RawMessage(`{}`)}, true},
 	}
 
