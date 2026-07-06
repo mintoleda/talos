@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"hash/fnv"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -170,11 +172,23 @@ func (s *Store) Search(query string, limit int) []Entry {
 	return out
 }
 
+// effectiveImportance applies a time-based decay so older entries lose
+// visibility over time. The half-life is 30 days — an entry's effective
+// importance halves every 30 days since its last update.
+func effectiveImportance(e Entry, now time.Time) float64 {
+	age := now.Sub(e.UpdatedAt)
+	halfLife := 30 * 24 * time.Hour
+	return e.Importance * math.Pow(0.5, age.Hours()/halfLife.Hours())
+}
+
 func (s *Store) TopN(n int, budgetBytes int) []Entry {
 	all := s.All()
+	now := time.Now()
 	sort.Slice(all, func(i, j int) bool {
-		if all[i].Importance != all[j].Importance {
-			return all[i].Importance > all[j].Importance
+		ei := effectiveImportance(all[i], now)
+		ej := effectiveImportance(all[j], now)
+		if ei != ej {
+			return ei > ej
 		}
 		return all[i].UpdatedAt.After(all[j].UpdatedAt)
 	})
@@ -229,6 +243,44 @@ func (s *Store) appendRecord(r record) error {
 	}
 	defer f.Close()
 	return json.NewEncoder(f).Encode(r)
+}
+
+// compactionFilePath returns the path to the file tracking compaction counts.
+func compactionFilePath(storePath string) string {
+	return storePath + ".compactions"
+}
+
+// CompactCount reads the persistent compaction count from disk.
+func (s *Store) CompactCount() int {
+	data, err := os.ReadFile(compactionFilePath(s.path))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// IncrementCompactions bumps the compaction count by 1.
+func (s *Store) IncrementCompactions() error {
+	n := s.CompactCount() + 1
+	return os.WriteFile(compactionFilePath(s.path), []byte(strconv.Itoa(n)+"\n"), 0o600)
+}
+
+// ResetCompactions resets the counter to zero (called after dream).
+func (s *Store) ResetCompactions() error {
+	return os.WriteFile(compactionFilePath(s.path), []byte("0\n"), 0o600)
+}
+
+// CompactionNudgeNeeded returns true if enough compactions have accumulated
+// since the last dream run to warrant a nudge. Threshold is 50 by default.
+func (s *Store) CompactionNudgeNeeded(threshold int) bool {
+	if threshold <= 0 {
+		threshold = 50
+	}
+	return s.CompactCount() >= threshold
 }
 
 func migrateLegacy(baseDir, storePath string) error {
@@ -294,4 +346,68 @@ func scoreEntry(e Entry, q map[string]bool) float64 {
 		recency = 1 / (1 + time.Since(e.UpdatedAt).Hours()/24/365)
 	}
 	return float64(hits) * (0.5 + e.Importance) * recency * (1 + float64(e.Uses)/10)
+}
+
+// polarityWords maps words to a rough semantic valence. Used by
+// HasContradictingEntries to detect likely contradictions between
+// two entries in the same category sharing overlapping tags.
+var polarityWords = map[string]float64{
+	"uses": 1, "is": 1, "does": 1, "are": 1, "was": 1, "were": 1,
+	"will": 1, "should": 1, "must": 1, "required": 1, "requires": 1,
+	"supports": 1, "enabled": 1, "preferred": 1, "recommended": 1,
+	"always": 1, "default": 1, "yes": 1,
+
+	"doesn't": -1, "isn't": -1, "aren't": -1, "won't": -1,
+	"shouldn't": -1, "mustn't": -1, "cannot": -1, "can't": -1,
+	"not": -1, "no": -1, "never": -1, "avoid": -1, "deprecated": -1,
+	"discouraged": -1, "disabled": -1, "removed": -1, "unsupported": -1,
+}
+
+// entryPolarity scores the semantic valence of an entry's text.
+// Returns a number in [-1, 1].
+func entryPolarity(text string) float64 {
+	var score float64
+	var count int
+	for _, f := range strings.Fields(strings.ToLower(text)) {
+		if v, ok := polarityWords[f]; ok {
+			score += v
+			count++
+		}
+	}
+	if count == 0 {
+		return 0
+	}
+	return score / float64(count)
+}
+
+// HasContradictingEntries checks whether two entries in the same category
+// have overlapping tags and opposite semantic polarity, which suggests
+// a contradiction. Returns true if they likely conflict.
+func HasContradictingEntries(a, b Entry) bool {
+	if a.Category != b.Category || a.ID == b.ID {
+		return false
+	}
+	// Require at least one overlapping tag.
+	overlap := false
+	for _, ta := range a.Tags {
+		for _, tb := range b.Tags {
+			if ta == tb {
+				overlap = true
+				break
+			}
+		}
+		if overlap {
+			break
+		}
+	}
+	if !overlap {
+		return false
+	}
+	pa := entryPolarity(a.Text)
+	pb := entryPolarity(b.Text)
+	// Both must have detectable polarity, and they must oppose.
+	if pa == 0 || pb == 0 {
+		return false
+	}
+	return (pa > 0 && pb < 0) || (pa < 0 && pb > 0)
 }

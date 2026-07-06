@@ -117,6 +117,7 @@ type Compactor struct {
 	ChunkSize          int
 	Threshold          float64
 	EmergencyThreshold float64 // above this, compact regardless of chunk size
+	OnCompaction       func() // called after each successful compaction
 }
 
 func NewCompactor(s Summarizer) *Compactor {
@@ -276,6 +277,11 @@ func (c *Compactor) compactChunk(ctx context.Context, tx *Transcript, chunk []pr
 		return "", err
 	}
 	tx.DropOldest(len(chunk))
+
+	if c.OnCompaction != nil {
+		c.OnCompaction()
+	}
+
 	return summary, nil
 }
 
