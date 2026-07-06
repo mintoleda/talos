@@ -13,10 +13,12 @@ import (
 type memoryWriteTool struct{ store *memory.Store }
 type memorySearchTool struct{ store *memory.Store }
 type memoryDeleteTool struct{ store *memory.Store }
+type memoryUpdateTool struct{ store *memory.Store }
 
-func NewMemoryWrite(store *memory.Store) Tool  { return &memoryWriteTool{store: store} }
-func NewMemorySearch(store *memory.Store) Tool { return &memorySearchTool{store: store} }
-func NewMemoryDelete(store *memory.Store) Tool { return &memoryDeleteTool{store: store} }
+func NewMemoryWrite(store *memory.Store) Tool   { return &memoryWriteTool{store: store} }
+func NewMemorySearch(store *memory.Store) Tool  { return &memorySearchTool{store: store} }
+func NewMemoryDelete(store *memory.Store) Tool  { return &memoryDeleteTool{store: store} }
+func NewMemoryUpdate(store *memory.Store) Tool  { return &memoryUpdateTool{store: store} }
 
 func (t *memoryWriteTool) Name() string { return "memory_write" }
 func (t *memoryWriteTool) Description() string {
@@ -106,4 +108,54 @@ func (t *memoryDeleteTool) Execute(_ context.Context, args map[string]any) (prot
 		return errResult(err), nil
 	}
 	return okResult("memory deleted"), nil
+}
+
+func (t *memoryUpdateTool) Name() string { return "memory_update" }
+func (t *memoryUpdateTool) Description() string {
+	return "Update an existing durable project memory. Only the provided fields are changed; omit fields to leave them as-is. Use this when you learn that a previously saved memory is now inaccurate, needs rewording, or its importance should change."
+}
+func (t *memoryUpdateTool) Schema() json.RawMessage {
+	return json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"id":{"type":"string","description":"ID of the memory to update (returned by memory_write)."},
+			"text":{"type":"string","description":"New text for the memory."},
+			"category":{"type":"string","enum":["architecture","convention","config","preference","context"]},
+			"tags":{"type":"array","items":{"type":"string"}},
+			"importance":{"type":"number","minimum":0,"maximum":1}
+		},
+		"required":["id"]
+	}`)
+}
+func (t *memoryUpdateTool) Execute(_ context.Context, args map[string]any) (protocol.ToolResult, error) {
+	id, err := str(args, "id")
+	if err != nil {
+		return errResult(err), nil
+	}
+	err = t.store.Update(id, func(e *memory.Entry) {
+		if text, ok := args["text"].(string); ok && text != "" {
+			e.Text = text
+		}
+		if cat, ok := args["category"].(string); ok && cat != "" {
+			e.Category = cat
+		}
+		if imp, ok := args["importance"].(float64); ok {
+			e.Importance = imp
+		}
+		if raw, ok := args["tags"].([]any); ok {
+			tags := make([]string, 0, len(raw))
+			for _, v := range raw {
+				if s, ok := v.(string); ok && s != "" {
+					tags = append(tags, s)
+				}
+			}
+			if len(tags) > 0 {
+				e.Tags = tags
+			}
+		}
+	})
+	if err != nil {
+		return errResult(err), nil
+	}
+	return okResult("memory updated: " + id), nil
 }

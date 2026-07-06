@@ -229,6 +229,40 @@ func run() error {
 	}
 	if memStore != nil {
 		cfg.SystemPrompt += memory.Render(memStore.TopN(30, 4096))
+
+		// Check if compaction count is high enough to warrant a dream nudge.
+		if memStore.CompactionNudgeNeeded(50) {
+			cfg.SystemPrompt += "\n\n[note: " + fmt.Sprint(memStore.CompactCount()) + " compactions since last dream — run 'talos dream' to curate project memories]"
+		}
+	}
+
+	// Start a background verifier that re-checks high-importance agent-written
+	// entries across restarts. It runs asynchronously so startup is not blocked.
+	if memStore != nil && !f.NoTools {
+		verifier := memory.NewVerifier(memory.StorePath(cfg.BaseDir, projectID))
+		go func() {
+			entries := memStore.All()
+			var toFlag []string
+			for _, e := range entries {
+				if e.Source != "agent" || e.Importance < 0.7 {
+					continue
+				}
+				if memoryReferencesMissingPath(repoRoot, e) {
+					toFlag = append(toFlag, e.ID)
+				}
+			}
+			for _, id := range toFlag {
+				n := verifier.Flag(id)
+				if n >= 3 {
+					// 3 strikes: permanently downgrade.
+					_ = memStore.Update(id, func(en *memory.Entry) {
+						if en.Importance > 0.3 {
+							en.Importance = 0.3
+						}
+					})
+				}
+			}
+		}()
 	}
 
 	cp := safety.NewCheckpointer(repoRoot)
@@ -298,7 +332,7 @@ func run() error {
 			}
 		}
 		if memStore != nil {
-			reg.Add(tools.NewMemoryWrite(memStore), tools.NewMemorySearch(memStore), tools.NewMemoryDelete(memStore))
+			reg.Add(tools.NewMemoryWrite(memStore), tools.NewMemorySearch(memStore), tools.NewMemoryDelete(memStore), tools.NewMemoryUpdate(memStore))
 		}
 		reg.Add(mcpManager.Tools()...)
 	}
@@ -313,6 +347,11 @@ func run() error {
 			fmt.Fprintf(os.Stderr, "[warning] historian disabled: %v\n", err)
 		} else {
 			compactor.Historian = hist
+		}
+	}
+	if compactor != nil && memStore != nil {
+		compactor.OnCompaction = func() {
+			_ = memStore.IncrementCompactions()
 		}
 	}
 
@@ -1108,6 +1147,29 @@ func runDream(cfg *config.Config, args []string) error {
 			})
 		}
 	}
+
+	// Phase 1-b: flag contradicting entries (same category, opposite polarity).
+	var contradictingPairs [][2]string
+	for i, a := range entries {
+		for j := i + 1; j < len(entries); j++ {
+			if memory.HasContradictingEntries(a, entries[j]) {
+				contradictingPairs = append(contradictingPairs, [2]string{a.ID, entries[j].ID})
+				if !*dryRun {
+					// Downgrade both so the LLM pass can resolve them.
+					_ = store.Update(a.ID, func(en *memory.Entry) {
+						if en.Importance > 0.4 {
+							en.Importance = 0.4
+						}
+					})
+					_ = store.Update(entries[j].ID, func(en *memory.Entry) {
+						if en.Importance > 0.4 {
+							en.Importance = 0.4
+						}
+					})
+				}
+			}
+		}
+	}
 	var deleted int
 	prov, modelName, err := dreamerProvider(cfg, *model)
 	if err != nil {
@@ -1148,12 +1210,18 @@ func runDream(cfg *config.Config, args []string) error {
 		if err := store.Compact(); err != nil {
 			return err
 		}
+		_ = store.ResetCompactions()
 	}
 	mode := "applied"
 	if *dryRun {
 		mode = "dry-run"
 	}
-	fmt.Fprintf(os.Stdout, "dream %s: kept=%d downgraded=%d deleted=%d\n", mode, len(entries)-deleted, downgraded, deleted)
+	contradictions := len(contradictingPairs)
+	if contradictions > 0 {
+		fmt.Fprintf(os.Stdout, "dream %s: kept=%d downgraded=%d deleted=%d contradictions=%d\n", mode, len(entries)-deleted, downgraded, deleted, contradictions)
+	} else {
+		fmt.Fprintf(os.Stdout, "dream %s: kept=%d downgraded=%d deleted=%d\n", mode, len(entries)-deleted, downgraded, deleted)
+	}
 	return nil
 }
 
