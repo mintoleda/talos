@@ -36,6 +36,7 @@ type Params struct {
 	MCPManager    *mcp.Manager
 	AgentBuilder  *agents.Builder // may be nil
 	Checkpointer  *safety.Checkpointer
+	Policy        *safety.Policy
 	NotifyConfig  notify.Config
 	Context       context.Context
 
@@ -97,6 +98,7 @@ type LocalEngine struct {
 	cwd          string
 	mcpManager   *mcp.Manager
 	agentBuilder *agents.Builder
+	pol          *safety.Policy
 	switchProv   func(providerName, modelName string) error
 
 	evCh  chan protocol.Event
@@ -131,6 +133,7 @@ func NewLocalEngine(p Params) *LocalEngine {
 		cwd:          p.CWD,
 		mcpManager:   p.MCPManager,
 		agentBuilder: p.AgentBuilder,
+		pol:          p.Policy,
 		switchProv:   p.SwitchProvider,
 		evCh:         evCh,
 		inCh:         inCh,
@@ -397,6 +400,32 @@ func (e *LocalEngine) CurrentThinkingLevel() string {
 	return e.pb.ThinkingLevel()
 }
 
+// CyclePermissionMode advances to the next permission mode (auto→ask→panic→auto)
+// and returns the new mode name.
+func (e *LocalEngine) CyclePermissionMode() (string, error) {
+	if e.pol == nil {
+		return "", fmt.Errorf("permission policy not configured")
+	}
+	next := safety.NextMode(e.pol.Mode())
+	e.pol.SetMode(next)
+	return next.String(), nil
+}
+
+// PermissionMode returns the current permission mode name without cycling.
+func (e *LocalEngine) PermissionMode() string {
+	if e.pol == nil {
+		return "auto"
+	}
+	return e.pol.Mode().String()
+}
+
+// TogglePanic toggles panic mode on/off. Returns the resulting mode name.
+func (e *LocalEngine) TogglePanic() (string, error) {
+	if e.pol == nil {
+		return "", fmt.Errorf("permission policy not configured")
+	}
+	return e.pol.TogglePanic().String(), nil
+}
 // Compact triggers manual compaction, optionally guided by a focus string.
 // The compaction runs asynchronously; progress is reported via the event
 // channel.
