@@ -46,6 +46,14 @@ type Engine interface {
 	CycleThinking() (level string, err error)
 	// CurrentThinkingLevel returns the current thinking level without cycling.
 	CurrentThinkingLevel() string
+	// CyclePermissionMode advances to the next permission mode (auto→ask→panic→auto)
+	// and returns the new mode name.
+	CyclePermissionMode() (mode string, err error)
+	// PermissionMode returns the current permission mode name without cycling.
+	PermissionMode() string
+	// TogglePanic toggles panic mode on/off. When toggled on, the current mode is
+	// saved and panic is engaged. When toggled off, the saved mode is restored.
+	TogglePanic() (mode string, err error)
 	// Compact triggers manual compaction, optionally guided by a focus string.
 	Compact(focus string) error
 	// Stats returns cumulative token and cost counters.

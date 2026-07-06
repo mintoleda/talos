@@ -14,6 +14,7 @@ type Executor interface {
 	Run(ctx context.Context, tu protocol.ToolUse, emit protocol.EmitFunc) protocol.ToolResult
 	Close()
 	KillBg()
+	Policy() *safety.Policy
 }
 
 type InProcExecutor struct {
@@ -24,6 +25,10 @@ type InProcExecutor struct {
 
 func New(registry *tools.Registry, policy *safety.Policy) *InProcExecutor {
 	return &InProcExecutor{registry: registry, policy: policy}
+}
+
+func (e *InProcExecutor) Policy() *safety.Policy {
+	return e.policy
 }
 
 func (e *InProcExecutor) KillBg() {

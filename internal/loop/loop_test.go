@@ -11,6 +11,7 @@ import (
 
 	"github.com/mintoleda/talos/internal/executor"
 	"github.com/mintoleda/talos/internal/protocol"
+	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
 )
 
@@ -46,6 +47,8 @@ func (e *fakeExecutor) Run(ctx context.Context, tu protocol.ToolUse, _ protocol.
 func (e *fakeExecutor) KillBg() {}
 
 func (e *fakeExecutor) Close() {}
+
+func (e *fakeExecutor) Policy() *safety.Policy { return nil }
 
 func newTestLoop(t *testing.T, prov *fakeProvider, exec executor.Executor) *Loop {
 	t.Helper()
@@ -87,6 +90,8 @@ func (e *concurrentExecutor) Run(ctx context.Context, tu protocol.ToolUse, _ pro
 func (e *concurrentExecutor) KillBg() {}
 
 func (e *concurrentExecutor) Close() {}
+
+func (e *concurrentExecutor) Policy() *safety.Policy { return nil }
 
 func TestParallelToolExecution(t *testing.T) {
 	prov := &fakeProvider{batches: [][]protocol.ProviderEvent{

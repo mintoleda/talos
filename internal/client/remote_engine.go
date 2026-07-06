@@ -116,6 +116,30 @@ func (e *RemoteEngine) CurrentThinkingLevel() string {
 	return out.Level
 }
 
+func (e *RemoteEngine) CyclePermissionMode() (string, error) {
+	var out rpc.LevelResult
+	if err := e.request(rpc.CyclePermissionMode, nil, &out); err != nil {
+		return "", err
+	}
+	return out.Level, nil
+}
+
+func (e *RemoteEngine) PermissionMode() string {
+	var out rpc.LevelResult
+	if err := e.request(rpc.PermissionMode, nil, &out); err != nil {
+		return "auto"
+	}
+	return out.Level
+}
+
+func (e *RemoteEngine) TogglePanic() (string, error) {
+	var out rpc.LevelResult
+	if err := e.request(rpc.TogglePanic, nil, &out); err != nil {
+		return "", err
+	}
+	return out.Level, nil
+}
+
 func (e *RemoteEngine) Compact(focus string) error {
 	return e.request(rpc.Compact, rpc.CompactParams{Focus: focus}, nil)
 }
