@@ -214,8 +214,8 @@ func TestServerBroadcastsEvents(t *testing.T) {
 	if sm.Type != "event" {
 		t.Fatalf("expected event type, got %s", sm.Type)
 	}
-	if sm.EType != "TextDelta" {
-		t.Fatalf("expected TextDelta etype, got %s", sm.EType)
+	if sm.EType != "text_delta" {
+		t.Fatalf("expected text_delta etype, got %s", sm.EType)
 	}
 }
 

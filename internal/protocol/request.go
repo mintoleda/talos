@@ -3,23 +3,23 @@ package protocol
 import "encoding/json"
 
 type Request struct {
-	System        string
-	Tools         []ToolSchema
-	Messages      []FrozenMessage
-	Volatile      []ContentBlock
-	Model         string
-	ThinkingLevel string
+	System        string         `json:"system"`
+	Tools         []ToolSchema   `json:"tools"`
+	Messages      []FrozenMessage `json:"messages"`
+	Volatile      []ContentBlock  `json:"volatile,omitempty"`
+	Model         string         `json:"model"`
+	ThinkingLevel string         `json:"thinking_level,omitempty"`
 }
 
 type FrozenMessage struct {
-	Msg Message
-	Raw []byte
+	Msg Message `json:"msg"`
+	Raw []byte  `json:"raw"`
 }
 
 type ToolSchema struct {
-	Name        string
-	Description string
-	Parameters  json.RawMessage
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
 }
 
 type ProviderEvent interface{ isProviderEvent() }

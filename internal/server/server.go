@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -177,6 +178,18 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) startWebSocket(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.Handle("/ws", websocket.Handler(func(conn *websocket.Conn) {
+		// Non-localhost listeners require Origin checking.
+		addr := s.address
+		if !isLocalhost(addr) {
+			origin := conn.Request().Header.Get("Origin")
+			if origin == "" {
+				origin = conn.Request().Header.Get("Sec-WebSocket-Origin")
+			}
+			if !originAllowed(origin, addr) {
+				_ = encodeServerMsg(json.NewEncoder(conn), &sync.Mutex{}, transport.ServerMsg{Type: "error", Err: "origin not allowed"})
+				return
+			}
+		}
 		s.handleConn(ctx, conn)
 	}))
 	srv := &http.Server{Addr: s.address, Handler: mux}
@@ -191,6 +204,41 @@ func (s *Server) startWebSocket(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+// isLocalhost returns true if addr is a loopback address or empty.
+func isLocalhost(addr string) bool {
+	if addr == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+// originAllowed checks if a browser origin is permitted to connect. Token
+// auth is the real barrier; this is defense-in-depth against cross-site
+// WebSocket connections. Non-browser clients send no Origin header and are
+// allowed; browser origins must target this server's host or loopback.
+func originAllowed(origin, addr string) bool {
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	oh := u.Hostname()
+	if oh == "localhost" || oh == "127.0.0.1" || oh == "::1" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return oh == host
 }
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
@@ -306,34 +354,9 @@ func encodeServerMsg(enc *json.Encoder, mu *sync.Mutex, sm transport.ServerMsg) 
 }
 
 func (s *Server) encodeEvent(enc *json.Encoder, mu *sync.Mutex, e protocol.Event) error {
-	raw, err := json.Marshal(e)
+	etype, raw, err := protocol.MarshalEvent(e)
 	if err != nil {
 		return err
-	}
-	var etype string
-	switch e.(type) {
-	case protocol.UserInput:
-		etype = "UserInput"
-	case protocol.ModelChanged:
-		etype = "ModelChanged"
-	case protocol.TextDelta:
-		etype = "TextDelta"
-	case protocol.ThinkingDelta:
-		etype = "ThinkingDelta"
-	case protocol.ThinkingBlock:
-		etype = "ThinkingBlock"
-	case protocol.ToolStarted:
-		etype = "ToolStarted"
-	case protocol.ToolFinished:
-		etype = "ToolFinished"
-	case protocol.Notice:
-		etype = "Notice"
-	case protocol.TurnEnded:
-		etype = "TurnEnded"
-	case protocol.PermissionRequested:
-		etype = "PermissionRequested"
-	case protocol.EngineSnapshot:
-		etype = "EngineSnapshot"
 	}
 	return encodeServerMsg(enc, mu, transport.ServerMsg{Type: "event", EType: etype, Event: raw})
 }

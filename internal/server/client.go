@@ -187,40 +187,5 @@ func runClientConn(ctx context.Context, conn net.Conn, address, token string) (*
 }
 
 func decodeEvent(sm transport.ServerMsg) (protocol.Event, error) {
-	switch sm.EType {
-	case "UserInput":
-		var e protocol.UserInput
-		return e, json.Unmarshal(sm.Event, &e)
-	case "ModelChanged":
-		var e protocol.ModelChanged
-		return e, json.Unmarshal(sm.Event, &e)
-	case "TextDelta":
-		var e protocol.TextDelta
-		return e, json.Unmarshal(sm.Event, &e)
-	case "ThinkingDelta":
-		var e protocol.ThinkingDelta
-		return e, json.Unmarshal(sm.Event, &e)
-	case "ThinkingBlock":
-		var e protocol.ThinkingBlock
-		return e, json.Unmarshal(sm.Event, &e)
-	case "ToolStarted":
-		var e protocol.ToolStarted
-		return e, json.Unmarshal(sm.Event, &e)
-	case "ToolFinished":
-		var e protocol.ToolFinished
-		return e, json.Unmarshal(sm.Event, &e)
-	case "Notice":
-		var e protocol.Notice
-		return e, json.Unmarshal(sm.Event, &e)
-	case "TurnEnded":
-		var e protocol.TurnEnded
-		return e, json.Unmarshal(sm.Event, &e)
-	case "PermissionRequested":
-		var e protocol.PermissionRequested
-		return e, json.Unmarshal(sm.Event, &e)
-	case "EngineSnapshot":
-		var e protocol.EngineSnapshot
-		return e, json.Unmarshal(sm.Event, &e)
-	}
-	return nil, fmt.Errorf("unknown event type %q", sm.EType)
+	return protocol.UnmarshalEvent(sm.EType, sm.Event)
 }
