@@ -136,9 +136,9 @@ i used pi a lot and configured it quite heavily, so the time is largely misleadi
 
 - working on vim binds because i like neovim
 - still need /config and probably other / commands
-- memory system would be cool
-- tabs/session windows
-- mcp support
+- ~~memory system would be cool~~
+- ~~tabs/session windows~~
+- ~~mcp support~~
 - multi-modal
   - [x] images
   - videos
