@@ -11,6 +11,13 @@ import (
 	"github.com/mintoleda/talos/internal/protocol"
 )
 
+// Byte caps keep a single read from flooding the context window (a 2000-line
+// default limit is no protection against files with enormous lines, e.g. logs).
+const (
+	maxReadBytes     = 128 * 1024
+	maxReadLineBytes = 4 * 1024
+)
+
 type readTool struct {
 	reads *ReadSet
 	index *fff.Index
@@ -68,10 +75,21 @@ func (t *readTool) Execute(ctx context.Context, args map[string]any) (protocol.T
 		end = len(lines) + 1
 	}
 	var out strings.Builder
+	byteCapped := false
 	for i := start - 1; i < end-1 && i < len(lines); i++ {
-		fmt.Fprintf(&out, "%6d | %s\n", i+1, lines[i])
+		line := lines[i]
+		if len(line) > maxReadLineBytes {
+			line = line[:maxReadLineBytes] + " …[line truncated]"
+		}
+		fmt.Fprintf(&out, "%6d | %s\n", i+1, line)
+		if out.Len() >= maxReadBytes {
+			byteCapped = true
+			fmt.Fprintf(&out, "\n[truncated at %dKB: stopped at line %d of %d; use offset/limit or grep to read more]\n",
+				maxReadBytes/1024, i+1, len(lines))
+			break
+		}
 	}
-	if len(lines) > limit && (end-start) < len(lines) {
+	if !byteCapped && len(lines) > limit && (end-start) < len(lines) {
 		fmt.Fprintf(&out, "\n[truncated: %d total lines]\n", len(lines))
 	}
 	_ = t.reads.Record(path)
