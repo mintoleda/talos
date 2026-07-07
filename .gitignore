@@ -20,3 +20,6 @@ TODOS.md
 # Session files
 .talos/sessions/
 .talos/swarm/
+# Web frontend
+web/dist/
+web/node_modules/
