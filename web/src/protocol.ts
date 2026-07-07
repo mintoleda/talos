@@ -244,7 +244,7 @@ export function decodeEvent(sm: ServerMsg): Event {
   const raw = sm.event as Record<string, unknown>;
   if (!raw) throw new Error("event body is empty");
   raw.etype = sm.etype;
-  return raw as Event;
+  return raw as unknown as Event;
 }
 
 /** Convert an Event union value back into wire form for display / logging. */
