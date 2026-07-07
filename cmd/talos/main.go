@@ -36,8 +36,6 @@ import (
 	"github.com/mintoleda/talos/internal/skills"
 	"github.com/mintoleda/talos/internal/tools"
 	"github.com/mintoleda/talos/internal/tui"
-
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 type Flags struct {
@@ -428,7 +426,7 @@ func run() error {
 			}
 		}()
 		_, _ = cp.Snapshot("before-run")
-		err := lp.RunTurn(ctx, protocol.TextBlocks(f.Print), renderTo(os.Stdout, f.DebugCache))
+		err := lp.RunTurn(ctx, protocol.TextBlocks(f.Print), renderFinal(os.Stdout))
 		signal.Reset(syscall.SIGINT, syscall.SIGTERM)
 		cancel()
 
@@ -492,6 +490,16 @@ func run() error {
 // one-shot (-p) mode. Text deltas go to stdout (the agent's response); all
 // metadata — tool calls, notices, turn summaries, permission prompts — goes
 // to stderr so that stdout contains only the answer, suitable for piping.
+// renderFinal emits only text deltas to out, suitable for -p / pipe mode.
+func renderFinal(out *os.File) protocol.EmitFunc {
+	return func(ev protocol.Event) {
+		switch e := ev.(type) {
+		case protocol.TextDelta:
+			fmt.Fprint(out, e.Text)
+		}
+	}
+}
+
 func renderTo(out *os.File, debugCache bool) protocol.EmitFunc {
 	errOut := os.Stderr
 	return func(ev protocol.Event) {
@@ -1026,37 +1034,26 @@ func runServer(ctx context.Context, cfg *config.Config, a *app, lp *loop.Loop, c
 }
 
 func runAttach(ctx context.Context, cfg *config.Config, sessionID string) error {
-	var clientConn *server.ClientConn
-	var events <-chan protocol.Event
-	var err error
-	if cfg.ServerListen != "" {
-		isWS := strings.HasPrefix(cfg.ServerListen, "ws:")
-		addr := strings.TrimPrefix(cfg.ServerListen, "tcp:")
-		addr = strings.TrimPrefix(addr, "ws:")
-		addr = strings.Replace(addr, "0.0.0.0:", "127.0.0.1:", 1)
-		if isWS {
-			clientConn, events, err = server.RunClientWebSocket(ctx, "ws://"+addr+"/ws", cfg.ServerToken)
-		} else {
-			clientConn, events, err = server.RunClientNetwork(ctx, "tcp", addr, cfg.ServerToken)
-		}
-	} else {
-		clientConn, events, err = server.RunClient(ctx, server.SocketPath(cfg.BaseDir, sessionID))
-	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	clientConn, events, err := attachConnect(ctx, cfg, sessionID)
 	if err != nil {
 		return err
 	}
+	_ = clientConn // held indirectly via engine
 
 	prices := pricing.Load(cfg.BaseDir)
-
 	engine := client.NewRemoteEngine(clientConn, events)
 	initialHistory, _ := engine.History()
 	inputTokens, outputTokens, cacheMiss, seedCost, _ := engine.Stats()
 
-	m := tui.NewModel(tui.Config{
+	initialCfg := tui.Config{
 		SessionID:      sessionID,
 		Mode:           tui.ModeSingleAgent,
 		InitialHistory: initialHistory,
 		Engine:         engine,
+		Shutdown:       cancel,
 		Provider:       cfg.Provider,
 		Model:          cfg.Model,
 		Pricing:        prices,
@@ -1071,19 +1068,62 @@ func runAttach(ctx context.Context, cfg *config.Config, sessionID string) error 
 			CacheMiss:    cacheMiss,
 			Cost:         seedCost,
 		},
-	})
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
-
-	go func() {
-		for ev := range events {
-			p.Send(tui.EventMsg{E: ev})
-		}
-	}()
-
-	if _, err := p.Run(); err != nil {
-		return fmt.Errorf("tui: %w", err)
 	}
-	return nil
+
+	return tui.RunTabs(ctx, initialCfg, events, attachNewTab(ctx, cfg, sessionID, prices))
+}
+
+// attachConnect dials the talos server and returns the client connection,
+// event channel, and any error.
+func attachConnect(ctx context.Context, cfg *config.Config, sessionID string) (*server.ClientConn, <-chan protocol.Event, error) {
+	if cfg.ServerListen != "" {
+		isWS := strings.HasPrefix(cfg.ServerListen, "ws:")
+		addr := strings.TrimPrefix(cfg.ServerListen, "tcp:")
+		addr = strings.TrimPrefix(addr, "ws:")
+		addr = strings.Replace(addr, "0.0.0.0:", "127.0.0.1:", 1)
+		if isWS {
+			return server.RunClientWebSocket(ctx, "ws://"+addr+"/ws", cfg.ServerToken)
+		}
+		return server.RunClientNetwork(ctx, "tcp", addr, cfg.ServerToken)
+	}
+	return server.RunClient(ctx, server.SocketPath(cfg.BaseDir, sessionID))
+}
+
+// attachNewTab returns a NewTabFunc that opens a fresh connection to the same
+// server for each new tab, allowing multiple views of the shared conversation.
+func attachNewTab(ctx context.Context, cfg *config.Config, sessionID string, prices *pricing.Table) tui.NewTabFunc {
+	return func(tabCtx context.Context, tabID int) (tui.Config, <-chan protocol.Event, func(), error) {
+		tabCtx, cancel := context.WithCancel(tabCtx)
+		conn, evs, err := attachConnect(tabCtx, cfg, sessionID)
+		if err != nil {
+			cancel()
+			return tui.Config{}, nil, nil, err
+		}
+		eng := client.NewRemoteEngine(conn, evs)
+		history, _ := eng.History()
+		in, out, miss, cost, _ := eng.Stats()
+		return tui.Config{
+			SessionID:      sessionID,
+			Mode:           tui.ModeSingleAgent,
+			Engine:         eng,
+			Shutdown:       cancel,
+			Provider:       cfg.Provider,
+			Model:          cfg.Model,
+			Pricing:        prices,
+			InitialHistory: history,
+			SeedStats: struct {
+				InputTokens  int
+				OutputTokens int
+				CacheMiss    int
+				Cost         float64
+			}{
+				InputTokens:  in,
+				OutputTokens: out,
+				CacheMiss:    miss,
+				Cost:         cost,
+			},
+		}, evs, cancel, nil
+	}
 }
 
 // pickSession lists this project's sessions and lets the user choose one,
