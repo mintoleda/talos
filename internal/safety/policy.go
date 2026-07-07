@@ -42,13 +42,12 @@ func (m Mode) String() string {
 	}
 }
 
-// NextMode returns the next mode in the auto → ask → panic cycle.
+// NextMode returns the next mode in the auto → ask → auto cycle.
+// Panic is excluded; it is only accessible via TogglePanic (alt+p or /panic).
 func NextMode(m Mode) Mode {
 	switch m {
 	case ModeAuto:
 		return ModeAsk
-	case ModeAsk:
-		return ModePanic
 	default:
 		return ModeAuto
 	}

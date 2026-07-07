@@ -400,8 +400,9 @@ func (e *LocalEngine) CurrentThinkingLevel() string {
 	return e.pb.ThinkingLevel()
 }
 
-// CyclePermissionMode advances to the next permission mode (auto→ask→panic→auto)
-// and returns the new mode name.
+// CyclePermissionMode advances to the next permission mode (auto→ask→auto)
+// and returns the new mode name. Panic is excluded from the cycle; use
+// TogglePanic instead.
 func (e *LocalEngine) CyclePermissionMode() (string, error) {
 	if e.pol == nil {
 		return "", fmt.Errorf("permission policy not configured")
