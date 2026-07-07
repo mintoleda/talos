@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -127,6 +128,25 @@ func TestReadLineNumbers(t *testing.T) {
 	}
 	if !contains(result.Content, "3 | c") {
 		t.Fatal("should contain line 3 content")
+	}
+}
+
+func TestReadByteCap(t *testing.T) {
+	// A file with few but enormous lines must not blow past the byte cap.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "huge.log")
+	line := strings.Repeat("x", 500*1024)
+	if err := os.WriteFile(path, []byte(line+"\n"+line+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewRead(NewReadSet(), nil)
+	result, _ := r.Execute(context.Background(), map[string]any{"path": path})
+	if len(result.Content) > maxReadBytes+maxReadLineBytes+1024 {
+		t.Fatalf("output not capped: %d bytes", len(result.Content))
+	}
+	if !contains(result.Content, "[line truncated]") {
+		t.Fatal("expected per-line truncation marker")
 	}
 }
 
