@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mintoleda/talos/internal/protocol"
@@ -43,6 +44,7 @@ func frozenText(role protocol.Role, text string) protocol.FrozenMessage {
 func TestAlignedChunk_PureText(t *testing.T) {
 	c := NewCompactor(nil)
 	c.ChunkSize = 3
+	c.KeepTail = 1
 
 	frozen := []protocol.FrozenMessage{
 		frozenText(protocol.RoleUser, "hello"),
@@ -63,6 +65,7 @@ func TestAlignedChunk_ToolCallSplit(t *testing.T) {
 	// The aligned chunk must extend to include the tool result at position 3.
 	c := NewCompactor(nil)
 	c.ChunkSize = 3
+	c.KeepTail = 1
 
 	frozen := []protocol.FrozenMessage{
 		frozenText(protocol.RoleUser, "read f1"),
@@ -83,6 +86,7 @@ func TestAlignedChunk_MultipleToolCalls(t *testing.T) {
 	// Must extend to 5.
 	c := NewCompactor(nil)
 	c.ChunkSize = 3
+	c.KeepTail = 1
 
 	frozen := []protocol.FrozenMessage{
 		frozenText(protocol.RoleUser, "do stuff"),
@@ -104,6 +108,7 @@ func TestAlignedChunk_CleanBreak(t *testing.T) {
 	// No extension needed.
 	c := NewCompactor(nil)
 	c.ChunkSize = 4
+	c.KeepTail = 1
 
 	frozen := []protocol.FrozenMessage{
 		frozenText(protocol.RoleUser, "read f1"),
@@ -119,9 +124,12 @@ func TestAlignedChunk_CleanBreak(t *testing.T) {
 	}
 }
 
-func TestAlignedChunk_AllMessages(t *testing.T) {
+func TestAlignedChunk_NeverConsumesEntireTranscript(t *testing.T) {
+	// Even with a huge ChunkSize, the last KeepTail messages are never
+	// compacted, so the model always retains the most recent context.
 	c := NewCompactor(nil)
 	c.ChunkSize = 100
+	c.KeepTail = 1
 
 	frozen := []protocol.FrozenMessage{
 		frozenText(protocol.RoleUser, "hello"),
@@ -129,8 +137,46 @@ func TestAlignedChunk_AllMessages(t *testing.T) {
 	}
 
 	got := c.alignedChunk(frozen)
+	if len(got) != 1 {
+		t.Fatalf("expected chunk size 1 (tail retained), got %d", len(got))
+	}
+}
+
+func TestAlignedChunk_KeepTailDefault(t *testing.T) {
+	c := NewCompactor(nil)
+	c.ChunkSize = 100
+
+	frozen := []protocol.FrozenMessage{
+		frozenText(protocol.RoleUser, "q1"),
+		frozenText(protocol.RoleAssistant, "a1"),
+		frozenText(protocol.RoleUser, "q2"),
+		frozenText(protocol.RoleAssistant, "a2"),
+	}
+
+	got := c.alignedChunk(frozen)
 	if len(got) != 2 {
-		t.Fatalf("all messages: expected chunk size 2, got %d", len(got))
+		t.Fatalf("expected chunk size 2 (KeepTail=2 retained), got %d", len(got))
+	}
+}
+
+func TestAlignedChunk_ShrinksBackwardWhenTailSplitsPair(t *testing.T) {
+	// The tool result sits inside the protected tail, so the boundary cannot
+	// extend forward to include it — it must shrink back to a clean break.
+	c := NewCompactor(nil)
+	c.ChunkSize = 3
+	c.KeepTail = 2
+
+	frozen := []protocol.FrozenMessage{
+		frozenText(protocol.RoleUser, "read f1"),
+		frozenText(protocol.RoleAssistant, "ok"),
+		frozenToolCall("tc1"),           // position 2
+		frozenToolResult("tc1"),          // position 3 — inside protected tail
+		frozenText(protocol.RoleUser, "next"),
+	}
+
+	got := c.alignedChunk(frozen)
+	if len(got) != 2 {
+		t.Fatalf("expected chunk size 2 (shrunk before tool_use), got %d", len(got))
 	}
 }
 
@@ -141,6 +187,63 @@ func TestAlignedChunk_Empty(t *testing.T) {
 	got := c.alignedChunk(nil)
 	if len(got) != 0 {
 		t.Fatalf("empty: expected chunk size 0, got %d", len(got))
+	}
+}
+
+func TestExtractSummarizer(t *testing.T) {
+	msgs := []protocol.Message{
+		protocol.TextMessage(protocol.RoleUser, "fix the jdtls crash"),
+		protocol.TextMessage(protocol.RoleAssistant, "Let me check the log.\nSecond line dropped."),
+		{Role: protocol.RoleAssistant, Content: []protocol.ContentBlock{{
+			Type:    protocol.BlockToolUse,
+			ToolUse: &protocol.ToolUse{ID: "r1", Name: "read", Args: map[string]any{"path": "/tmp/lsp.log"}},
+		}}},
+		{Role: protocol.RoleTool, Content: []protocol.ContentBlock{{
+			Type:       protocol.BlockToolResult,
+			ToolResult: &protocol.ToolResult{ToolUseID: "r1", Content: strings.Repeat("x", 100000)},
+		}}},
+	}
+
+	got, err := ExtractSummarizer{}.Summarize(context.Background(), msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "user: fix the jdtls crash") {
+		t.Fatalf("missing user message: %q", got)
+	}
+	if !strings.Contains(got, "assistant: Let me check the log.") {
+		t.Fatalf("missing assistant first line: %q", got)
+	}
+	if strings.Contains(got, "Second line") {
+		t.Fatalf("assistant text not trimmed to first line: %q", got)
+	}
+	if !strings.Contains(got, "files touched: /tmp/lsp.log") {
+		t.Fatalf("missing files touched: %q", got)
+	}
+	if strings.Contains(got, "xxxx") {
+		t.Fatal("tool result content leaked into summary")
+	}
+	if len(got) > 8192+len("…") {
+		t.Fatalf("summary exceeds total cap: %d bytes", len(got))
+	}
+
+	// Deterministic: same input, same output.
+	again, _ := ExtractSummarizer{}.Summarize(context.Background(), msgs)
+	if got != again {
+		t.Fatal("extract summary not deterministic")
+	}
+}
+
+func TestExtractSummarizerCapsHugeUserMessage(t *testing.T) {
+	msgs := []protocol.Message{
+		protocol.TextMessage(protocol.RoleUser, strings.Repeat("y", 100000)),
+	}
+	got, err := ExtractSummarizer{}.Summarize(context.Background(), msgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) > 8192+len("…") {
+		t.Fatalf("summary exceeds total cap: %d bytes", len(got))
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mintoleda/talos/internal/protocol"
@@ -47,6 +48,80 @@ func (DropSummarizer) Summarize(_ context.Context, _ []protocol.Message) (string
 }
 
 func (d DropSummarizer) WithFocus(_ string) Summarizer { return d }
+
+// ExtractSummarizer builds a summary mechanically from the dropped chunk: user
+// messages verbatim (they carry the intent and are usually small), assistant
+// text trimmed to its first line, tool results dropped, plus a list of file
+// paths touched by tool calls. No LLM call, and the output is a pure function
+// of the chunk — so like DropSummarizer it is deterministic and reproducible
+// on replay, and costs the same single cache miss any compaction incurs.
+type ExtractSummarizer struct {
+	// MaxUserBytes caps each user message in the extract (0 = 2048).
+	MaxUserBytes int
+	// MaxTotalBytes caps the whole summary (0 = 8192).
+	MaxTotalBytes int
+}
+
+func (e ExtractSummarizer) WithFocus(_ string) Summarizer { return e }
+
+func (e ExtractSummarizer) Summarize(_ context.Context, msgs []protocol.Message) (string, error) {
+	maxUser := e.MaxUserBytes
+	if maxUser <= 0 {
+		maxUser = 2048
+	}
+	maxTotal := e.MaxTotalBytes
+	if maxTotal <= 0 {
+		maxTotal = 8192
+	}
+
+	var b strings.Builder
+	b.WriteString("[Earlier conversation compacted. Extract of dropped messages:]\n")
+	var paths []string
+	seen := map[string]bool{}
+	for _, m := range msgs {
+		for _, block := range m.Content {
+			switch {
+			case block.Type == protocol.BlockText && m.Role == protocol.RoleUser:
+				text := truncate(block.Text, maxUser)
+				if strings.TrimSpace(text) != "" {
+					b.WriteString("user: " + text + "\n")
+				}
+			case block.Type == protocol.BlockText && m.Role == protocol.RoleAssistant:
+				line := firstLine(block.Text)
+				if line != "" {
+					b.WriteString("assistant: " + truncate(line, 200) + "\n")
+				}
+			case block.Type == protocol.BlockToolUse && block.ToolUse != nil:
+				if p, ok := block.ToolUse.Args["path"].(string); ok && p != "" && !seen[p] {
+					seen[p] = true
+					paths = append(paths, p)
+				}
+			}
+		}
+		if b.Len() >= maxTotal {
+			break
+		}
+	}
+	if len(paths) > 0 && b.Len() < maxTotal {
+		b.WriteString("files touched: " + strings.Join(paths, ", ") + "\n")
+	}
+	return truncate(b.String(), maxTotal), nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return s
+}
 
 // LLMSummarizer uses a provider to summarize a chunk of conversation history.
 // It emits no events and blocks until the summary is returned.
@@ -117,6 +192,7 @@ type Compactor struct {
 	ChunkSize          int
 	Threshold          float64
 	EmergencyThreshold float64 // above this, compact regardless of chunk size
+	KeepTail           int     // most recent messages that are never compacted
 	OnCompaction       func() // called after each successful compaction
 }
 
@@ -126,6 +202,7 @@ func NewCompactor(s Summarizer) *Compactor {
 		ChunkSize:          20,
 		Threshold:          0.85,
 		EmergencyThreshold: 0.95,
+		KeepTail:           2,
 	}
 }
 
@@ -159,6 +236,15 @@ func (c *Compactor) Clamp() {
 	if c.ChunkSize > 500 {
 		c.ChunkSize = 500
 	}
+	if c.KeepTail == 0 {
+		c.KeepTail = 2
+	}
+	if c.KeepTail < 1 {
+		c.KeepTail = 1
+	}
+	if c.KeepTail > 50 {
+		c.KeepTail = 50
+	}
 }
 
 // alignedChunk returns the oldest chunk of messages whose boundary does not
@@ -166,72 +252,80 @@ func (c *Compactor) Clamp() {
 // include all tool-result messages for any assistant tool_calls in the window.
 // This prevents sending incomplete exchanges to providers (e.g. DeepSeek) that
 // reject messages with dangling tool_calls.
+//
+// The chunk never reaches into the last KeepTail messages, so compaction can
+// never consume the entire transcript (e.g. the in-flight turn's user message).
+// If forward extension would cross that boundary, the boundary shrinks
+// backward to the nearest clean break instead — possibly to zero (no chunk).
 func (c *Compactor) alignedChunk(frozen []protocol.FrozenMessage) []protocol.FrozenMessage {
+	keep := c.KeepTail
+	if keep < 1 {
+		keep = 1
+	}
+	maxEnd := len(frozen) - keep
+	if maxEnd <= 0 {
+		return nil
+	}
 	target := c.ChunkSize
 	if target == 0 {
 		target = 20
 	}
-	if target >= len(frozen) {
-		return frozen
-	}
-
 	end := target
-	for end < len(frozen) {
-		incomplete := false
-		for i := 0; i < end && !incomplete; i++ {
-			if frozen[i].Msg.Role != protocol.RoleAssistant {
+	if end > maxEnd {
+		end = maxEnd
+	}
+	for end < maxEnd && splitsToolPair(frozen, end) {
+		end++
+	}
+	for end > 0 && splitsToolPair(frozen, end) {
+		end--
+	}
+	return frozen[:end]
+}
+
+// splitsToolPair reports whether cutting frozen at index end would separate an
+// assistant tool_use inside the chunk from its tool_result outside it. A
+// tool_use with no result anywhere in the transcript does not count as split.
+func splitsToolPair(frozen []protocol.FrozenMessage, end int) bool {
+	for i := 0; i < end; i++ {
+		if frozen[i].Msg.Role != protocol.RoleAssistant {
+			continue
+		}
+		for _, block := range frozen[i].Msg.Content {
+			if block.Type != protocol.BlockToolUse || block.ToolUse == nil {
 				continue
 			}
-			for _, block := range frozen[i].Msg.Content {
-				if block.Type != protocol.BlockToolUse || block.ToolUse == nil {
+			found := false
+			for j := i + 1; j < end && !found; j++ {
+				if frozen[j].Msg.Role != protocol.RoleTool {
 					continue
 				}
-				found := false
-				for j := i + 1; j < end; j++ {
-					if frozen[j].Msg.Role == protocol.RoleTool {
-						for _, b := range frozen[j].Msg.Content {
-							if b.Type == protocol.BlockToolResult && b.ToolResult != nil &&
-								b.ToolResult.ToolUseID == block.ToolUse.ID {
-								found = true
-								break
-							}
-						}
-					}
-					if found {
-						break
-					}
-				}
-				if !found {
-					// See if the result exists beyond 'end'.
-					for j := end; j < len(frozen); j++ {
-						if frozen[j].Msg.Role == protocol.RoleTool {
-							for _, b := range frozen[j].Msg.Content {
-								if b.Type == protocol.BlockToolResult && b.ToolResult != nil &&
-									b.ToolResult.ToolUseID == block.ToolUse.ID {
-									found = true
-									break
-								}
-							}
-						}
-						if found {
-							break
-						}
-					}
-					if found {
-						incomplete = true
+				for _, b := range frozen[j].Msg.Content {
+					if b.Type == protocol.BlockToolResult && b.ToolResult != nil &&
+						b.ToolResult.ToolUseID == block.ToolUse.ID {
+						found = true
 						break
 					}
 				}
 			}
-		}
-		if incomplete {
-			end++
-		} else {
-			break
+			if found {
+				continue
+			}
+			// The result may exist beyond 'end' — that's a split.
+			for j := end; j < len(frozen); j++ {
+				if frozen[j].Msg.Role != protocol.RoleTool {
+					continue
+				}
+				for _, b := range frozen[j].Msg.Content {
+					if b.Type == protocol.BlockToolResult && b.ToolResult != nil &&
+						b.ToolResult.ToolUseID == block.ToolUse.ID {
+						return true
+					}
+				}
+			}
 		}
 	}
-
-	return frozen[:end]
+	return false
 }
 
 // compactChunk summarises the given chunk of frozen messages, persists a
