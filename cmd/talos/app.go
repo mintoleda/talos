@@ -162,7 +162,7 @@ func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices 
 		}
 
 		newLp := loop.New(a.prov, a.exec, ntx, a.pb)
-		var sum session.Summarizer = session.DropSummarizer{}
+		var sum session.Summarizer = session.ExtractSummarizer{}
 		if a.cfg.SummaryModel != "" {
 			sum = session.NewLLMSummarizer(a.prov, a.cfg.SummaryModel, "")
 		}

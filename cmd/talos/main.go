@@ -583,10 +583,11 @@ func newProvider(cfg *config.Config, noTools bool) (provider.Provider, *session.
 	}
 
 	// Build the compactor. By default, use a deterministic, zero-cost
-	// placeholder summarizer that keeps the prefix cacheable after compaction.
-	// When the user sets summary_model in config, an LLM-based summarizer
-	// (using the specified model) replaces it for richer summaries.
-	var sum session.Summarizer = session.DropSummarizer{}
+	// extractive summarizer (user messages verbatim, tool results dropped) —
+	// like the old placeholder it makes no API calls and is reproducible on
+	// replay. When the user sets summary_model in config, an LLM-based
+	// summarizer (using the specified model) replaces it for richer summaries.
+	var sum session.Summarizer = session.ExtractSummarizer{}
 	if cfg.SummaryModel != "" {
 		sum = session.NewLLMSummarizer(prov, cfg.SummaryModel, "")
 	}
