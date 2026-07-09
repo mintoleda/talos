@@ -73,6 +73,15 @@ export interface GCWorktreesResult {
   removed: string[];
 }
 
+export interface ProbeDirParams {
+  dir: string;
+}
+
+export interface ProbeDirResult {
+  is_repo: boolean;
+  project_dir: string;
+}
+
 export const DaemonRPC = {
   CreateSession: "daemon.createSession",
   ListSessions: "daemon.listSessions",
@@ -80,6 +89,7 @@ export const DaemonRPC = {
   DeleteSession: "daemon.deleteSession",
   Status: "daemon.status",
   GCWorktrees: "daemon.gcWorktrees",
+  ProbeDir: "daemon.probeDir",
 } as const;
 
 // ── Content blocks (message.go) ──────────────────────────────────────────

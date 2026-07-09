@@ -1,155 +1,170 @@
 /**
- * App — root component wiring Engine + State + UI.
+ * App — multi-session shell: sidebar + focused chat.
  */
 
-import React, { useState, useCallback, useEffect, useRef } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { Engine } from './engine'
 import type { Event, SessionInfo } from './protocol'
-import { type ChatState, initialState, reduceState, ingestHistory } from './state'
+import { DaemonRPC } from './protocol'
+import { initialState } from './state'
+import {
+  type AppState,
+  initialAppState,
+  applyChatEvent,
+  applyHistory,
+  applySessionStatus,
+  approvalCount,
+  focusedChat,
+  flattenSessions,
+  pickBootFocus,
+  readFocusedSession,
+  sessionsFromList,
+  setTranscript,
+  writeFocusedSession,
+  writeRecentProject,
+} from './appState'
 import { ChatView } from './ChatView'
 import { Composer } from './Composer'
 import { PermissionPrompt } from './PermissionPrompt'
 import { StatusBar } from './StatusBar'
-
-const RECENT_PROJECT_KEY = 'talos.recentProject'
+import { Sidebar } from './Sidebar'
+import { CreatePopover } from './CreatePopover'
+import { ConfirmDialog } from './ConfirmDialog'
 
 function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search)
   const urlParam = params.get('ws')
   if (urlParam) return urlParam
-
-  // In browser/dev, Vite (or the daemon) proxies /ws.
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${proto}//${window.location.host}/ws`
 }
 
-function readRecentProject(): string | null {
-  try {
-    return localStorage.getItem(RECENT_PROJECT_KEY)
-  } catch {
-    return null
-  }
-}
-
-function writeRecentProject(dir: string) {
-  try {
-    localStorage.setItem(RECENT_PROJECT_KEY, dir)
-  } catch {
-    /* ignore */
-  }
-}
-
-function pickMostRecentLive(sessions: SessionInfo[]): SessionInfo | null {
-  const live = sessions.filter((s) => s.live)
-  if (live.length === 0) return null
-  live.sort((a, b) => {
-    const ta = Date.parse(a.last_active || a.created_at || '') || 0
-    const tb = Date.parse(b.last_active || b.created_at || '') || 0
-    return tb - ta
-  })
-  return live[0]
-}
-
 export function App() {
-  const [state, setState] = useState<ChatState>(initialState)
+  const [app, setApp] = useState<AppState>(initialAppState)
   const engineRef = useRef<Engine | null>(null)
-  const [connected, setConnected] = useState(false)
-  const [session, setSession] = useState('')
-  const [error, setError] = useState('')
-  const [needsProject, setNeedsProject] = useState(false)
-  const [versionBanner, setVersionBanner] = useState<string | null>(null)
   const bootRef = useRef(0)
-  const sessionRef = useRef('')
   const readyOnceRef = useRef(false)
+  const focusedRef = useRef<string | null>(null)
+  const sessionsRef = useRef<Map<string, SessionInfo>>(new Map())
+  const refetchingRef = useRef(false)
+  const [showCreate, setShowCreate] = useState(false)
+  const [pendingDelete, setPendingDelete] = useState<SessionInfo | null>(null)
+  const [daemonVersion, setDaemonVersion] = useState('')
+  const [booting, setBooting] = useState(true)
 
   useEffect(() => {
-    sessionRef.current = session
-  }, [session])
+    focusedRef.current = app.focusedID
+  }, [app.focusedID])
 
-  const attachSession = useCallback(async (eng: Engine, sessionId: string) => {
+  useEffect(() => {
+    sessionsRef.current = app.sessions
+  }, [app.sessions])
+
+  useEffect(() => {
+    writeFocusedSession(app.focusedID)
+  }, [app.focusedID])
+
+  useEffect(() => {
+    const n = approvalCount(app.sessions)
+    void window.talos?.setBadgeCount?.(n)
+  }, [app.sessions])
+
+  const refetchSessions = useCallback(async (eng: Engine) => {
+    const listed = (await eng.request(DaemonRPC.ListSessions)) as { sessions?: SessionInfo[] }
+    const list = listed?.sessions ?? []
+    setApp((a) => ({ ...a, sessions: sessionsFromList(list) }))
+    return list
+  }, [])
+
+  const focusSession = useCallback(async (eng: Engine, sessionId: string) => {
+    const prev = focusedRef.current
+    if (prev === sessionId) {
+      eng.subscribe(sessionId)
+      return
+    }
+    if (prev) {
+      eng.unsubscribe(prev)
+    }
+
+    const existing = sessionsRef.current.get(sessionId)
+    // Resume unloaded sessions via createSession{resume}.
+    if (existing && !existing.live) {
+      try {
+        await eng.request(DaemonRPC.CreateSession, {
+          dir: existing.project_dir || existing.dir,
+          resume: sessionId,
+          isolation: existing.isolation || undefined,
+        })
+      } catch (e) {
+        setApp((a) => ({
+          ...a,
+          error: e instanceof Error ? e.message : String(e),
+        }))
+        return
+      }
+    }
+
     eng.subscribe(sessionId)
-    setSession(sessionId)
-    setConnected(true)
-    setNeedsProject(false)
-    setError('')
+    focusedRef.current = sessionId
 
-    eng
+    setApp((a) => {
+      let next = { ...a, focusedID: sessionId, connected: true, needsProject: false, error: '' }
+      if (!next.transcripts.has(sessionId)) {
+        next = setTranscript(next, sessionId, initialState())
+      }
+      return next
+    })
+
+    void eng
       .request('engine.history', undefined, sessionId)
       .then((raw) => {
         const hist = (raw as { history?: unknown[] })?.history ?? []
-        setState((s) => ingestHistory(s, hist))
+        setApp((a) => {
+          const chat = a.transcripts.get(sessionId)
+          if (chat && chat.messages.length > 0) return a
+          return applyHistory(a, sessionId, hist)
+        })
       })
       .catch(() => {})
 
-    eng
+    void eng
       .request('engine.permissionMode', undefined, sessionId)
       .then((raw) => {
         const r = raw as { level?: string } | null
-        if (r?.level) {
-          setState((s) => ({ ...s, permissionMode: r.level! }))
-        }
+        if (!r?.level) return
+        setApp((a) => {
+          const prevChat = a.transcripts.get(sessionId) ?? initialState()
+          return setTranscript(a, sessionId, { ...prevChat, permissionMode: r.level! })
+        })
       })
       .catch(() => {})
   }, [])
 
-  const resolveOrCreateSession = useCallback(
-    async (eng: Engine, preferredDir?: string | null): Promise<string | null> => {
-      const listed = (await eng.request('daemon.listSessions')) as {
-        sessions?: SessionInfo[]
-      }
-      const sessions = listed?.sessions ?? []
-      const recent = pickMostRecentLive(sessions)
-      if (recent?.id) {
-        return recent.id
-      }
-
-      let dir =
-        preferredDir ||
-        new URLSearchParams(window.location.search).get('dir') ||
-        readRecentProject()
-
-      // In Electron, missing dir → show Open project UI (don't auto-dialog).
-      if (!dir) {
-        return null
-      }
-
-      writeRecentProject(dir)
-      const created = (await eng.request('daemon.createSession', {
-        dir,
-        // default isolation: omit → daemon default (worktree); never force "none"
-      })) as { session?: { id?: string } }
-      return created?.session?.id ?? null
-    },
-    [],
-  )
-
-  const checkVersionMismatch = useCallback(
-    async (helloVersion: string, discoveryVersion: string) => {
-      if (!helloVersion || !discoveryVersion) {
-        setVersionBanner(null)
-        return
-      }
-      if (helloVersion !== discoveryVersion) {
-        setVersionBanner(
-          `Daemon version ${helloVersion} differs from binary ${discoveryVersion}. Restart the daemon to upgrade.`,
-        )
-      } else {
-        setVersionBanner(null)
-      }
-    },
-    [],
-  )
+  const checkVersionMismatch = useCallback(async (helloVersion: string, discoveryVersion: string) => {
+    if (!helloVersion || !discoveryVersion) {
+      setApp((a) => ({ ...a, versionBanner: null }))
+      return
+    }
+    if (helloVersion !== discoveryVersion) {
+      setApp((a) => ({
+        ...a,
+        versionBanner: `Daemon version ${helloVersion} differs from binary ${discoveryVersion}. Restart the daemon to upgrade.`,
+      }))
+    } else {
+      setApp((a) => ({ ...a, versionBanner: null }))
+    }
+  }, [])
 
   const startEngine = useCallback(
     async (url: string, token: string | undefined, discoveryVersion: string) => {
       const boot = ++bootRef.current
       engineRef.current?.close()
-      setState(initialState)
-      setConnected(false)
-      setSession('')
-      setNeedsProject(false)
-
+      setApp(initialAppState())
+      focusedRef.current = null
       readyOnceRef.current = false
+      setBooting(true)
+      setDaemonVersion(discoveryVersion)
+
       const eng = new Engine(url, token, {
         autoReconnect: true,
         resolveConnection: window.talos
@@ -158,60 +173,89 @@ export function App() {
               return { url: d.wsURL, token: d.token }
             }
           : undefined,
-        onReconnect: (sid) => {
+        onReconnect: () => {
           if (boot !== bootRef.current) return
-          const current = sessionRef.current || sid
-          if (current) {
-            eng.subscribe(current)
-            setConnected(true)
-            setError('')
-          }
+          void (async () => {
+            try {
+              await refetchSessions(eng)
+              const fid = focusedRef.current
+              if (fid) eng.subscribe(fid)
+              setApp((a) => ({ ...a, connected: true, error: '' }))
+            } catch (e) {
+              setApp((a) => ({
+                ...a,
+                connected: false,
+                error: e instanceof Error ? e.message : String(e),
+              }))
+            }
+          })()
         },
       })
       engineRef.current = eng
 
-      eng.onReady = async (sid, helloVersion) => {
+      eng.onReady = async (_sid, helloVersion) => {
         if (boot !== bootRef.current) return
-        setError('')
+        setApp((a) => ({ ...a, error: '' }))
         void checkVersionMismatch(helloVersion ?? eng.serverVersion, discoveryVersion)
+        setDaemonVersion(helloVersion || discoveryVersion)
 
-        // Full bootstrap only on first hello; reconnects use onReconnect.
         if (readyOnceRef.current) return
         readyOnceRef.current = true
 
         try {
-          let sessionId = sid
-          if (!sessionId) {
-            sessionId = (await resolveOrCreateSession(eng)) ?? ''
+          // Optional auto-create from ?dir= for browser/dev.
+          const dirParam = new URLSearchParams(window.location.search).get('dir')
+          const listed = (await eng.request(DaemonRPC.ListSessions)) as { sessions?: SessionInfo[] }
+          let list = listed?.sessions ?? []
+          if (list.length === 0 && dirParam) {
+            writeRecentProject(dirParam)
+            await eng.request(DaemonRPC.CreateSession, { dir: dirParam })
+            list = ((await eng.request(DaemonRPC.ListSessions)) as { sessions?: SessionInfo[] })
+              ?.sessions ?? []
           }
-          if (!sessionId) {
-            if (window.talos) {
-              setNeedsProject(true)
-              setConnected(false)
-              setError('')
-              return
-            }
-            setError('no session — pass ?dir=/absolute/project/path')
-            setConnected(false)
-            return
+          const map = sessionsFromList(list)
+          const focus = pickBootFocus(map, readFocusedSession())
+          setApp((a) => ({
+            ...a,
+            sessions: map,
+            connected: true,
+            needsProject: !focus,
+            error: '',
+          }))
+          if (focus) {
+            await focusSession(eng, focus)
           }
-          await attachSession(eng, sessionId)
         } catch (e) {
-          setError(e instanceof Error ? e.message : String(e))
-          setConnected(false)
+          setApp((a) => ({
+            ...a,
+            error: e instanceof Error ? e.message : String(e),
+            connected: false,
+          }))
+        } finally {
+          if (boot === bootRef.current) setBooting(false)
         }
       }
 
-      eng.onEvent = (ev: Event) => {
-        setState((s) => reduceState(s, ev))
+      eng.onEvent = (ev: Event, session?: string) => {
+        if (ev.etype === 'session_status') {
+          const unknown = !sessionsRef.current.has(ev.id) && ev.state !== 'deleted'
+          setApp((a) => applySessionStatus(a, ev))
+          if (unknown && !refetchingRef.current) {
+            refetchingRef.current = true
+            void refetchSessions(eng).finally(() => {
+              refetchingRef.current = false
+            })
+          }
+          return
+        }
+        setApp((a) => applyChatEvent(a, ev, session))
       }
 
       eng.onClose = (reason) => {
-        setConnected(false)
-        setError(reason)
+        setApp((a) => ({ ...a, connected: false, error: reason }))
       }
     },
-    [attachSession, checkVersionMismatch, resolveOrCreateSession],
+    [checkVersionMismatch, focusSession, refetchSessions],
   )
 
   useEffect(() => {
@@ -231,28 +275,17 @@ export function App() {
         }
       } catch (e) {
         if (!cancelled) {
-          setError(e instanceof Error ? e.message : String(e))
+          setBooting(false)
+          setApp((a) => ({
+            ...a,
+            error: e instanceof Error ? e.message : String(e),
+          }))
         }
       }
     })()
 
     const unsub = window.talos?.onNewSession(() => {
-      void (async () => {
-        const eng = engineRef.current
-        if (!eng || !window.talos) return
-        try {
-          const dir = await window.talos.pickDirectory()
-          if (!dir) return
-          writeRecentProject(dir)
-          const created = (await eng.request('daemon.createSession', { dir })) as {
-            session?: { id?: string }
-          }
-          const id = created?.session?.id
-          if (id) await attachSession(eng, id)
-        } catch (e) {
-          setError(e instanceof Error ? e.message : String(e))
-        }
-      })()
+      setShowCreate(true)
     })
 
     return () => {
@@ -261,106 +294,151 @@ export function App() {
       engineRef.current?.close()
       engineRef.current = null
     }
-  }, [attachSession, startEngine])
+  }, [startEngine])
 
-  const handleOpenProject = useCallback(async () => {
-    if (!window.talos) return
-    const eng = engineRef.current
-    try {
-      const dir = await window.talos.pickDirectory()
-      if (!dir) return
-      writeRecentProject(dir)
-      if (!eng) {
-        const d = await window.talos.getDaemon()
-        await startEngine(d.wsURL, d.token, d.version)
-        return
-      }
-      const created = (await eng.request('daemon.createSession', { dir })) as {
-        session?: { id?: string }
-      }
-      const id = created?.session?.id
-      if (!id) {
-        setError('failed to create session')
-        return
-      }
-      await attachSession(eng, id)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+  // Ctrl/Cmd+1..9 focus nth session in flattened list.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return
+      if (e.key < '1' || e.key > '9') return
+      e.preventDefault()
+      const idx = Number(e.key) - 1
+      const flat = flattenSessions(sessionsRef.current)
+      const target = flat[idx]
+      if (!target || !engineRef.current) return
+      void focusSession(engineRef.current, target.id)
     }
-  }, [attachSession, startEngine])
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [focusSession])
 
   const handleRestartDaemon = useCallback(async () => {
     if (!window.talos) return
-    setError('restarting daemon…')
-    setVersionBanner(null)
+    setApp((a) => ({ ...a, error: 'restarting daemon…', versionBanner: null }))
     try {
       const d = await window.talos.restartDaemon()
       await startEngine(d.wsURL, d.token, d.version)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setApp((a) => ({
+        ...a,
+        error: e instanceof Error ? e.message : String(e),
+      }))
     }
   }, [startEngine])
 
+  const chat = focusedChat(app)
+  const sessionList = [...app.sessions.values()]
+  const fid = app.focusedID
+
   const handleSubmit = useCallback(
     (text: string) => {
-      engineRef.current?.submit(text, session || undefined)
+      if (!fid) return
+      engineRef.current?.submit(text, fid)
     },
-    [session],
+    [fid],
   )
 
   const handleInterrupt = useCallback(() => {
-    engineRef.current?.interrupt(session || undefined)
-  }, [session])
+    if (!fid) return
+    engineRef.current?.interrupt(fid)
+  }, [fid])
 
   const handleApprove = useCallback(() => {
-    engineRef.current?.approve(true, session || undefined)
-    setState((s) => ({ ...s, permissionRequest: null }))
-  }, [session])
+    if (!fid) return
+    engineRef.current?.approve(true, fid)
+    setApp((a) => {
+      const prev = a.transcripts.get(fid) ?? initialState()
+      return setTranscript(a, fid, { ...prev, permissionRequest: null })
+    })
+  }, [fid])
 
   const handleDeny = useCallback(() => {
-    engineRef.current?.approve(false, session || undefined)
-    setState((s) => ({ ...s, permissionRequest: null }))
-  }, [session])
+    if (!fid) return
+    engineRef.current?.approve(false, fid)
+    setApp((a) => {
+      const prev = a.transcripts.get(fid) ?? initialState()
+      return setTranscript(a, fid, { ...prev, permissionRequest: null })
+    })
+  }, [fid])
 
-  if (!connected) {
+  const handleStop = useCallback(async (id: string) => {
+    const eng = engineRef.current
+    if (!eng) return
+    try {
+      await eng.request(DaemonRPC.StopSession, { id })
+    } catch (e) {
+      setApp((a) => ({
+        ...a,
+        error: e instanceof Error ? e.message : String(e),
+      }))
+    }
+  }, [])
+
+  const handleDeleteConfirm = useCallback(async () => {
+    const target = pendingDelete
+    setPendingDelete(null)
+    if (!target) return
+    const eng = engineRef.current
+    if (!eng) return
+    try {
+      await eng.request(DaemonRPC.DeleteSession, { id: target.id })
+      if (focusedRef.current === target.id) {
+        eng.unsubscribe(target.id)
+        focusedRef.current = null
+        setApp((a) => ({ ...a, focusedID: null }))
+      }
+    } catch (e) {
+      setApp((a) => ({
+        ...a,
+        error: e instanceof Error ? e.message : String(e),
+      }))
+    }
+  }, [pendingDelete])
+
+  const handleReveal = useCallback((dir: string) => {
+    if (!dir) return
+    void window.talos?.showItemInFolder(dir)
+  }, [])
+
+  const handleCreated = useCallback(
+    (sessionID: string) => {
+      const eng = engineRef.current
+      if (!eng) return
+      void (async () => {
+        await refetchSessions(eng)
+        await focusSession(eng, sessionID)
+      })()
+    },
+    [focusSession, refetchSessions],
+  )
+
+  const deleteWarning = (() => {
+    if (!pendingDelete) return ''
+    const s = pendingDelete
+    const risky =
+      s.isolation === 'worktree' && ((s.ahead ?? 0) > 0 || !!s.dirty)
+    if (risky) {
+      return 'This worktree session has unmerged commits or dirty files. The branch may be kept if it is not fully merged.'
+    }
+    return `Delete session ${s.preview || s.id.slice(0, 8)}? This cannot be undone.`
+  })()
+
+  if (booting && !app.connected && !app.error) {
     return (
-      <div className="app">
-        {versionBanner && (
-          <div className="version-banner">
-            <span>{versionBanner}</span>
-            {window.talos && (
-              <button type="button" onClick={() => void handleRestartDaemon()}>
-                Restart daemon
-              </button>
-            )}
-          </div>
-        )}
+      <div className="app shell">
         <div className="connecting">
           <h1>talos</h1>
-          {error ? <p className="error">{error}</p> : needsProject ? null : <p>connecting…</p>}
-          {needsProject && (
-            <>
-              <p>Open a project to start a session.</p>
-              <button type="button" className="primary-btn" onClick={() => void handleOpenProject()}>
-                Open project
-              </button>
-            </>
-          )}
-          {!window.talos && !needsProject && (
-            <p className="hint">
-              Start a daemon with <code>talos serve</code>
-            </p>
-          )}
+          <p>connecting…</p>
         </div>
       </div>
     )
   }
 
   return (
-    <div className="app">
-      {versionBanner && (
+    <div className="app shell">
+      {app.versionBanner && (
         <div className="version-banner">
-          <span>{versionBanner}</span>
+          <span>{app.versionBanner}</span>
           {window.talos && (
             <button type="button" onClick={() => void handleRestartDaemon()}>
               Restart daemon
@@ -368,30 +446,85 @@ export function App() {
           )}
         </div>
       )}
-      <StatusBar
-        provider={state.provider}
-        model={state.model}
-        thinkingLevel={state.thinkingLevel}
-        permissionMode={state.permissionMode}
-        promptTokens={state.promptTokens}
-        contextLimit={state.contextLimit}
-        busy={state.busy}
-      />
-      <ChatView
-        messages={state.messages}
-        streamedText={state.streamedText}
-        streamedThinking={state.streamedThinking}
-        activeTools={state.activeTools}
-        busy={state.busy}
-      />
-      {state.permissionRequest && (
-        <PermissionPrompt
-          request={state.permissionRequest}
-          onApprove={handleApprove}
-          onDeny={handleDeny}
+      <div className="shell-body">
+        <Sidebar
+          sessions={sessionList}
+          focusedID={app.focusedID}
+          connected={app.connected}
+          daemonLabel={daemonVersion ? `v${daemonVersion}` : undefined}
+          onNewAgent={() => setShowCreate(true)}
+          onFocus={(id) => {
+            const eng = engineRef.current
+            if (eng) void focusSession(eng, id)
+          }}
+          onStop={(id) => void handleStop(id)}
+          onDelete={(id) => {
+            const s = app.sessions.get(id)
+            if (s) setPendingDelete(s)
+          }}
+          onReveal={handleReveal}
+        />
+        <main className="main-column">
+          {app.error && !fid && (
+            <div className="main-error">{app.error}</div>
+          )}
+          {!fid ? (
+            <div className="empty-main">
+              <h1>talos</h1>
+              <p>Select a session or start a new agent.</p>
+              <button type="button" className="primary-btn" onClick={() => setShowCreate(true)}>
+                New Agent
+              </button>
+              {app.error && <p className="error">{app.error}</p>}
+            </div>
+          ) : (
+            <>
+              <StatusBar
+                provider={chat.provider}
+                model={chat.model}
+                thinkingLevel={chat.thinkingLevel}
+                permissionMode={chat.permissionMode}
+                promptTokens={chat.promptTokens}
+                contextLimit={chat.contextLimit}
+                busy={chat.busy}
+              />
+              <ChatView
+                messages={chat.messages}
+                streamedText={chat.streamedText}
+                streamedThinking={chat.streamedThinking}
+                activeTools={chat.activeTools}
+                busy={chat.busy}
+              />
+              {chat.permissionRequest && (
+                <PermissionPrompt
+                  request={chat.permissionRequest}
+                  onApprove={handleApprove}
+                  onDeny={handleDeny}
+                />
+              )}
+              <Composer busy={chat.busy} onSubmit={handleSubmit} onInterrupt={handleInterrupt} />
+            </>
+          )}
+        </main>
+      </div>
+
+      {showCreate && (
+        <CreatePopover
+          engine={engineRef.current}
+          onCreated={handleCreated}
+          onClose={() => setShowCreate(false)}
         />
       )}
-      <Composer busy={state.busy} onSubmit={handleSubmit} onInterrupt={handleInterrupt} />
+      {pendingDelete && (
+        <ConfirmDialog
+          title="Delete session"
+          body={deleteWarning}
+          confirmLabel="Delete"
+          danger
+          onConfirm={() => void handleDeleteConfirm()}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </div>
   )
 }
