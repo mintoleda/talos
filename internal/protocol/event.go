@@ -145,9 +145,24 @@ type SessionStatus struct {
 // server's current turn state (busy flag, streamed text, active tools).
 // Without this, a client that attaches mid-turn sees a blank idle screen.
 type EngineSnapshot struct {
-	Busy         bool           `json:"busy"`
-	StreamedText string         `json:"streamed_text"`
-	ActiveTools  []ToolSnapshot `json:"active_tools"`
+	Busy              bool               `json:"busy"`
+	StreamedText      string             `json:"streamed_text"`
+	ActiveTools       []ToolSnapshot     `json:"active_tools"`
+	PendingPermission *PendingPermission `json:"pending_permission,omitempty"`
+}
+
+// PendingPermission describes an outstanding permission request so a newly
+// attached client can show the approval dialog.
+type PendingPermission struct {
+	ToolName string `json:"tool_name"`
+	Command  string `json:"command"`
+	Reason   string `json:"reason"`
+}
+
+// ApprovalResolved is emitted after Approve consumes a pending permission
+// request so every subscribed client can dismiss its confirmation dialog.
+type ApprovalResolved struct {
+	Approved bool `json:"approved"`
 }
 
 type ToolSnapshot struct {
@@ -175,6 +190,7 @@ func (PromptEstimate) isEvent()      {}
 func (SubagentFinished) isEvent()    {}
 func (SessionStatus) isEvent()           {}
 func (EngineSnapshot) isEvent()          {}
+func (ApprovalResolved) isEvent()        {}
 func (PermissionModeChanged) isEvent()   {}
 
 type Usage struct {
