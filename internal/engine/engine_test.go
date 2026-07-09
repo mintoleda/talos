@@ -222,6 +222,9 @@ func TestEngineResume(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
 	ns := session.NewSession(eng.cwd)
 	tx, err := session.Create(ns.Path)
 	if err != nil {
@@ -270,6 +273,9 @@ func TestEngineClose(t *testing.T) {
 func TestEngineResumeLatest(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 
 	ns := session.NewSession(eng.cwd)
 	tx, err := session.Create(ns.Path)
