@@ -24,6 +24,68 @@ func TestClientMsgMarshalInput(t *testing.T) {
 	}
 }
 
+func TestClientMsgMarshalSubscribe(t *testing.T) {
+	msg := ClientMsg{Type: "subscribe", Session: "sess-1"}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `{"type":"subscribe","session":"sess-1"}`
+	if string(data) != want {
+		t.Fatalf("golden:\n  got  %s\n  want %s", data, want)
+	}
+	var decoded ClientMsg
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Type != "subscribe" || decoded.Session != "sess-1" {
+		t.Fatalf("unexpected: %+v", decoded)
+	}
+}
+
+func TestClientMsgMarshalUnsubscribe(t *testing.T) {
+	msg := ClientMsg{Type: "unsubscribe", Session: "sess-1"}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `{"type":"unsubscribe","session":"sess-1"}`
+	if string(data) != want {
+		t.Fatalf("golden:\n  got  %s\n  want %s", data, want)
+	}
+}
+
+func TestClientMsgSessionOmittedWhenEmpty(t *testing.T) {
+	msg := ClientMsg{Type: "input", Text: "hi"}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(string(data), "session") {
+		t.Fatalf("empty session should be omitted: %s", data)
+	}
+}
+
+func TestClientMsgSessionScopedRequest(t *testing.T) {
+	msg := ClientMsg{
+		Type:    "request",
+		ID:      1,
+		Method:  "engine.stats",
+		Session: "abc",
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ClientMsg
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Session != "abc" {
+		t.Fatalf("session: got %q", decoded.Session)
+	}
+}
+
 func TestClientMsgMarshalInterrupt(t *testing.T) {
 	msg := ClientMsg{Type: "interrupt"}
 	data, err := json.Marshal(msg)
