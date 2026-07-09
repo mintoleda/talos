@@ -9,111 +9,76 @@ import (
 )
 
 func TestConfirmDialogApprovesWithY(t *testing.T) {
-	reply := make(chan bool, 1)
-	ev := protocol.PermissionRequested{ToolName: "bash", Command: "rm -rf /", Reason: "dangerous", ReplyCh: reply}
+	ev := protocol.PermissionRequested{ToolName: "bash", Command: "rm -rf /", Reason: "dangerous"}
 	d := NewConfirmDialog(ev)
-
-	// Press 'y' to approve.
-	m, _ := d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m, _ := d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
 	cd := m.(*ConfirmDialog)
-
 	if !cd.IsDismissed() {
-		t.Fatal("expected dialog dismissed after 'y'")
+		t.Fatal("expected dismissed")
 	}
 	if !cd.Approved() {
-		t.Fatal("expected approved=true")
-	}
-	select {
-	case v := <-reply:
-		if !v {
-			t.Fatal("expected reply channel to receive true")
-		}
-	default:
-		t.Fatal("expected reply on channel")
+		t.Fatal("expected approved")
 	}
 }
 
 func TestConfirmDialogDeniesWithN(t *testing.T) {
-	reply := make(chan bool, 1)
-	ev := protocol.PermissionRequested{ToolName: "bash", Command: "rm -rf /", Reason: "dangerous", ReplyCh: reply}
+	ev := protocol.PermissionRequested{ToolName: "bash", Command: "rm -rf /", Reason: "dangerous"}
 	d := NewConfirmDialog(ev)
-
-	m, _ := d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m, _ := d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
 	cd := m.(*ConfirmDialog)
-
 	if !cd.IsDismissed() {
-		t.Fatal("expected dialog dismissed after 'n'")
+		t.Fatal("expected dismissed")
 	}
 	if cd.Approved() {
-		t.Fatal("expected approved=false")
-	}
-	select {
-	case v := <-reply:
-		if v {
-			t.Fatal("expected reply channel to receive false")
-		}
-	default:
-		t.Fatal("expected reply on channel")
+		t.Fatal("expected denied")
 	}
 }
 
 func TestConfirmDialogDeniesWithEsc(t *testing.T) {
-	reply := make(chan bool, 1)
-	ev := protocol.PermissionRequested{ToolName: "bash", Reason: "dangerous", ReplyCh: reply}
+	ev := protocol.PermissionRequested{ToolName: "bash", Reason: "dangerous"}
 	d := NewConfirmDialog(ev)
-
 	m, _ := d.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	cd := m.(*ConfirmDialog)
-
 	if !cd.IsDismissed() {
-		t.Fatal("expected dialog dismissed after esc")
+		t.Fatal("expected dismissed")
 	}
 	if cd.Approved() {
-		t.Fatal("expected approved=false")
+		t.Fatal("expected denied")
 	}
 }
 
 func TestConfirmDialogDeniesWithQ(t *testing.T) {
-	reply := make(chan bool, 1)
-	ev := protocol.PermissionRequested{ToolName: "bash", Reason: "dangerous", ReplyCh: reply}
+	ev := protocol.PermissionRequested{ToolName: "bash", Reason: "dangerous"}
 	d := NewConfirmDialog(ev)
-
-	m, _ := d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	m, _ := d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
 	cd := m.(*ConfirmDialog)
-
 	if !cd.IsDismissed() {
-		t.Fatal("expected dialog dismissed after 'q'")
+		t.Fatal("expected dismissed")
 	}
 }
 
 func TestConfirmDialogDeniesWithCapitalN(t *testing.T) {
-	reply := make(chan bool, 1)
-	ev := protocol.PermissionRequested{ToolName: "bash", Reason: "dangerous", ReplyCh: reply}
+	ev := protocol.PermissionRequested{ToolName: "bash", Reason: "dangerous"}
 	d := NewConfirmDialog(ev)
-
-	m, _ := d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	m, _ := d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("N")})
 	cd := m.(*ConfirmDialog)
-
 	if !cd.IsDismissed() {
-		t.Fatal("expected dialog dismissed after 'N'")
+		t.Fatal("expected dismissed")
 	}
 }
 
 func TestConfirmDialogStoresSize(t *testing.T) {
 	d := NewConfirmDialog(protocol.PermissionRequested{ToolName: "bash", Reason: "test"})
-	m, _ := d.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	m, _ := d.WithSize(80, 24).Update(tea.WindowSizeMsg{Width: 100, Height: 40})
 	cd := m.(*ConfirmDialog)
-
 	if cd.width != 100 || cd.height != 40 {
-		t.Fatalf("expected width=100 height=40, got width=%d height=%d", cd.width, cd.height)
+		t.Fatalf("size not updated: %dx%d", cd.width, cd.height)
 	}
 }
 
 func TestConfirmDialogViewContainsToolName(t *testing.T) {
 	ev := protocol.PermissionRequested{ToolName: "my-tool", Command: "dangerous-cmd", Reason: "safety check"}
-	d := NewConfirmDialog(ev)
-	d.width, d.height = 80, 24
-
+	d := NewConfirmDialog(ev).WithSize(80, 24)
 	view := d.View()
 	if !contains(view, "my-tool") {
 		t.Fatal("view should contain tool name")

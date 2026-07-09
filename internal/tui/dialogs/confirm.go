@@ -38,15 +38,9 @@ func (d *ConfirmDialog) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "y", "Y":
 			d.approved = true
 			d.dismissed = true
-			if d.ev.ReplyCh != nil {
-				d.ev.ReplyCh <- true
-			}
 		case "n", "N", "esc", "q":
 			d.approved = false
 			d.dismissed = true
-			if d.ev.ReplyCh != nil {
-				d.ev.ReplyCh <- false
-			}
 		}
 	}
 	return d, nil
