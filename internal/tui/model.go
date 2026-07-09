@@ -264,6 +264,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.dialog != nil {
 		newDlg, cmd := m.dialog.Update(msg)
 		if d, ok := newDlg.(dialog); ok && d.IsDismissed() {
+			if cd, ok := d.(*dialogs.ConfirmDialog); ok && m.cfg.Engine != nil {
+				m.cfg.Engine.Approve(cd.Approved(), nil)
+			}
 			m.dialog = nil
 		} else {
 			m.dialog = newDlg
@@ -1251,6 +1254,10 @@ func (m Model) handleEvent(e protocol.Event) Model {
 		m.relayout()
 	case protocol.PermissionRequested:
 		m.dialog = dialogs.NewConfirmDialog(ev).WithSize(m.width, m.height)
+	case protocol.ApprovalResolved:
+		if _, ok := m.dialog.(*dialogs.ConfirmDialog); ok {
+			m.dialog = nil
+		}
 	case protocol.EngineSnapshot:
 		// Newly-attached client syncing with a server that is mid-turn.
 		m.busy = ev.Busy
@@ -1272,7 +1279,14 @@ func (m Model) handleEvent(e protocol.Event) Model {
 			m.toolNames[t.ID] = t.Name
 			m.toolArgs[t.ID] = t.Args
 		}
-		if ev.Busy || len(ev.ActiveTools) > 0 {
+		if ev.PendingPermission != nil {
+			m.dialog = dialogs.NewConfirmDialog(protocol.PermissionRequested{
+				ToolName: ev.PendingPermission.ToolName,
+				Command:  ev.PendingPermission.Command,
+				Reason:   ev.PendingPermission.Reason,
+			}).WithSize(m.width, m.height)
+		}
+		if ev.Busy || len(ev.ActiveTools) > 0 || ev.PendingPermission != nil {
 			m.relayout()
 		}
 	case protocol.SubagentStarted:

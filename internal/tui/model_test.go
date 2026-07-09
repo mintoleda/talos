@@ -21,13 +21,16 @@ type fakeEngine struct {
 	events      chan protocol.Event
 	steer       [][]protocol.ContentBlock
 	submissions [][]protocol.ContentBlock
+	approvals   []bool
 }
 
 func (e *fakeEngine) Submit(blocks []protocol.ContentBlock) {
 	e.submissions = append(e.submissions, blocks)
 }
-func (e *fakeEngine) Interrupt()                           {}
-func (e *fakeEngine) Approve(bool, []byte)                 {}
+func (e *fakeEngine) Interrupt() {}
+func (e *fakeEngine) Approve(ok bool, _ []byte) {
+	e.approvals = append(e.approvals, ok)
+}
 func (e *fakeEngine) Steer(blocks []protocol.ContentBlock) { e.steer = append(e.steer, blocks) }
 func (e *fakeEngine) WithdrawSteer() []protocol.ContentBlock {
 	n := len(e.steer)
@@ -175,33 +178,27 @@ func TestPromptBoxWrapKeystrokeByKeystroke(t *testing.T) {
 }
 
 func TestModelShowsConfirmDialog(t *testing.T) {
-	m := NewModel(Config{SessionID: "test", Mode: ModeSingleAgent})
+	eng := &fakeEngine{}
+	m := NewModel(Config{SessionID: "test", Mode: ModeSingleAgent, Engine: eng})
 	m.width, m.height = 80, 24
 	m.relayout()
 
-	reply := make(chan bool, 1)
 	m2, _ := m.Update(EventMsg{E: protocol.PermissionRequested{
 		ToolName: "bash",
 		Reason:   "dangerous",
-		ReplyCh:  reply,
 	}})
 	m3 := m2.(Model)
 	if m3.dialog == nil {
 		t.Fatal("expected dialog to be set")
 	}
-	// Approve with 'y'.
+	// Approve with 'y' — should call Engine.Approve, not ReplyCh.
 	m4, _ := m3.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	m5 := m4.(Model)
 	if m5.dialog != nil {
 		t.Fatal("expected dialog dismissed")
 	}
-	select {
-	case v := <-reply:
-		if !v {
-			t.Fatal("expected approved=true")
-		}
-	default:
-		t.Fatal("expected reply on channel")
+	if len(eng.approvals) != 1 || !eng.approvals[0] {
+		t.Fatalf("expected Engine.Approve(true), got %v", eng.approvals)
 	}
 }
 
