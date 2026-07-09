@@ -458,10 +458,17 @@ func (d *Daemon) handleDaemonRPC(ctx context.Context, method string, params json
 		return nil, d.manager.Delete(p.ID)
 	case rpc.DaemonStatus:
 		return json.Marshal(rpc.DaemonStatusResult{
-			Version:  version.VERSION,
-			Uptime:   int64(time.Since(d.startedAt).Seconds()),
-			Sessions: d.manager.LiveCount(),
+			Version:         version.VERSION,
+			Uptime:          int64(time.Since(d.startedAt).Seconds()),
+			Sessions:        d.manager.LiveCount(),
+			OrphanWorktrees: d.manager.OrphanWorktrees(),
 		})
+	case rpc.DaemonGCWorktrees:
+		removed, err := d.manager.GCWorktrees()
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(rpc.GCWorktreesResult{Removed: removed})
 	default:
 		return nil, fmt.Errorf("unknown method: %s", method)
 	}
