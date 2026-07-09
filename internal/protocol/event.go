@@ -131,6 +131,16 @@ type ThinkingDelta struct {
 	Text string `json:"text"`
 }
 
+// SessionStatus is broadcast to every connection (no subscription needed) on
+// any session state transition. It drives the multi-session sidebar cheaply
+// and never carries deltas.
+type SessionStatus struct {
+	ID      string `json:"id"`
+	State   string `json:"state"` // idle|busy|awaiting_approval|unloaded|deleted
+	Preview string `json:"preview,omitempty"`
+	Dir     string `json:"dir,omitempty"`
+}
+
 // EngineSnapshot is sent to newly-attached clients so they can sync with the
 // server's current turn state (busy flag, streamed text, active tools).
 // Without this, a client that attaches mid-turn sees a blank idle screen.
@@ -163,6 +173,7 @@ func (SubagentStarted) isEvent()     {}
 func (SubagentEvent) isEvent()       {}
 func (PromptEstimate) isEvent()      {}
 func (SubagentFinished) isEvent()    {}
+func (SessionStatus) isEvent()           {}
 func (EngineSnapshot) isEvent()          {}
 func (PermissionModeChanged) isEvent()   {}
 
