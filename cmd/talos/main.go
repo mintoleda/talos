@@ -474,7 +474,7 @@ func pickDaemonSession(ctx context.Context, conn *client.ClientConn) (string, er
 		if err != nil {
 			return "", err
 		}
-		resp, err := conn.Request(ctx, rpc.DaemonCreateSession, rpc.CreateSessionParams{Dir: cwd, Isolation: "none"})
+		resp, err := conn.Request(ctx, rpc.DaemonCreateSession, rpc.CreateSessionParams{Dir: cwd})
 		if err != nil {
 			return "", fmt.Errorf("create session: %w", err)
 		}
