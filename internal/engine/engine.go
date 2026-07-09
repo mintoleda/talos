@@ -39,6 +39,7 @@ type Params struct {
 	Model         string
 	BaseDir       string
 	CWD           string
+	ProjectDir    string // origin repo for session/memory keying; defaults to CWD
 	MCPManager    *mcp.Manager
 	AgentBuilder  *agents.Builder
 	Checkpointer  *safety.Checkpointer
@@ -75,6 +76,7 @@ type Engine struct {
 	modelName    string
 	baseDir      string
 	cwd          string
+	projectDir   string
 	mcpManager   *mcp.Manager
 	agentBuilder *agents.Builder
 	pol          *safety.Policy
@@ -142,6 +144,7 @@ func NewEngine(p Params) *Engine {
 		modelName:    p.Model,
 		baseDir:      p.BaseDir,
 		cwd:          p.CWD,
+		projectDir:   p.ProjectDir,
 		mcpManager:   p.MCPManager,
 		agentBuilder: p.AgentBuilder,
 		pol:          p.Policy,
@@ -170,6 +173,9 @@ func NewEngine(p Params) *Engine {
 	}
 	if e.baseDir == "" {
 		e.baseDir = cfg.BaseDir
+	}
+	if e.projectDir == "" {
+		e.projectDir = e.cwd
 	}
 
 	p.Loop.SteerFunc = e.sq.Drain
@@ -202,6 +208,7 @@ func (b *Built) NewEngine(ctx context.Context) *Engine {
 		Model:         b.Cfg.Model,
 		BaseDir:       b.Cfg.BaseDir,
 		CWD:           b.Dir,
+		ProjectDir:    b.ProjectDir,
 		MCPManager:    b.MCPManager,
 		AgentBuilder:  b.AgentBuilder,
 		Checkpointer:  b.Checkpointer,
@@ -557,7 +564,7 @@ func (e *Engine) trackState(inner func(protocol.Event)) func(protocol.Event) {
 }
 
 func (e *Engine) NewSession() (string, error) {
-	ns := session.NewSession(e.cwd)
+	ns := session.NewSession(e.projectDir)
 	tx, err := session.Create(ns.Path)
 	if err != nil {
 		return "", err
@@ -572,12 +579,12 @@ func (e *Engine) Resume(id string) (string, []protocol.FrozenMessage, error) {
 	var sess session.Session
 	var err error
 	if id != "" {
-		sess, err = session.OpenSession(e.cwd, id)
+		sess, err = session.OpenSession(e.projectDir, id)
 		if err != nil {
 			return "", nil, fmt.Errorf("session not found: %s", id)
 		}
 	} else {
-		sess, err = session.LatestSession(e.cwd)
+		sess, err = session.LatestSession(e.projectDir)
 		if err != nil {
 			return "", nil, err
 		}
@@ -593,7 +600,7 @@ func (e *Engine) Resume(id string) (string, []protocol.FrozenMessage, error) {
 }
 
 func (e *Engine) ListSessions() ([]dialogs.SessionEntry, error) {
-	previews, err := session.ListSessionPreviews(e.cwd)
+	previews, err := session.ListSessionPreviews(e.projectDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -608,7 +615,7 @@ func (e *Engine) ListSessions() ([]dialogs.SessionEntry, error) {
 }
 
 func (e *Engine) DeleteSession(id string) error {
-	return session.DeleteSession(e.cwd, id)
+	return session.DeleteSession(e.projectDir, id)
 }
 
 func (e *Engine) ListModels() ([]models.Entry, error) {

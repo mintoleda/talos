@@ -93,16 +93,23 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 		sess session.Session
 		err  error
 	)
+	// Transcripts are keyed by ProjectDir (origin repo), not the worktree Dir.
 	switch {
 	case o.SessionID != "":
-		sess, err = session.OpenSession(dir, o.SessionID)
+		sess, err = session.OpenSession(projectDir, o.SessionID)
+		if err != nil {
+			// Fresh create with a pre-allocated ID (worktree path allocated the ID first).
+			sess = session.SessionAt(projectDir, o.SessionID)
+			err = nil
+		}
 	case o.Continue:
-		sess, err = session.LatestSession(dir)
+		sess, err = session.LatestSession(projectDir)
+		if err != nil {
+			sess = session.NewSession(projectDir)
+			err = nil
+		}
 	default:
-		sess = session.NewSession(dir)
-	}
-	if err != nil {
-		sess = session.NewSession(dir)
+		sess = session.NewSession(projectDir)
 	}
 	if _, statErr := os.Stat(sess.Path); statErr == nil {
 		tx, err = session.Load(sess.Path)
@@ -116,14 +123,15 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 		fmt.Fprintf(os.Stderr, "[notice] repaired session: removed %d orphaned tool call(s)\n", n)
 	}
 
-	if sp, err := config.LoadProjectSystemPrompt(projectDir); err != nil {
+	// Versioned inputs load from Dir (worktree checkout).
+	if sp, err := config.LoadProjectSystemPrompt(dir); err != nil {
 		fmt.Fprintf(os.Stderr, "[warning] reading SYSTEM_PROMPT.md: %v\n", err)
 	} else if sp != "" {
 		cfg.SystemPrompt = sp
 	}
 
 	skillsDir := filepath.Join(cfg.BaseDir, "skills")
-	projectSkillsDir := filepath.Join(projectDir, ".talos", "skills")
+	projectSkillsDir := filepath.Join(dir, ".talos", "skills")
 	allSkills, err := skills.Scan([]skills.Dir{
 		{Path: skillsDir, Label: "global"},
 		{Path: projectSkillsDir, Label: "project"},
@@ -135,6 +143,7 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 		cfg.SystemPrompt += listing
 	}
 
+	// Unversioned state (memory, transcripts, read-set) keyed by ProjectDir.
 	projectID := memory.ProjectID(projectDir)
 	memStore, err := memory.Open(cfg.BaseDir, projectID)
 	if err != nil {
@@ -178,7 +187,8 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 		}()
 	}
 
-	cp := safety.NewCheckpointer(projectDir)
+	// Checkpointer operates in the session Dir (worktree), namespaced by sessionID.
+	cp := safety.NewCheckpointer(dir, sess.ID)
 
 	reads, readErr := tools.LoadReadSet(sess.Path + ".reads.json")
 	if readErr != nil {
@@ -207,13 +217,13 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 		}, cfg.SearchURL)
 		reg.Add(tools.NewSkillTool([]string{
 			filepath.Join(cfg.BaseDir, "skills"),
-			filepath.Join(projectDir, ".talos", "skills"),
+			filepath.Join(dir, ".talos", "skills"),
 		}))
 
 		if cfg.EnableSubagents {
 			agentDirs := []agents.Dir{
 				{Path: filepath.Join(cfg.BaseDir, "subagents"), Label: "global"},
-				{Path: filepath.Join(projectDir, ".talos", "subagents"), Label: "project"},
+				{Path: filepath.Join(dir, ".talos", "subagents"), Label: "project"},
 			}
 			if defs, err := agents.Load(agentDirs); err != nil {
 				fmt.Fprintf(os.Stderr, "[warning] loading agents: %v\n", err)
