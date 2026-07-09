@@ -58,14 +58,29 @@ see [docs/configuration.md](docs/configuration.md) for the full config reference
 ./talos -p "explain this repo"   # one-shot
 ./talos -c                       # continue latest session
 ./talos -r                       # pick a session to resume
-./talos server                   # run as a daemon server (background)
-./talos attach                   # attach to a running server (auto-discovers)
-./talos attach <session-id>      # attach to a specific server
-./talos server list              # list running servers
-./talos server kill <session-id> # kill a specific server
-./talos server kill-all          # kill all running servers
+./talos serve                    # multi-session daemon (foreground)
+./talos serve -d                 # multi-session daemon (background)
+./talos attach                   # attach TUI to a running daemon
+./talos attach <session-id>      # attach to a specific session
+./talos server list              # list running daemon
+./talos server kill              # kill the daemon
 ./talos server help              # show server management commands
 ```
+
+### desktop app (Electron)
+
+The React UI lives under `app/renderer` (formerly `web/`). The Electron shell
+auto-discovers or spawns `talos serve -d`, then connects over WebSocket.
+
+```bash
+make talos          # build the Go binary
+cd app && npm install
+make app-dev        # electron-vite dev (builds ./talos first)
+make app            # production renderer/main bundles → app/out/
+```
+
+`talos serve` still serves the static UI from `app/out/renderer` when present
+(browser byproduct). The daemon keeps running after you quit the Electron window.
 
 ## server / attach workflow
 
