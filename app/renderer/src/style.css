@@ -823,24 +823,37 @@ body {
 
 .composer {
   display: flex;
-  gap: 0.5rem;
-  padding: 0.55rem 0.85rem 0.7rem;
+  flex-direction: column;
+  padding: 0.55rem 0.85rem 0.65rem;
   background: var(--surface);
   border-top: 1px solid var(--border);
   flex-shrink: 0;
 }
 
+.composer-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  position: relative;
+}
+
+.composer-input-wrap {
+  position: relative;
+}
+
 .composer-input {
-  flex: 1;
-  padding: 0.5rem 0.75rem;
+  width: 100%;
+  padding: 0.55rem 0.75rem;
   background: var(--bg);
   color: var(--text);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 8px;
   font-family: var(--font);
   font-size: 0.85rem;
   resize: none;
   outline: none;
+  min-height: 2.6rem;
+  line-height: 1.45;
   transition: border-color 0.15s var(--ease-out);
 }
 
@@ -850,6 +863,274 @@ body {
 
 .composer-input::placeholder {
   color: var(--text-faint);
+}
+
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 1.75rem;
+}
+
+.composer-chips-left,
+.composer-chips-right {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  max-width: 14rem;
+  padding: 0.2rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  font-family: var(--font-ui);
+  font-size: 0.72rem;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: border-color 0.12s var(--ease-out), color 0.12s var(--ease-out), background 0.12s var(--ease-out);
+}
+
+.composer-chip:hover,
+.composer-chip.open {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.composer-chip.branch-chip {
+  cursor: default;
+  color: var(--accent);
+  border-color: rgba(212, 165, 116, 0.35);
+  background: var(--accent-soft);
+}
+
+.composer-chip.perm-chip.panic,
+.composer-chip.panic {
+  color: #fff;
+  border-color: var(--err);
+  background: rgba(224, 108, 117, 0.35);
+}
+
+.composer-chip.think-chip {
+  text-transform: lowercase;
+}
+
+.chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chip-caret {
+  opacity: 0.55;
+  font-size: 0.65rem;
+}
+
+.composer-send {
+  min-width: 2.1rem;
+  padding: 0.28rem 0.55rem;
+  font-size: 0.95rem;
+  line-height: 1;
+}
+
+.composer-dd {
+  position: relative;
+}
+
+.composer-menu,
+.composer-palette {
+  position: absolute;
+  z-index: var(--z-dropdown);
+  min-width: 12rem;
+  max-width: 22rem;
+  max-height: 16rem;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  animation: fade-rise 0.14s var(--ease-out);
+}
+
+.composer-palette {
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 4px);
+  max-width: none;
+}
+
+.model-menu,
+.perm-menu {
+  bottom: calc(100% + 4px);
+  right: 0;
+}
+
+.composer-menu-search {
+  margin: 0.4rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 0.78rem;
+  outline: none;
+}
+
+.composer-menu-search:focus {
+  border-color: var(--accent);
+}
+
+.composer-menu-scroll {
+  overflow: auto;
+  max-height: 12rem;
+  padding: 0.2rem;
+}
+
+.composer-menu-item {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.35rem 0.55rem;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.composer-menu-item:hover,
+.composer-menu-item.active {
+  background: var(--surface-hover);
+}
+
+.composer-menu-item.panic-item {
+  color: var(--err);
+  font-weight: 600;
+}
+
+.composer-menu-empty {
+  padding: 0.6rem 0.75rem;
+  color: var(--text-faint);
+  font-size: 0.78rem;
+}
+
+.composer-menu-empty.err {
+  color: var(--err);
+}
+
+.composer-menu-sep {
+  height: 1px;
+  margin: 0.25rem 0.4rem;
+  background: var(--border);
+}
+
+.composer-menu-footer {
+  border: none;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  padding: 0.4rem;
+  cursor: pointer;
+}
+
+.composer-menu-footer:hover {
+  color: var(--text);
+}
+
+.model-group-label {
+  padding: 0.35rem 0.55rem 0.15rem;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.slash-name {
+  font-family: var(--font);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.slash-local {
+  margin-left: 0.25rem;
+  font-size: 0.65rem;
+  font-weight: 500;
+  color: var(--accent);
+  font-family: var(--font-ui);
+}
+
+.slash-summary {
+  color: var(--text-faint);
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.steer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.steer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  max-width: 100%;
+  padding: 0.15rem 0.4rem;
+  border-radius: 5px;
+  border: 1px solid rgba(107, 191, 138, 0.35);
+  background: rgba(107, 191, 138, 0.1);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+
+.steer-tag {
+  color: var(--accent2);
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.62rem;
+  letter-spacing: 0.03em;
+}
+
+.steer-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 16rem;
+}
+
+.steer-x {
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 0 0.1rem;
+}
+
+.steer-x:hover {
+  color: var(--err);
 }
 
 .composer-actions {

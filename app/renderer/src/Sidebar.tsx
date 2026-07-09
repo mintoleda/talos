@@ -2,7 +2,7 @@
  * Sidebar — left rail: New Agent, session list, footer status.
  */
 
-import React from 'react'
+import React, { forwardRef } from 'react'
 import type { SessionInfo } from './protocol'
 import { SessionList } from './SessionList'
 
@@ -18,19 +18,22 @@ export type SidebarProps = {
   onReveal: (dir: string) => void
 }
 
-export function Sidebar({
-  sessions,
-  focusedID,
-  connected,
-  daemonLabel,
-  onNewAgent,
-  onFocus,
-  onStop,
-  onDelete,
-  onReveal,
-}: SidebarProps) {
+export const Sidebar = forwardRef<HTMLElement, SidebarProps>(function Sidebar(
+  {
+    sessions,
+    focusedID,
+    connected,
+    daemonLabel,
+    onNewAgent,
+    onFocus,
+    onStop,
+    onDelete,
+    onReveal,
+  },
+  ref,
+) {
   return (
-    <aside className="sidebar">
+    <aside className="sidebar" ref={ref} tabIndex={-1}>
       <div className="sidebar-header">
         <span className="sidebar-brand">talos</span>
         <button type="button" className="new-agent-btn" onClick={onNewAgent}>
@@ -56,4 +59,4 @@ export function Sidebar({
       </footer>
     </aside>
   )
-}
+})
