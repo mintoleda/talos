@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,7 +42,11 @@ func testManager(t *testing.T) (*SessionManager, string) {
 			id = fmtID(seq)
 		}
 		dir := o.Dir
-		pid := session.ProjectHash(dir)
+		projectDir := o.ProjectDir
+		if projectDir == "" {
+			projectDir = dir
+		}
+		pid := session.ProjectHash(projectDir)
 		txPath := filepath.Join(session.SessionsDir(), pid, id+".jsonl")
 		if err := os.MkdirAll(filepath.Dir(txPath), 0o755); err != nil {
 			return nil, err
@@ -58,7 +64,7 @@ func testManager(t *testing.T) (*SessionManager, string) {
 				Model:    firstNonEmpty(o.Model, cfg.Model),
 			},
 			Dir:        dir,
-			ProjectDir: o.ProjectDir,
+			ProjectDir: projectDir,
 			Session:    session.Session{ID: id, ProjectID: pid, Path: txPath},
 		}, nil
 	}
@@ -99,12 +105,15 @@ func TestSessionManagerCreateListStopResumeDelete(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
-	info, err := m.Create(ctx, rpc.CreateSessionParams{Dir: dir})
+	info, err := m.Create(ctx, rpc.CreateSessionParams{Dir: dir, Isolation: "none"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if info.ID == "" || !info.Live || info.State != "idle" {
 		t.Fatalf("unexpected info: %+v", info)
+	}
+	if info.Isolation != "none" {
+		t.Fatalf("isolation = %q, want none", info.Isolation)
 	}
 	if info.Dir != dir && info.Dir != mustAbs(t, dir) {
 		t.Fatalf("dir = %q, want %q", info.Dir, dir)
@@ -177,7 +186,7 @@ func TestSessionManagerStatusFn(t *testing.T) {
 		got <- st
 	})
 	ctx := context.Background()
-	info, err := m.Create(ctx, rpc.CreateSessionParams{Dir: t.TempDir()})
+	info, err := m.Create(ctx, rpc.CreateSessionParams{Dir: t.TempDir(), Isolation: "none"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -239,4 +248,162 @@ func mustAbs(t *testing.T, p string) string {
 		t.Fatal(err)
 	}
 	return a
+}
+
+func initGitRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-b", "main")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-m", "init")
+	return dir
+}
+
+func TestSessionManagerCreateWorktreeFallbackNone(t *testing.T) {
+	m, _ := testManager(t)
+	info, err := m.Create(context.Background(), rpc.CreateSessionParams{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Isolation != "none" {
+		t.Fatalf("expected fallback none, got %q", info.Isolation)
+	}
+}
+
+func TestSessionManagerCreateWorktree(t *testing.T) {
+	m, home := testManager(t)
+	repo := initGitRepo(t)
+	ctx := context.Background()
+
+	info, err := m.Create(ctx, rpc.CreateSessionParams{Dir: repo})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if info.Isolation != "worktree" {
+		t.Fatalf("isolation = %q", info.Isolation)
+	}
+	if info.Branch != "talos/"+info.ID {
+		t.Fatalf("branch = %q", info.Branch)
+	}
+	wantWT := filepath.Join(home, ".talos", "worktrees", session.ProjectHash(mustAbs(t, repo)), info.ID)
+	if info.Dir != wantWT {
+		t.Fatalf("dir = %q, want %q", info.Dir, wantWT)
+	}
+	if info.ProjectDir != mustAbs(t, repo) && info.ProjectDir != repo {
+		// RepoRoot may return cleaned path
+		root, _ := filepath.EvalSymlinks(mustAbs(t, repo))
+		pd, _ := filepath.EvalSymlinks(info.ProjectDir)
+		if pd != root && info.ProjectDir != mustAbs(t, repo) {
+			t.Fatalf("projectDir = %q", info.ProjectDir)
+		}
+	}
+	meta, err := FindSessionMeta(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Transcript keyed by ProjectDir, not worktree.
+	tx := filepath.Join(session.SessionsDir(), session.ProjectHash(meta.ProjectDir), info.ID+".jsonl")
+	if _, err := os.Stat(tx); err != nil {
+		t.Fatalf("transcript missing at %s: %v", tx, err)
+	}
+
+	if err := m.Delete(info.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+}
+
+func TestSessionManagerDeleteWorktreeMergedVsUnmerged(t *testing.T) {
+	m, _ := testManager(t)
+	repo := initGitRepo(t)
+	ctx := context.Background()
+
+	info, err := m.Create(ctx, rpc.CreateSessionParams{Dir: repo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Commit on worktree so branch is unmerged.
+	if err := os.WriteFile(filepath.Join(info.Dir, "extra.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run(info.Dir, "add", ".")
+	run(info.Dir, "commit", "-m", "wt")
+
+	branch := info.Branch
+	if err := m.Delete(info.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Branch should remain (unmerged).
+	cmd := exec.Command("git", "branch", "--list", branch)
+	cmd.Dir = repo
+	out, _ := cmd.CombinedOutput()
+	if strings.TrimSpace(string(out)) == "" {
+		t.Fatal("expected unmerged branch retained")
+	}
+
+	// Merged case: create, merge, delete.
+	info2, err := m.Create(ctx, rpc.CreateSessionParams{Dir: repo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run(info2.Dir, "commit", "--allow-empty", "-m", "empty")
+	run(repo, "merge", info2.Branch)
+	branch2 := info2.Branch
+	if err := m.Delete(info2.ID); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("git", "branch", "--list", branch2)
+	cmd.Dir = repo
+	out, _ = cmd.CombinedOutput()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("expected merged branch deleted, still have %q", out)
+	}
+}
+
+func TestSessionManagerOrphanGC(t *testing.T) {
+	m, home := testManager(t)
+	orphan := filepath.Join(home, ".talos", "worktrees", "deadproj", "orphansess")
+	if err := os.MkdirAll(orphan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	orphans := m.OrphanWorktrees()
+	found := false
+	for _, o := range orphans {
+		if o == orphan {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("orphan not reported: %v", orphans)
+	}
+	removed, err := m.GCWorktrees()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) == 0 {
+		t.Fatal("expected removed")
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatal("orphan dir still present")
+	}
 }

@@ -38,6 +38,7 @@ const (
 	DaemonStopSession   = "daemon.stopSession"
 	DaemonDeleteSession = "daemon.deleteSession"
 	DaemonStatus        = "daemon.status"
+	DaemonGCWorktrees   = "daemon.gcWorktrees"
 )
 
 // SessionInfo describes a live or persisted-resumable session for the
@@ -47,6 +48,9 @@ type SessionInfo struct {
 	Dir        string    `json:"dir"`         // effective cwd (worktree path if isolated)
 	ProjectDir string    `json:"project_dir"` // origin repo root
 	Isolation  string    `json:"isolation"`
+	Branch     string    `json:"branch,omitempty"`
+	Ahead      int       `json:"ahead,omitempty"`
+	Dirty      bool      `json:"dirty,omitempty"`
 	State      string    `json:"state"` // "idle"|"busy"|"awaiting_approval"|"unloaded"
 	Live       bool      `json:"live"`  // engine loaded in daemon
 	Provider   string    `json:"provider"`
@@ -81,9 +85,14 @@ type DeleteSessionDaemonParams struct {
 }
 
 type DaemonStatusResult struct {
-	Version  string `json:"version"`
-	Uptime   int64  `json:"uptime_seconds"`
-	Sessions int    `json:"sessions"`
+	Version         string   `json:"version"`
+	Uptime          int64    `json:"uptime_seconds"`
+	Sessions        int      `json:"sessions"`
+	OrphanWorktrees []string `json:"orphan_worktrees,omitempty"`
+}
+
+type GCWorktreesResult struct {
+	Removed []string `json:"removed"`
 }
 
 type ResumeParams struct {

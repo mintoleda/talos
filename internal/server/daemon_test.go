@@ -34,7 +34,10 @@ func TestDaemonHandleConnSubscribeAndRoute(t *testing.T) {
 			id = "pipe-sess"
 		}
 		builtID = id
-		pid := session.ProjectHash(o.Dir)
+		pid := session.ProjectHash(o.ProjectDir)
+		if o.ProjectDir == "" {
+			pid = session.ProjectHash(o.Dir)
+		}
 		txPath := filepath.Join(session.SessionsDir(), pid, id+".jsonl")
 		if err := os.MkdirAll(filepath.Dir(txPath), 0o755); err != nil {
 			return nil, err
@@ -77,7 +80,7 @@ func TestDaemonHandleConnSubscribeAndRoute(t *testing.T) {
 		t.Fatalf("hello = %+v", hello)
 	}
 
-	raw, _ := json.Marshal(rpc.CreateSessionParams{Dir: dir})
+	raw, _ := json.Marshal(rpc.CreateSessionParams{Dir: dir, Isolation: "none"})
 	if err := enc.Encode(transport.ClientMsg{Type: "request", ID: 1, Method: rpc.DaemonCreateSession, Params: raw}); err != nil {
 		t.Fatal(err)
 	}
