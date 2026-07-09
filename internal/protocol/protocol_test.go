@@ -67,6 +67,7 @@ func TestEventRoundTrip(t *testing.T) {
 		{"ThinkingBlock", ThinkingBlock{Text: "...thinking..."}},
 		{"ThinkingDelta", ThinkingDelta{Text: "..."}},
 		{"EngineSnapshot", EngineSnapshot{Busy: true, StreamedText: "hello", ActiveTools: []ToolSnapshot{{ID: "t1", Name: "read", Args: map[string]any{"path": "x.go"}}}}},
+		{"SessionStatus", SessionStatus{ID: "s1", State: "busy", Preview: "hello", Dir: "/tmp/proj"}},
 		{"SubagentEvent with TextDelta", SubagentEvent{ID: "s1", Agent: "scout", Inner: TextDelta{Text: "hello"}}},
 		{"SubagentEvent with ToolStarted", SubagentEvent{ID: "s1", Agent: "scout", Inner: ToolStarted{ID: "t1", Name: "read"}}},
 	}
