@@ -2,20 +2,44 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/mintoleda/talos/internal/client"
+	"github.com/mintoleda/talos/internal/client/rpc"
 	"github.com/mintoleda/talos/internal/loop"
 	"github.com/mintoleda/talos/internal/mcp"
 	"github.com/mintoleda/talos/internal/notify"
 	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/protocol"
+	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
 	"github.com/mintoleda/talos/internal/testutil"
 )
+
+// recordingProvider captures the last StreamTurn request for assertions.
+type recordingProvider struct {
+	mu   sync.Mutex
+	last protocol.Request
+	testutil.FakeProvider
+}
+
+func (r *recordingProvider) StreamTurn(ctx context.Context, req protocol.Request) (<-chan protocol.ProviderEvent, error) {
+	r.mu.Lock()
+	r.last = req
+	r.mu.Unlock()
+	return r.FakeProvider.StreamTurn(ctx, req)
+}
+
+func (r *recordingProvider) lastRequest() protocol.Request {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.last
+}
 
 func TestEngineImplementsClientEngine(t *testing.T) {
 	var _ client.Engine = (*Engine)(nil)
@@ -394,5 +418,151 @@ func TestEngineSubscribe(t *testing.T) {
 	case <-got:
 		t.Fatal("should not receive after unsubscribe")
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestListCommandsNonEmpty(t *testing.T) {
+	cmds := Commands()
+	if len(cmds) == 0 {
+		t.Fatal("expected non-empty command list")
+	}
+	names := map[string]bool{}
+	for _, c := range cmds {
+		names[c.Name] = true
+	}
+	for _, want := range []string{"/model", "/thinking", "/permission", "/panic", "/mcp", "/subagents", "/compact"} {
+		if !names[want] {
+			t.Fatalf("missing command %s", want)
+		}
+	}
+
+	eng := engineHarness(t)
+	defer eng.Close()
+	raw, err := eng.HandleRequest(context.Background(), rpc.ListCommands, nil)
+	if err != nil {
+		t.Fatalf("ListCommands RPC: %v", err)
+	}
+	var out rpc.ListCommandsResult
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(out.Commands) == 0 {
+		t.Fatal("ListCommands result empty")
+	}
+}
+
+func TestSetPermissionMode(t *testing.T) {
+	eng := engineHarness(t)
+	defer eng.Close()
+	eng.pol = safety.NewPolicy(safety.ModeAuto, eng.cwd, safety.NewClassifier(), true)
+
+	if err := eng.SetPermissionMode("ask"); err != nil {
+		t.Fatalf("SetPermissionMode: %v", err)
+	}
+	if got := eng.PermissionMode(); got != "ask" {
+		t.Fatalf("want ask, got %s", got)
+	}
+
+	params, _ := json.Marshal(rpc.SetPermissionModeParams{Mode: "auto"})
+	raw, err := eng.HandleRequest(context.Background(), rpc.SetPermissionMode, params)
+	if err != nil {
+		t.Fatalf("setPermissionMode RPC: %v", err)
+	}
+	var level rpc.LevelResult
+	if err := json.Unmarshal(raw, &level); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if level.Level != "auto" {
+		t.Fatalf("want auto, got %s", level.Level)
+	}
+}
+
+func TestSubmitTextResolvesImage(t *testing.T) {
+	tx := testutil.NewTestTranscript(t)
+	rec := &recordingProvider{}
+	exec := &testutil.FakeExecutor{}
+	pb := loop.NewPromptBuilder("system", nil, "test-model")
+	lp := loop.New(rec, exec, tx, pb)
+
+	tmpDir := t.TempDir()
+	baseDir := filepath.Join(tmpDir, ".talos")
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Minimal 1x1 PNG
+	png := []byte{
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+		0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+		0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00,
+		0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xff, 0xff, 0x3f,
+		0x00, 0x05, 0xfe, 0x02, 0xfe, 0xa7, 0x35, 0x81, 0x84, 0x00, 0x00, 0x00,
+		0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "pic.png"), png, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := NewEngine(Params{
+		Loop:          lp,
+		PromptBuilder: pb,
+		Prices:        pricing.Default,
+		Provider:      "test",
+		Model:         "test-model",
+		BaseDir:       baseDir,
+		CWD:           tmpDir,
+		Context:       context.Background(),
+	})
+	defer eng.Close()
+
+	gotUI := make(chan string, 1)
+	cancel := eng.Subscribe(func(ev protocol.Event) {
+		if ui, ok := ev.(protocol.UserInput); ok {
+			select {
+			case gotUI <- ui.Text:
+			default:
+			}
+		}
+	})
+	defer cancel()
+
+	eng.SubmitText("look @pic.png please")
+
+	select {
+	case display := <-gotUI:
+		if display != "look @pic.png please" {
+			t.Fatalf("UserInput display = %q", display)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for UserInput")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var req protocol.Request
+	for time.Now().Before(deadline) {
+		req = rec.lastRequest()
+		if len(req.Messages) > 0 || len(req.Volatile) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	var blocks []protocol.ContentBlock
+	if len(req.Volatile) > 0 {
+		blocks = req.Volatile
+	} else if len(req.Messages) > 0 {
+		blocks = req.Messages[len(req.Messages)-1].Msg.Content
+	}
+	hasImage := false
+	hasText := false
+	for _, b := range blocks {
+		if b.Type == protocol.BlockImage && b.Image != nil && b.Image.Data != "" {
+			hasImage = true
+		}
+		if b.Type == protocol.BlockText && b.Text != "" {
+			hasText = true
+		}
+	}
+	if !hasImage || !hasText {
+		t.Fatalf("expected text+image blocks in turn, got %#v", blocks)
 	}
 }

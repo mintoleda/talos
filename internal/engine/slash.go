@@ -4,11 +4,35 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/mintoleda/talos/internal/client/rpc"
 	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/provider"
 	"github.com/mintoleda/talos/internal/safety"
 )
+
+// commands is the single source of truth for slash dispatch and listCommands.
+var commands = []rpc.CommandDesc{
+	{Name: "/model", Summary: "Switch provider/model or list available models", Args: "[provider/model]"},
+	{Name: "/thinking", Summary: "Cycle thinking level"},
+	{Name: "/permission", Summary: "Cycle permission mode (auto/ask)"},
+	{Name: "/panic", Summary: "Toggle panic mode (blocks all tools)"},
+	{Name: "/mcp", Summary: "List connected MCP servers and their tools"},
+	{Name: "/subagents", Summary: "Toggle subagent delegation on/off"},
+	{Name: "/compact", Summary: "Compact conversation history", Args: "[focus]"},
+}
+
+// Commands returns the daemon-owned slash command inventory.
+func Commands() []rpc.CommandDesc {
+	out := make([]rpc.CommandDesc, len(commands))
+	copy(out, commands)
+	return out
+}
+
+// ListCommands is the engine RPC entry for the composer palette.
+func (e *Engine) ListCommands() []rpc.CommandDesc {
+	return Commands()
+}
 
 // handleSlash processes slash commands for SubmitText (daemon path).
 // Returns a notice string; may also Emit ModelChanged / PermissionModeChanged.
@@ -101,6 +125,15 @@ func (e *Engine) handleSlash(cmd string) string {
 			return "🔴 panic mode ON"
 		}
 		return "panic mode OFF — restored " + modeStr
+	case "/compact":
+		focus := ""
+		if len(parts) >= 2 {
+			focus = strings.Join(parts[1:], " ")
+		}
+		if err := e.Compact(focus); err != nil {
+			return fmt.Sprintf("compact: %v", err)
+		}
+		return "compacting…"
 	default:
 		return fmt.Sprintf("unknown command: %s", parts[0])
 	}

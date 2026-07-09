@@ -105,8 +105,21 @@ func (e *Engine) HandleRequest(ctx context.Context, method string, params json.R
 		}
 		e.Emit(protocol.PermissionModeChanged{Mode: mode})
 		return rpcResult(rpc.LevelResult{Level: mode})
+	case rpc.SetPermissionMode:
+		p, err := decodeRPC[rpc.SetPermissionModeParams](params)
+		if err != nil {
+			return nil, err
+		}
+		if err := e.SetPermissionMode(p.Mode); err != nil {
+			return nil, err
+		}
+		mode := e.PermissionMode()
+		e.Emit(protocol.PermissionModeChanged{Mode: mode})
+		return rpcResult(rpc.LevelResult{Level: mode})
 	case rpc.PermissionMode:
 		return rpcResult(rpc.LevelResult{Level: e.PermissionMode()})
+	case rpc.ListCommands:
+		return rpcResult(rpc.ListCommandsResult{Commands: e.ListCommands()})
 	case rpc.TogglePanic:
 		mode, err := e.TogglePanic()
 		if err != nil {
