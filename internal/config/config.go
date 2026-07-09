@@ -56,8 +56,9 @@ type Config struct {
 	DreamerBaseURL            string
 	DreamerAPIKey             string
 	KillBgOnInterrupt         bool
-	ServerListen              string // empty/unix default, or tcp host:port
-	ServerToken               string // auth token for network listeners
+	ServerListen              string        // empty/unix default, or tcp host:port
+	ServerToken               string        // auth token for network listeners
+	ServerIdleTimeout         time.Duration // multi-session daemon idle exit; 0 = no timeout
 
 	Notifications notify.Config // desktop notification settings
 
@@ -172,8 +173,9 @@ type fileConfig struct {
 	DreamerModel              string  `toml:"dreamer_model"`
 	DreamerBaseURL            string  `toml:"dreamer_base_url"`
 	DreamerAPIKey             string  `toml:"dreamer_api_key"`
-	ServerListen              string  `toml:"server_listen"`
-	ServerToken               string  `toml:"server_token"`
+	ServerListen      string `toml:"server_listen"`
+	ServerToken       string `toml:"server_token"`
+	ServerIdleTimeout string `toml:"server_idle_timeout"` // duration string, e.g. "30m"
 
 	Notifications *notifyFileConfig `toml:"notifications"`
 
@@ -240,8 +242,9 @@ type memoryFileConfig struct {
 }
 
 type serverFileConfig struct {
-	Listen string `toml:"listen"`
-	Token  string `toml:"token"`
+	Listen      string `toml:"listen"`
+	Token       string `toml:"token"`
+	IdleTimeout string `toml:"idle_timeout"` // duration string, e.g. "30m"
 }
 
 // notifyFileConfig mirrors the [notifications] section of config.toml.
@@ -344,6 +347,9 @@ func mergeSectionedConfig(fc *fileConfig, sc sectionedConfig) {
 	}
 	if fc.ServerToken == "" {
 		fc.ServerToken = sc.Server.Token
+	}
+	if fc.ServerIdleTimeout == "" {
+		fc.ServerIdleTimeout = sc.Server.IdleTimeout
 	}
 	if fc.Notifications == nil {
 		fc.Notifications = sc.Notifications
@@ -461,6 +467,13 @@ func loadFile(path string, cfg *Config) error {
 	}
 	if fc.ServerToken != "" {
 		cfg.ServerToken = fc.ServerToken
+	}
+	if fc.ServerIdleTimeout != "" {
+		d, err := time.ParseDuration(fc.ServerIdleTimeout)
+		if err != nil {
+			return fmt.Errorf("server idle_timeout: %w", err)
+		}
+		cfg.ServerIdleTimeout = d
 	}
 	if fc.Notifications != nil {
 		nc := notify.DefaultConfig()
