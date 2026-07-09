@@ -5,7 +5,7 @@
 // ── Transport layer ──────────────────────────────────────────────────────
 
 export interface ClientMsg {
-  type: "auth" | "input" | "steer" | "interrupt" | "approve" | "request";
+  type: "auth" | "input" | "steer" | "interrupt" | "approve" | "request" | "subscribe" | "unsubscribe";
   text?: string;
   approved?: boolean;
   plan?: unknown[];
@@ -13,18 +13,65 @@ export interface ClientMsg {
   method?: string;
   params?: unknown;
   token?: string;
+  session?: string; // target session; omit / "" = connection default
 }
 
 export interface ServerMsg {
   type: "hello" | "event" | "error" | "response";
   version?: string;
-  session?: string;
+  session?: string; // originating session for events/errors; "" on multi-session hello
   etype?: string;      // snake_case event type name
   event?: unknown;      // raw JSON object
   id?: number;
   result?: unknown;
   err?: string;
 }
+
+// ── Daemon RPC types (mirrors internal/client/rpc) ────────────────────────
+
+export interface SessionInfo {
+  id: string;
+  dir: string;
+  project_dir: string;
+  isolation: string;
+  state: "idle" | "busy" | "awaiting_approval" | "unloaded" | string;
+  live: boolean;
+  provider: string;
+  model: string;
+  preview: string;
+  created_at: string;
+  last_active: string;
+}
+
+export interface CreateSessionParams {
+  dir: string;
+  isolation?: "worktree" | "none" | string;
+  resume?: string;
+  provider?: string;
+  model?: string;
+}
+
+export interface CreateSessionResult {
+  session: SessionInfo;
+}
+
+export interface ListSessionsResult {
+  sessions: SessionInfo[];
+}
+
+export interface DaemonStatusResult {
+  version: string;
+  uptime_seconds: number;
+  sessions: number;
+}
+
+export const DaemonRPC = {
+  CreateSession: "daemon.createSession",
+  ListSessions: "daemon.listSessions",
+  StopSession: "daemon.stopSession",
+  DeleteSession: "daemon.deleteSession",
+  Status: "daemon.status",
+} as const;
 
 // ── Content blocks (message.go) ──────────────────────────────────────────
 
@@ -193,6 +240,13 @@ export interface EngineSnapshotEvent {
   streamed_text: string;
   active_tools: ToolSnapshot[];
 }
+export interface SessionStatusEvent {
+  etype: "session_status";
+  id: string;
+  state: "idle" | "busy" | "awaiting_approval" | "unloaded" | "deleted" | string;
+  preview?: string;
+  dir?: string;
+}
 export interface ToolSnapshot {
   id: string;
   name: string;
@@ -235,6 +289,7 @@ export type Event =
   | ThinkingBlockEvent
   | ThinkingDeltaEvent
   | EngineSnapshotEvent
+  | SessionStatusEvent
   | SubagentEventEvent;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
