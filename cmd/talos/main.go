@@ -576,9 +576,12 @@ func findWebDist() string {
 	}
 	dir := filepath.Dir(exe)
 	candidates := []string{
-		filepath.Join(dir, "web", "dist"),
-		filepath.Join(dir, "..", "web", "dist"),
-		filepath.Join(dir, "..", "..", "web", "dist"),
+		filepath.Join(dir, "app", "out", "renderer"),
+		filepath.Join(dir, "..", "app", "out", "renderer"),
+		filepath.Join(dir, "..", "..", "app", "out", "renderer"),
+		filepath.Join(dir, "app", "renderer", "dist"),
+		filepath.Join(dir, "..", "app", "renderer", "dist"),
+		filepath.Join(dir, "..", "..", "app", "renderer", "dist"),
 	}
 	for _, c := range candidates {
 		if info, err := os.Stat(filepath.Join(c, "index.html")); err == nil && !info.IsDir() {
