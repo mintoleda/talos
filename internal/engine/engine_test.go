@@ -1,4 +1,4 @@
-package client
+package engine
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mintoleda/talos/internal/client"
 	"github.com/mintoleda/talos/internal/loop"
 	"github.com/mintoleda/talos/internal/mcp"
 	"github.com/mintoleda/talos/internal/notify"
@@ -16,16 +17,11 @@ import (
 	"github.com/mintoleda/talos/internal/testutil"
 )
 
-// TestLocalEngineImplementsEngine ensures LocalEngine satisfies the Engine
-// interface at compile time. If LocalEngine is ever changed so it no longer
-// implements Engine, this test won't compile.
-func TestLocalEngineImplementsEngine(t *testing.T) {
-	var _ Engine = (*LocalEngine)(nil)
+func TestEngineImplementsClientEngine(t *testing.T) {
+	var _ client.Engine = (*Engine)(nil)
 }
 
-// engineHarness creates a LocalEngine wired to fakes for testing. The caller
-// must defer engine.Close().
-func engineHarness(t *testing.T) *LocalEngine {
+func engineHarness(t *testing.T) *Engine {
 	t.Helper()
 
 	tx := testutil.NewTestTranscript(t)
@@ -46,7 +42,7 @@ func engineHarness(t *testing.T) *LocalEngine {
 		t.Logf("mcp: %v", e)
 	}
 
-	eng := NewLocalEngine(Params{
+	eng := NewEngine(Params{
 		Loop:          lp,
 		PromptBuilder: pb,
 		Prices:        prices,
@@ -63,7 +59,7 @@ func engineHarness(t *testing.T) *LocalEngine {
 	return eng
 }
 
-func TestLocalEngineStats(t *testing.T) {
+func TestEngineStats(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
@@ -76,7 +72,7 @@ func TestLocalEngineStats(t *testing.T) {
 	}
 }
 
-func TestLocalEngineNewSession(t *testing.T) {
+func TestEngineNewSession(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
@@ -89,11 +85,10 @@ func TestLocalEngineNewSession(t *testing.T) {
 	}
 }
 
-func TestLocalEngineCycleThinking(t *testing.T) {
+func TestEngineCycleThinking(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	// With a fake model (unknown), all 6 levels are available.
 	level, err := eng.CycleThinking()
 	if err != nil {
 		t.Fatalf("CycleThinking: %v", err)
@@ -103,28 +98,23 @@ func TestLocalEngineCycleThinking(t *testing.T) {
 	}
 }
 
-func TestLocalEngineCurrentThinkingLevel(t *testing.T) {
+func TestEngineCurrentThinkingLevel(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	level := eng.CurrentThinkingLevel()
-	// Default is empty string for a fresh PromptBuilder.
-	_ = level
+	_ = eng.CurrentThinkingLevel()
 }
 
-func TestLocalEngineSubmitAndEvents(t *testing.T) {
+func TestEngineSubmitAndEvents(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	// Submit should not block and events channel should be open.
 	eng.Submit(protocol.TextBlocks("hello"))
 
-	// The fake provider returns no events, so the turn should end quickly.
 	select {
 	case ev := <-eng.Events():
 		switch ev.(type) {
 		case protocol.TurnEnded:
-			// Good — the fake loop finishes immediately.
 		default:
 			t.Logf("got event type %T", ev)
 		}
@@ -133,38 +123,33 @@ func TestLocalEngineSubmitAndEvents(t *testing.T) {
 	}
 }
 
-func TestLocalEngineInterrupt(t *testing.T) {
+func TestEngineInterrupt(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	// Interrupt should not panic and should be non-blocking.
 	eng.Interrupt()
-	eng.Interrupt() // double-interrupt should be safe
+	eng.Interrupt()
 }
 
-func TestLocalEngineSteer(t *testing.T) {
+func TestEngineSteer(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	// Steer enqueues a message.
 	eng.Steer(protocol.TextBlocks("steer message"))
-	// Drain it via the underlying sync queue.
 	drained := eng.sq.Drain()
 	if len(drained) != 1 {
 		t.Fatalf("expected 1 drained message, got %d", len(drained))
 	}
 }
 
-func TestLocalEngineCompact(t *testing.T) {
+func TestEngineCompact(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	// Compact should not block; with no compactor configured it still
-	// gets processed in the bg goroutine and emits an error event.
 	eng.Compact("some focus")
 }
 
-func TestLocalEngineListSessions(t *testing.T) {
+func TestEngineListSessions(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
@@ -172,13 +157,12 @@ func TestLocalEngineListSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListSessions: %v", err)
 	}
-	// Should be empty since we haven't created any sessions.
 	if len(sessions) != 0 {
 		t.Logf("expected 0 sessions, got %d", len(sessions))
 	}
 }
 
-func TestLocalEngineLoginProviders(t *testing.T) {
+func TestEngineLoginProviders(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
@@ -191,7 +175,7 @@ func TestLocalEngineLoginProviders(t *testing.T) {
 	}
 }
 
-func TestLocalEngineMCPStatus(t *testing.T) {
+func TestEngineMCPStatus(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
@@ -204,7 +188,7 @@ func TestLocalEngineMCPStatus(t *testing.T) {
 	}
 }
 
-func TestLocalEngineMCPCount(t *testing.T) {
+func TestEngineMCPCount(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
@@ -214,33 +198,30 @@ func TestLocalEngineMCPCount(t *testing.T) {
 	}
 }
 
-func TestLocalEngineDeleteSession(t *testing.T) {
+func TestEngineDeleteSession(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	// Deleting a non-existent session should return an error.
 	err := eng.DeleteSession("nonexistent-id")
 	if err == nil {
 		t.Log("DeleteSession on nonexistent id returned nil (may vary by filesystem)")
 	}
 }
 
-func TestLocalEngineLogin(t *testing.T) {
+func TestEngineLogin(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	// Writing a key should succeed.
 	err := eng.Login("test-provider", "test-key")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
 }
 
-func TestLocalEngineResume(t *testing.T) {
+func TestEngineResume(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	// Create a session manually with a persisted message so the file is on disk.
 	ns := session.NewSession(eng.cwd)
 	tx, err := session.Create(ns.Path)
 	if err != nil {
@@ -261,42 +242,35 @@ func TestLocalEngineResume(t *testing.T) {
 	}
 }
 
-func TestLocalEngineCancelSubagent(t *testing.T) {
+func TestEngineCancelSubagent(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	// CancelSubagent on a nil builder should not panic.
 	eng.CancelSubagent("nonexistent")
 }
 
-func TestLocalEngineSwitchModel(t *testing.T) {
+func TestEngineSwitchModel(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	// Without a SwitchProvider function, this should error.
+	// Without a real API key this should error; must not persist config.
 	err := eng.SwitchModel("openai", "gpt-4")
 	if err == nil {
-		t.Log("SwitchModel returned nil (acceptable if no switch function configured)")
+		t.Log("SwitchModel returned nil (acceptable if provider constructed)")
 	}
 }
 
-func TestLocalEngineClose(t *testing.T) {
+func TestEngineClose(t *testing.T) {
 	eng := engineHarness(t)
 
-	// Close should clean up without panicking.
 	eng.Close()
-
-	// Double-close should be safe.
 	eng.Close()
 }
 
-// TestLocalEngineResumeLatest tests that Resume with an empty string picks
-// the latest session.
-func TestLocalEngineResumeLatest(t *testing.T) {
+func TestEngineResumeLatest(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	// Create a session with a persisted message so it shows up as "latest".
 	ns := session.NewSession(eng.cwd)
 	tx, err := session.Create(ns.Path)
 	if err != nil {
@@ -315,9 +289,7 @@ func TestLocalEngineResumeLatest(t *testing.T) {
 	_ = history
 }
 
-// TestLocalEngineListModels tests that ListModels returns at least zero
-// results without error.
-func TestLocalEngineListModels(t *testing.T) {
+func TestEngineListModels(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
@@ -325,34 +297,96 @@ func TestLocalEngineListModels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListModels: %v", err)
 	}
-	// With no real API keys configured, this returns empty slice — not an error.
 	_ = models
 }
 
-// TestLocalEngineSubmitClosed ensures Submit doesn't deadlock after Close.
-func TestLocalEngineSubmitClosed(t *testing.T) {
+func TestEngineSubmitClosed(t *testing.T) {
 	eng := engineHarness(t)
 	eng.Close()
 
-	// Must not block.
 	eng.Submit(protocol.TextBlocks("hello"))
 }
 
-// TestLocalEngineInterruptClosed ensures Interrupt doesn't deadlock after Close.
-func TestLocalEngineInterruptClosed(t *testing.T) {
+func TestEngineInterruptClosed(t *testing.T) {
 	eng := engineHarness(t)
 	eng.Close()
 
 	eng.Interrupt()
 }
 
-// TestLocalEngineEventsClosed ensures Events returns a closed channel after Close.
-func TestLocalEngineEventsClosed(t *testing.T) {
+func TestEngineEventsClosed(t *testing.T) {
 	eng := engineHarness(t)
 	eng.Close()
 
 	_, ok := <-eng.Events()
 	if ok {
 		t.Fatal("expected closed event channel after Close")
+	}
+}
+
+func TestEngineApprovePending(t *testing.T) {
+	eng := engineHarness(t)
+	defer eng.Close()
+
+	reply := make(chan bool, 1)
+	eng.setPending(pendingApproval{
+		reply: func(ok bool, _ []byte) {
+			reply <- ok
+		},
+		toolName: "bash",
+		command:  "ls",
+		reason:   "ask",
+	})
+
+	snap := eng.Snapshot()
+	if snap.PendingPermission == nil || snap.PendingPermission.ToolName != "bash" {
+		t.Fatalf("expected pending permission in snapshot, got %+v", snap.PendingPermission)
+	}
+
+	eng.Approve(true, nil)
+	select {
+	case ok := <-reply:
+		if !ok {
+			t.Fatal("expected approved")
+		}
+	default:
+		t.Fatal("expected reply")
+	}
+
+	// Second Approve is a no-op (first-wins).
+	eng.Approve(false, nil)
+
+	snap = eng.Snapshot()
+	if snap.PendingPermission != nil {
+		t.Fatal("expected pending cleared")
+	}
+}
+
+func TestEngineSubscribe(t *testing.T) {
+	eng := engineHarness(t)
+	defer eng.Close()
+
+	got := make(chan protocol.Event, 1)
+	cancel := eng.Subscribe(func(ev protocol.Event) {
+		select {
+		case got <- ev:
+		default:
+		}
+	})
+	eng.Emit(protocol.Notice{Level: "info", Text: "hi"})
+	select {
+	case ev := <-got:
+		if n, ok := ev.(protocol.Notice); !ok || n.Text != "hi" {
+			t.Fatalf("unexpected event: %#v", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for subscribe")
+	}
+	cancel()
+	eng.Emit(protocol.Notice{Level: "info", Text: "after"})
+	select {
+	case <-got:
+		t.Fatal("should not receive after unsubscribe")
+	case <-time.After(50 * time.Millisecond):
 	}
 }

@@ -1,8 +1,8 @@
 // Package client defines the client-facing Engine interface that abstracts
 // over local (in-process) and remote (server-attach) loop interaction.
 //
-// Step 2 of the engine seam refactor: introduce the interface and a LocalEngine
-// implementation. The TUI still uses Config directly; step 3 switches it over.
+// The concrete local implementation lives in internal/engine; this package
+// keeps the TUI-facing interface and RemoteEngine.
 package client
 
 import (
@@ -12,7 +12,7 @@ import (
 )
 
 // Engine captures every capability the TUI needs to drive a conversation loop.
-// LocalEngine and (future) RemoteEngine both satisfy it.
+// engine.Engine and RemoteEngine both satisfy it.
 type Engine interface {
 	// Submit sends user content blocks to the engine for processing.
 	Submit(blocks []protocol.ContentBlock)
