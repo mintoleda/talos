@@ -13,7 +13,7 @@ export class Engine {
   private closed = false;
 
   /** Callback for inbound events (TextDelta, ToolStarted, …) */
-  onEvent: ((ev: Event) => void) | null = null;
+  onEvent: ((ev: Event, session?: string) => void) | null = null;
   /** Callback when the connection drops */
   onClose: ((reason: string) => void) | null = null;
   /** Callback when the hello handshake completes */
@@ -45,7 +45,7 @@ export class Engine {
       }
 
       if (sm.type === 'error') {
-        console.error('server error:', sm.err);
+        console.error('server error:', sm.err, sm.session ? `(session ${sm.session})` : '');
         return;
       }
 
@@ -65,7 +65,7 @@ export class Engine {
       if (sm.type === 'event' && sm.etype && sm.event) {
         const raw = sm.event as Record<string, unknown>;
         raw.etype = sm.etype;
-        this.onEvent?.(raw as unknown as Event);
+        this.onEvent?.(raw as unknown as Event, sm.session);
       }
     };
 
@@ -80,32 +80,42 @@ export class Engine {
     };
   }
 
+  /** Start receiving a session's full event stream (snapshot + history first). */
+  subscribe(session: string) {
+    this.sendRaw({ type: 'subscribe', session });
+  }
+
+  /** Stop the full event stream for a session (SessionStatus still arrives). */
+  unsubscribe(session: string) {
+    this.sendRaw({ type: 'unsubscribe', session });
+  }
+
   /** Submit user text as a new turn. */
-  submit(text: string) {
-    this.sendRaw({ type: 'input', text });
+  submit(text: string, session?: string) {
+    this.sendRaw({ type: 'input', text, session });
   }
 
   /** Interrupt the current turn. */
-  interrupt() {
-    this.sendRaw({ type: 'interrupt' });
+  interrupt(session?: string) {
+    this.sendRaw({ type: 'interrupt', session });
   }
 
   /** Approve or deny a permission request. */
-  approve(ok: boolean) {
-    this.sendRaw({ type: 'approve', approved: ok });
+  approve(ok: boolean, session?: string) {
+    this.sendRaw({ type: 'approve', approved: ok, session });
   }
 
   /** Send a steer message (text typed while busy). */
-  steer(text: string) {
-    this.sendRaw({ type: 'steer', text });
+  steer(text: string, session?: string) {
+    this.sendRaw({ type: 'steer', text, session });
   }
 
   /** Call an RPC method and await the result. */
-  async request(method: string, params?: unknown): Promise<unknown> {
+  async request(method: string, params?: unknown, session?: string): Promise<unknown> {
     const id = this.nextID++;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      this.sendRaw({ type: 'request', id, method, params });
+      this.sendRaw({ type: 'request', id, method, params, session });
       setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
