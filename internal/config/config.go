@@ -58,7 +58,8 @@ type Config struct {
 	KillBgOnInterrupt         bool
 	ServerListen              string        // empty/unix default, or tcp host:port
 	ServerToken               string        // auth token for network listeners
-	ServerIdleTimeout         time.Duration // multi-session daemon idle exit; 0 = no timeout
+	ServerIdleTimeout         time.Duration // multi-session daemon idle exit; 0 = no timeout when set
+	ServerIdleTimeoutSet      bool          // true when server_idle_timeout was present in config
 
 	Notifications notify.Config // desktop notification settings
 
@@ -474,6 +475,7 @@ func loadFile(path string, cfg *Config) error {
 			return fmt.Errorf("server idle_timeout: %w", err)
 		}
 		cfg.ServerIdleTimeout = d
+		cfg.ServerIdleTimeoutSet = true
 	}
 	if fc.Notifications != nil {
 		nc := notify.DefaultConfig()
