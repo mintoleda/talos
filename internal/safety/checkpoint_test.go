@@ -29,7 +29,7 @@ func initRepo(t *testing.T) string {
 
 func TestCheckpointSnapshotRestore(t *testing.T) {
 	repo := initRepo(t)
-	cp := NewCheckpointer(repo)
+	cp := NewCheckpointer(repo, "")
 
 	os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("v2\n"), 0o644)
 	os.WriteFile(filepath.Join(repo, "untracked.txt"), []byte("new\n"), 0o644)
@@ -73,5 +73,44 @@ func TestCheckpointSnapshotRestore(t *testing.T) {
 	}
 	if len(refs) != 1 || refs[0] != ref {
 		t.Fatalf("expected exactly the one checkpoint ref, got %v", refs)
+	}
+}
+
+func TestCheckpointSessionNamespace(t *testing.T) {
+	repo := initRepo(t)
+	a := NewCheckpointer(repo, "sess-a")
+	b := NewCheckpointer(repo, "sess-b")
+
+	os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("a\n"), 0o644)
+	refA, err := a.Snapshot("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(refA, "refs/checkpoints/sess-a/") {
+		t.Fatalf("refA = %s", refA)
+	}
+
+	os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("b\n"), 0o644)
+	refB, err := b.Snapshot("b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(refB, "refs/checkpoints/sess-b/") {
+		t.Fatalf("refB = %s", refB)
+	}
+
+	listA, err := a.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listB, err := b.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listA) != 1 || listA[0] != refA {
+		t.Fatalf("listA = %v", listA)
+	}
+	if len(listB) != 1 || listB[0] != refB {
+		t.Fatalf("listB = %v", listB)
 	}
 }

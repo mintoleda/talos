@@ -9,11 +9,22 @@ import (
 )
 
 type Checkpointer struct {
-	repo string
+	repo      string
+	sessionID string
 }
 
-func NewCheckpointer(repo string) *Checkpointer {
-	return &Checkpointer{repo: repo}
+// NewCheckpointer creates a checkpointer for repo, namespaced by sessionID.
+// Refs are written as refs/checkpoints/<sessionID>/<ts>. When sessionID is
+// empty, refs use the legacy refs/checkpoints/<ts> form for back-compat.
+func NewCheckpointer(repo, sessionID string) *Checkpointer {
+	return &Checkpointer{repo: repo, sessionID: sessionID}
+}
+
+func (c *Checkpointer) refPrefix() string {
+	if c.sessionID == "" {
+		return "refs/checkpoints/"
+	}
+	return "refs/checkpoints/" + c.sessionID + "/"
 }
 
 func (c *Checkpointer) Snapshot(label string) (string, error) {
@@ -52,7 +63,7 @@ func (c *Checkpointer) Snapshot(label string) (string, error) {
 	}
 	commit = strings.TrimSpace(commit)
 
-	ref := "refs/checkpoints/" + time.Now().UTC().Format("20060102T150405Z")
+	ref := c.refPrefix() + time.Now().UTC().Format("20060102T150405Z")
 	if _, err = git("update-ref", ref, commit); err != nil {
 		return "", err
 	}
@@ -65,7 +76,7 @@ func (c *Checkpointer) Restore(ref string) error {
 }
 
 func (c *Checkpointer) List() ([]string, error) {
-	out, err := runGit(c.repo, os.Environ(), "for-each-ref", "--format=%(refname)", "refs/checkpoints/")
+	out, err := runGit(c.repo, os.Environ(), "for-each-ref", "--format=%(refname)", c.refPrefix())
 	if err != nil {
 		return nil, err
 	}
@@ -73,9 +84,17 @@ func (c *Checkpointer) List() ([]string, error) {
 	var refs []string
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line != "" {
-			refs = append(refs, line)
+		if line == "" {
+			continue
 		}
+		// When sessionID is empty, exclude namespaced refs (sessionID/ts).
+		if c.sessionID == "" {
+			rest := strings.TrimPrefix(line, "refs/checkpoints/")
+			if strings.Contains(rest, "/") {
+				continue
+			}
+		}
+		refs = append(refs, line)
 	}
 	return refs, nil
 }
