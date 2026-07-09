@@ -1,4 +1,4 @@
-package server
+package client
 
 import (
 	"context"
@@ -16,11 +16,13 @@ import (
 	"github.com/mintoleda/talos/internal/version"
 )
 
+// ClientConn is a JSON-line connection to a talos server/daemon.
 type ClientConn struct {
 	enc     *json.Encoder
 	dec     *json.Decoder
 	writeMu sync.Mutex
 	nextID  atomic.Uint64
+	Session string // stamped on every outbound ClientMsg when non-empty
 
 	pendingMu sync.Mutex
 	pending   map[uint64]chan response
@@ -34,25 +36,37 @@ type response struct {
 func (c *ClientConn) Send(text string) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.enc.Encode(transport.ClientMsg{Type: "input", Text: text})
+	return c.enc.Encode(transport.ClientMsg{Type: "input", Text: text, Session: c.Session})
 }
 
 func (c *ClientConn) Steer(text string) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.enc.Encode(transport.ClientMsg{Type: "steer", Text: text})
+	return c.enc.Encode(transport.ClientMsg{Type: "steer", Text: text, Session: c.Session})
 }
 
 func (c *ClientConn) Interrupt() error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.enc.Encode(transport.ClientMsg{Type: "interrupt"})
+	return c.enc.Encode(transport.ClientMsg{Type: "interrupt", Session: c.Session})
 }
 
 func (c *ClientConn) Approve(ok bool, plan []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.enc.Encode(transport.ClientMsg{Type: "approve", Approved: ok, Plan: plan})
+	return c.enc.Encode(transport.ClientMsg{Type: "approve", Approved: ok, Plan: plan, Session: c.Session})
+}
+
+func (c *ClientConn) Subscribe(session string) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.enc.Encode(transport.ClientMsg{Type: "subscribe", Session: session})
+}
+
+func (c *ClientConn) Unsubscribe(session string) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.enc.Encode(transport.ClientMsg{Type: "unsubscribe", Session: session})
 }
 
 func (c *ClientConn) Request(ctx context.Context, method string, params any) (json.RawMessage, error) {
@@ -69,7 +83,7 @@ func (c *ClientConn) Request(ctx context.Context, method string, params any) (js
 	c.pendingMu.Unlock()
 
 	c.writeMu.Lock()
-	err = c.enc.Encode(transport.ClientMsg{Type: "request", ID: id, Method: method, Params: raw})
+	err = c.enc.Encode(transport.ClientMsg{Type: "request", ID: id, Method: method, Params: raw, Session: c.Session})
 	c.writeMu.Unlock()
 	if err != nil {
 		c.removePending(id)
@@ -105,34 +119,30 @@ func (c *ClientConn) handleResponse(sm transport.ServerMsg) {
 	ch <- response{result: sm.Result, err: sm.Err}
 }
 
-// RunClient connects to a talos server over a Unix socket and returns a
-// ClientConn plus a channel of server events. The caller should:
-//  1. Start a Bubble Tea program.
-//  2. Forward events from the returned channel to p.Send(...).
-//  3. Wire the ClientConn's Send/Interrupt methods into the TUI model.
-//
-// The event channel is closed when the server disconnects.
+// RunClient connects to a talos server over a Unix socket.
 func RunClient(ctx context.Context, sockPath string) (*ClientConn, <-chan protocol.Event, error) {
 	return RunClientNetwork(ctx, "unix", sockPath, "")
 }
 
+// RunClientNetwork dials network/address (unix or tcp).
 func RunClientNetwork(ctx context.Context, network, address, token string) (*ClientConn, <-chan protocol.Event, error) {
 	conn, err := net.Dial(network, address)
 	if err != nil {
-		return nil, nil, fmt.Errorf("no server at %s — start with 'talos --server': %w", address, err)
+		return nil, nil, fmt.Errorf("no daemon at %s — start with 'talos serve': %w", address, err)
 	}
-	return runClientConn(ctx, conn, address, token)
+	return runClientConn(ctx, conn, token)
 }
 
+// RunClientWebSocket dials a websocket URL.
 func RunClientWebSocket(ctx context.Context, url, token string) (*ClientConn, <-chan protocol.Event, error) {
 	conn, err := websocket.Dial(url, "", "http://localhost/")
 	if err != nil {
 		return nil, nil, fmt.Errorf("no websocket server at %s: %w", url, err)
 	}
-	return runClientConn(ctx, conn, url, token)
+	return runClientConn(ctx, conn, token)
 }
 
-func runClientConn(ctx context.Context, conn net.Conn, address, token string) (*ClientConn, <-chan protocol.Event, error) {
+func runClientConn(ctx context.Context, conn net.Conn, token string) (*ClientConn, <-chan protocol.Event, error) {
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
 
@@ -171,7 +181,7 @@ func runClientConn(ctx context.Context, conn net.Conn, address, token string) (*
 			if sm.Type != "event" {
 				continue
 			}
-			ev, err := decodeEvent(sm)
+			ev, err := protocol.UnmarshalEvent(sm.EType, sm.Event)
 			if err != nil {
 				continue
 			}
@@ -184,8 +194,4 @@ func runClientConn(ctx context.Context, conn net.Conn, address, token string) (*
 	}()
 
 	return cc, events, nil
-}
-
-func decodeEvent(sm transport.ServerMsg) (protocol.Event, error) {
-	return protocol.UnmarshalEvent(sm.EType, sm.Event)
 }

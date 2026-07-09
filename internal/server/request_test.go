@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mintoleda/talos/internal/client"
 )
 
 func TestClientRequestEcho(t *testing.T) {
@@ -104,7 +106,7 @@ func TestServerRequestUnknownWithoutHandler(t *testing.T) {
 	}
 }
 
-func startRequestServer(t *testing.T, h RequestHandler) (*ClientConn, context.CancelFunc) {
+func startRequestServer(t *testing.T, h RequestHandler) (*client.ClientConn, context.CancelFunc) {
 	t.Helper()
 	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "request.sock")
@@ -128,7 +130,7 @@ func startRequestServer(t *testing.T, h RequestHandler) (*ClientConn, context.Ca
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	conn, _, err := RunClient(context.Background(), sockPath)
+	conn, _, err := client.RunClient(context.Background(), sockPath)
 	if err != nil {
 		cancel()
 		t.Fatalf("run client: %v", err)
