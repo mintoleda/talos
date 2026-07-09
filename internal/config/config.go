@@ -187,6 +187,7 @@ type sectionedConfig struct {
 	Agent         agentFileConfig      `toml:"agent"`
 	Compaction    compactionFileConfig `toml:"compaction"`
 	Memory        memoryFileConfig     `toml:"memory"`
+	Server        serverFileConfig     `toml:"server"`
 	Notifications *notifyFileConfig    `toml:"notifications"`
 	MCPServers    []mcp.ServerConfig   `toml:"mcp_servers"`
 }
@@ -236,6 +237,11 @@ type memoryFileConfig struct {
 	DreamerModel      string `toml:"dreamer_model"`
 	DreamerBaseURL    string `toml:"dreamer_base_url"`
 	DreamerAPIKey     string `toml:"dreamer_api_key"`
+}
+
+type serverFileConfig struct {
+	Listen string `toml:"listen"`
+	Token  string `toml:"token"`
 }
 
 // notifyFileConfig mirrors the [notifications] section of config.toml.
@@ -332,6 +338,12 @@ func mergeSectionedConfig(fc *fileConfig, sc sectionedConfig) {
 	}
 	if fc.DreamerAPIKey == "" {
 		fc.DreamerAPIKey = sc.Memory.DreamerAPIKey
+	}
+	if fc.ServerListen == "" {
+		fc.ServerListen = sc.Server.Listen
+	}
+	if fc.ServerToken == "" {
+		fc.ServerToken = sc.Server.Token
 	}
 	if fc.Notifications == nil {
 		fc.Notifications = sc.Notifications
