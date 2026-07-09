@@ -51,6 +51,10 @@ export function App() {
   const [pendingDelete, setPendingDelete] = useState<SessionInfo | null>(null)
   const [daemonVersion, setDaemonVersion] = useState('')
   const [booting, setBooting] = useState(true)
+  const [steerClearSignal, setSteerClearSignal] = useState(0)
+  const [stats, setStats] = useState<{ input: number; output: number; cost: number } | null>(null)
+  const sidebarRef = useRef<HTMLElement | null>(null)
+  const wasBusyRef = useRef(false)
 
   useEffect(() => {
     focusedRef.current = app.focusedID
@@ -329,6 +333,7 @@ export function App() {
   const chat = focusedChat(app)
   const sessionList = [...app.sessions.values()]
   const fid = app.focusedID
+  const focusedSession = fid ? app.sessions.get(fid) ?? null : null
 
   const handleSubmit = useCallback(
     (text: string) => {
@@ -338,10 +343,59 @@ export function App() {
     [fid],
   )
 
+  const handleSteer = useCallback(
+    (text: string) => {
+      if (!fid) return
+      engineRef.current?.steer(text, fid)
+    },
+    [fid],
+  )
+
+  const handleWithdrawSteer = useCallback(() => {
+    if (!fid) return
+    void engineRef.current?.request('engine.withdrawSteer', undefined, fid)
+  }, [fid])
+
   const handleInterrupt = useCallback(() => {
     if (!fid) return
     engineRef.current?.interrupt(fid)
   }, [fid])
+
+  const handleLocalCommand = useCallback((name: string) => {
+    if (name === '/new') {
+      setShowCreate(true)
+      return
+    }
+    if (name === '/sessions') {
+      sidebarRef.current?.focus()
+      const first = sidebarRef.current?.querySelector<HTMLElement>('.session-row, .new-agent-btn')
+      first?.focus()
+    }
+  }, [])
+
+  // Clear steer chips when turn ends; refresh stats.
+  useEffect(() => {
+    const busy = chat.busy
+    if (wasBusyRef.current && !busy) {
+      setSteerClearSignal((n) => n + 1)
+      const eng = engineRef.current
+      const sid = focusedRef.current
+      if (eng && sid) {
+        void eng
+          .request('engine.stats', undefined, sid)
+          .then((raw) => {
+            const r = raw as { input?: number; output?: number; cost?: number }
+            setStats({
+              input: r.input ?? 0,
+              output: r.output ?? 0,
+              cost: r.cost ?? 0,
+            })
+          })
+          .catch(() => {})
+      }
+    }
+    wasBusyRef.current = busy
+  }, [chat.busy])
 
   const handleApprove = useCallback(() => {
     if (!fid) return
@@ -448,6 +502,7 @@ export function App() {
       )}
       <div className="shell-body">
         <Sidebar
+          ref={sidebarRef}
           sessions={sessionList}
           focusedID={app.focusedID}
           connected={app.connected}
@@ -487,6 +542,7 @@ export function App() {
                 promptTokens={chat.promptTokens}
                 contextLimit={chat.contextLimit}
                 busy={chat.busy}
+                stats={stats}
               />
               <ChatView
                 messages={chat.messages}
@@ -502,7 +558,22 @@ export function App() {
                   onDeny={handleDeny}
                 />
               )}
-              <Composer busy={chat.busy} onSubmit={handleSubmit} onInterrupt={handleInterrupt} />
+              <Composer
+                busy={chat.busy}
+                session={focusedSession}
+                provider={chat.provider || focusedSession?.provider || ''}
+                model={chat.model || focusedSession?.model || ''}
+                thinkingLevel={chat.thinkingLevel}
+                permissionMode={chat.permissionMode}
+                engine={engineRef.current}
+                sessionId={fid}
+                onSubmit={handleSubmit}
+                onSteer={handleSteer}
+                onWithdrawSteer={handleWithdrawSteer}
+                onInterrupt={handleInterrupt}
+                onLocalCommand={handleLocalCommand}
+                steerClearSignal={steerClearSignal}
+              />
             </>
           )}
         </main>

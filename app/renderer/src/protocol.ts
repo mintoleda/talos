@@ -92,6 +92,60 @@ export const DaemonRPC = {
   ProbeDir: "daemon.probeDir",
 } as const;
 
+export const EngineRPC = {
+  ListModels: "engine.listModels",
+  SwitchModel: "engine.switchModel",
+  CycleThinking: "engine.cycleThinking",
+  CurrentThinking: "engine.currentThinking",
+  CyclePermissionMode: "engine.cyclePermissionMode",
+  SetPermissionMode: "engine.setPermissionMode",
+  PermissionMode: "engine.permissionMode",
+  TogglePanic: "engine.togglePanic",
+  WithdrawSteer: "engine.withdrawSteer",
+  Compact: "engine.compact",
+  Stats: "engine.stats",
+  ListFiles: "engine.listFiles",
+  ResolveInput: "engine.resolveInput",
+  ListCommands: "engine.listCommands",
+  History: "engine.history",
+  MCPCount: "engine.mcpCount",
+} as const;
+
+export interface CommandDesc {
+  name: string;
+  summary: string;
+  args?: string;
+  local?: boolean;
+}
+
+export interface ListCommandsResult {
+  commands: CommandDesc[];
+}
+
+export interface ModelEntry {
+  Provider: string;
+  ID: string;
+}
+
+export interface ModelsResult {
+  models: ModelEntry[];
+}
+
+export interface ListFilesResult {
+  files: string[];
+}
+
+export interface StatsResult {
+  input: number;
+  output: number;
+  cache_miss: number;
+  cost: number;
+}
+
+export interface LevelResult {
+  level: string;
+}
+
 // ── Content blocks (message.go) ──────────────────────────────────────────
 
 export type Role = "system" | "user" | "assistant" | "tool";
