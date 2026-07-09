@@ -20,7 +20,8 @@ TODOS.md
 # Session files
 .talos/sessions/
 .talos/swarm/
-# Web frontend
-web/dist/
-web/node_modules/
+# Electron app
+app/node_modules/
+app/out/
+app/dist/
 *.tsbuildinfo
