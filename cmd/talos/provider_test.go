@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/mintoleda/talos/internal/engine"
 )
 
 func TestOpenAICompatibleBaseURLCloudflareFromAuthJSON(t *testing.T) {
@@ -12,7 +14,7 @@ func TestOpenAICompatibleBaseURLCloudflareFromAuthJSON(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "auth.json"), data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	base, err := openAICompatibleBaseURL(dir, "cloudflare", "")
+	base, err := engine.OpenAICompatibleBaseURL(dir, "cloudflare", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,7 +26,7 @@ func TestOpenAICompatibleBaseURLCloudflareFromAuthJSON(t *testing.T) {
 
 func TestOpenAICompatibleBaseURLCloudflareFromEnvAccountID(t *testing.T) {
 	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "acct_env")
-	base, err := openAICompatibleBaseURL(t.TempDir(), "cloudflare", "")
+	base, err := engine.OpenAICompatibleBaseURL(t.TempDir(), "cloudflare", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +37,7 @@ func TestOpenAICompatibleBaseURLCloudflareFromEnvAccountID(t *testing.T) {
 }
 
 func TestOpenAICompatibleBaseURLCloudflareStripsV1Override(t *testing.T) {
-	base, err := openAICompatibleBaseURL(t.TempDir(), "cloudflare", "https://api.cloudflare.com/client/v4/accounts/acct_123/ai/v1")
+	base, err := engine.OpenAICompatibleBaseURL(t.TempDir(), "cloudflare", "https://api.cloudflare.com/client/v4/accounts/acct_123/ai/v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +49,7 @@ func TestOpenAICompatibleBaseURLCloudflareStripsV1Override(t *testing.T) {
 
 func TestOpenAICompatibleBaseURLCloudflareRequiresAccountID(t *testing.T) {
 	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "")
-	if _, err := openAICompatibleBaseURL(t.TempDir(), "cloudflare", ""); err == nil {
+	if _, err := engine.OpenAICompatibleBaseURL(t.TempDir(), "cloudflare", ""); err == nil {
 		t.Fatal("expected missing account id error")
 	}
 }
