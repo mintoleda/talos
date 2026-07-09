@@ -1,36 +1,90 @@
 package rpc
 
 import (
+	"time"
+
 	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/tui/dialogs"
 )
 
 const (
-	NewSession           = "engine.newSession"
-	Resume               = "engine.resume"
-	ListSessions         = "engine.listSessions"
-	DeleteSession        = "engine.deleteSession"
-	ListModels           = "engine.listModels"
-	SwitchModel          = "engine.switchModel"
-	CycleThinking        = "engine.cycleThinking"
-	CurrentThinking      = "engine.currentThinking"
-	CyclePermissionMode  = "engine.cyclePermissionMode"
-	PermissionMode       = "engine.permissionMode"
-	TogglePanic          = "engine.togglePanic"
-	WithdrawSteer        = "engine.withdrawSteer"
-	Compact              = "engine.compact"
-	Stats                = "engine.stats"
-	LoginProviders       = "engine.loginProviders"
-	Login                = "engine.login"
-	MCPStatus            = "engine.mcpStatus"
-	MCPCount             = "engine.mcpCount"
-	CancelSubagent       = "engine.cancelSubagent"
-	History              = "engine.history"
-	ListFiles            = "engine.listFiles"
-	ResolveInput         = "engine.resolveInput"
-	PushInstruction      = "engine.pushInstruction"
+	NewSession          = "engine.newSession"
+	Resume              = "engine.resume"
+	ListSessions        = "engine.listSessions"
+	DeleteSession       = "engine.deleteSession"
+	ListModels          = "engine.listModels"
+	SwitchModel         = "engine.switchModel"
+	CycleThinking       = "engine.cycleThinking"
+	CurrentThinking     = "engine.currentThinking"
+	CyclePermissionMode = "engine.cyclePermissionMode"
+	PermissionMode      = "engine.permissionMode"
+	TogglePanic         = "engine.togglePanic"
+	WithdrawSteer       = "engine.withdrawSteer"
+	Compact             = "engine.compact"
+	Stats               = "engine.stats"
+	LoginProviders      = "engine.loginProviders"
+	Login               = "engine.login"
+	MCPStatus           = "engine.mcpStatus"
+	MCPCount            = "engine.mcpCount"
+	CancelSubagent      = "engine.cancelSubagent"
+	History             = "engine.history"
+	ListFiles           = "engine.listFiles"
+	ResolveInput        = "engine.resolveInput"
+	PushInstruction     = "engine.pushInstruction"
+
+	DaemonCreateSession = "daemon.createSession"
+	DaemonListSessions  = "daemon.listSessions"
+	DaemonStopSession   = "daemon.stopSession"
+	DaemonDeleteSession = "daemon.deleteSession"
+	DaemonStatus        = "daemon.status"
 )
+
+// SessionInfo describes a live or persisted-resumable session for the
+// multi-session daemon sidebar and session picker.
+type SessionInfo struct {
+	ID         string    `json:"id"`
+	Dir        string    `json:"dir"`         // effective cwd (worktree path if isolated)
+	ProjectDir string    `json:"project_dir"` // origin repo root
+	Isolation  string    `json:"isolation"`
+	State      string    `json:"state"` // "idle"|"busy"|"awaiting_approval"|"unloaded"
+	Live       bool      `json:"live"`  // engine loaded in daemon
+	Provider   string    `json:"provider"`
+	Model      string    `json:"model"`
+	Preview    string    `json:"preview"` // first-user-message snippet
+	CreatedAt  time.Time `json:"created_at"`
+	LastActive time.Time `json:"last_active"`
+}
+
+type CreateSessionParams struct {
+	Dir       string `json:"dir"`                 // project dir (absolute)
+	Isolation string `json:"isolation,omitempty"` // "worktree" (default) | "none"
+	Resume    string `json:"resume,omitempty"`    // session ID to load instead of fresh
+	Provider  string `json:"provider,omitempty"`
+	Model     string `json:"model,omitempty"`
+}
+
+type CreateSessionResult struct {
+	Session SessionInfo `json:"session"`
+}
+
+type ListSessionsResult struct {
+	Sessions []SessionInfo `json:"sessions"` // live + persisted-resumable
+}
+
+type StopSessionParams struct {
+	ID string `json:"id"`
+}
+
+type DeleteSessionDaemonParams struct {
+	ID string `json:"id"`
+}
+
+type DaemonStatusResult struct {
+	Version  string `json:"version"`
+	Uptime   int64  `json:"uptime_seconds"`
+	Sessions int    `json:"sessions"`
+}
 
 type ResumeParams struct {
 	ID string `json:"id"`
