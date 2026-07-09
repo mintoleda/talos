@@ -181,7 +181,7 @@ func TestSessionManagerResumeRequiresID(t *testing.T) {
 
 func TestSessionManagerStatusFn(t *testing.T) {
 	m, _ := testManager(t)
-	got := make(chan protocol.SessionStatus, 4)
+	got := make(chan protocol.SessionStatus, 8)
 	m.SetStatusFn(func(st protocol.SessionStatus) {
 		got <- st
 	})
@@ -190,6 +190,16 @@ func TestSessionManagerStatusFn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+
+	select {
+	case st := <-got:
+		if st.State != "idle" || st.ID != info.ID {
+			t.Fatalf("create status = %+v", st)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for create idle")
+	}
+
 	eng, _ := m.Get(info.ID)
 	eng.Emit(protocol.SessionStatus{ID: info.ID, State: "busy", Dir: info.Dir})
 
@@ -212,6 +222,18 @@ func TestSessionManagerStatusFn(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for unloaded")
+	}
+
+	if err := m.Delete(info.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	select {
+	case st := <-got:
+		if st.State != "deleted" {
+			t.Fatalf("delete status = %+v", st)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for deleted")
 	}
 }
 

@@ -183,6 +183,7 @@ func (m *SessionManager) Create(ctx context.Context, params rpc.CreateSessionPar
 
 	eng := newEng(built, ctx)
 	m.register(eng, meta)
+	m.emitStatus(protocol.SessionStatus{ID: meta.ID, State: "idle", Dir: meta.Dir, Preview: sessionPreview(meta)})
 	if dirtyMain {
 		eng.Emit(protocol.Notice{
 			Level: "info",
@@ -217,6 +218,7 @@ func (m *SessionManager) Stop(id string) error {
 	eng.Close()
 	_ = TouchSessionMeta(id)
 
+	// statusFn already captured under lock above; call emitStatus without re-locking states.
 	if statusFn != nil {
 		statusFn(protocol.SessionStatus{ID: id, State: "unloaded", Dir: dir})
 	}
@@ -257,6 +259,7 @@ func (m *SessionManager) Delete(id string) error {
 			fmt.Fprintf(os.Stderr, "[notice] keeping branch %s (not fully merged): %v\n", branch, err)
 		}
 	}
+	m.emitStatus(protocol.SessionStatus{ID: id, State: "deleted", Dir: meta.Dir})
 	return nil
 }
 
@@ -380,6 +383,7 @@ func (m *SessionManager) Resume(ctx context.Context, id string) (*engine.Engine,
 
 	eng := newEng(built, ctx)
 	m.register(eng, meta)
+	m.emitStatus(protocol.SessionStatus{ID: id, State: "idle", Dir: meta.Dir, Preview: sessionPreview(meta)})
 	return eng, nil
 }
 
@@ -525,16 +529,23 @@ func (m *SessionManager) register(eng *engine.Engine, meta SessionMeta) {
 
 	eng.Subscribe(func(ev protocol.Event) {
 		if st, ok := ev.(protocol.SessionStatus); ok {
-			m.mu.Lock()
-			m.states[st.ID] = st.State
-			fn := m.statusFn
-			m.mu.Unlock()
-			if fn != nil {
-				fn(st)
-			}
+			m.emitStatus(st)
 			_ = TouchSessionMeta(st.ID)
 		}
 	})
+}
+
+// emitStatus broadcasts a SessionStatus via the daemon-wide hook.
+func (m *SessionManager) emitStatus(st protocol.SessionStatus) {
+	m.mu.Lock()
+	if st.State != "deleted" && st.State != "unloaded" {
+		m.states[st.ID] = st.State
+	}
+	fn := m.statusFn
+	m.mu.Unlock()
+	if fn != nil {
+		fn(st)
+	}
 }
 
 func (m *SessionManager) sessionInfo(eng *engine.Engine, meta SessionMeta, live bool, state string) rpc.SessionInfo {
