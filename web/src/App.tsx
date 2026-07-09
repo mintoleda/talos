@@ -102,7 +102,7 @@ export function App() {
             <p>connecting…</p>
           )}
           <p className="hint">
-            Start a server with <code>talos --server ws:localhost:8080</code>
+            Start a server with <code>talos server</code>
           </p>
         </div>
       </div>
