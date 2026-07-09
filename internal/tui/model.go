@@ -501,11 +501,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// into the input bar so you can edit or discard them).
 				text := m.input.Value()
 				if text != "" && m.cfg.Engine != nil {
-					blocks, _, err := m.cfg.Engine.ResolveInput(text)
-					if err != nil {
-						m.chat = m.chat.AppendNotice("error", err.Error())
-						return m, nil
-					}
+					// Bare text — engine ResolveInput runs server-side on Submit/Steer paths.
+					blocks := protocol.TextBlocks(text)
 					m.chat = m.chat.AppendUserBlocks(blocks)
 					m.cfg.Engine.Steer(blocks)
 					m.input.Reset()
@@ -562,11 +559,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.chat = m.chat.AppendNotice("error", "engine unavailable")
 						return m, nil
 					}
-					blocks, _, err := m.cfg.Engine.ResolveInput(text)
-					if err != nil {
-						m.chat = m.chat.AppendNotice("error", err.Error())
-						return m, nil
-					}
+					// Bare text — Engine.Submit ResolveInput's a single text block.
+					blocks := protocol.TextBlocks(text)
 					m.chat = m.chat.AppendUserBlocks(blocks)
 					m.busy = true
 					m.busySince = time.Now()
