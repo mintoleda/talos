@@ -33,8 +33,13 @@ func SessionsDir() string {
 }
 
 func NewSession(projectRoot string) Session {
+	return SessionAt(projectRoot, generateID())
+}
+
+// SessionAt returns a Session for an explicit ID under projectRoot without
+// requiring the transcript file to exist yet.
+func SessionAt(projectRoot, id string) Session {
 	pid := ProjectHash(projectRoot)
-	id := generateID()
 	return Session{
 		ID:        id,
 		ProjectID: pid,
