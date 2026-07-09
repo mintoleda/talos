@@ -32,6 +32,8 @@ const (
 	ListFiles           = "engine.listFiles"
 	ResolveInput        = "engine.resolveInput"
 	PushInstruction     = "engine.pushInstruction"
+	ListCommands        = "engine.listCommands"
+	SetPermissionMode   = "engine.setPermissionMode"
 
 	DaemonCreateSession = "daemon.createSession"
 	DaemonListSessions  = "daemon.listSessions"
@@ -195,4 +197,19 @@ type ResolveInputResult struct {
 type PushInstructionResult struct {
 	Message string `json:"message"`
 	Notice  string `json:"notice"`
+}
+
+// CommandDesc describes a slash command for the composer palette.
+type CommandDesc struct {
+	Name    string `json:"name"`
+	Summary string `json:"summary"`
+	Args    string `json:"args,omitempty"`
+}
+
+type ListCommandsResult struct {
+	Commands []CommandDesc `json:"commands"`
+}
+
+type SetPermissionModeParams struct {
+	Mode string `json:"mode"`
 }
