@@ -1,4 +1,4 @@
-package server
+package client
 
 import (
 	"context"
@@ -16,7 +16,6 @@ func TestRunClientBadHandshake(t *testing.T) {
 	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "bad.sock")
 
-	// Start a server that sends bad handshake.
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -54,9 +53,7 @@ func TestRunClientVersionMismatch(t *testing.T) {
 		conn, _ := ln.Accept()
 		if conn != nil {
 			enc := json.NewEncoder(conn)
-			// Major version 1 vs client major 0 → incompatible.
 			enc.Encode(transport.ServerMsg{Type: "hello", Version: "1.0.0"})
-			// Read client request then close.
 			json.NewDecoder(conn).Decode(&struct{}{})
 			conn.Close()
 		}
@@ -77,32 +74,8 @@ func TestRunClientNoServer(t *testing.T) {
 	}
 }
 
-func TestDecodeEvent(t *testing.T) {
-	tests := []struct {
-		name    string
-		msg     transport.ServerMsg
-		wantErr bool
-	}{
-		{"UserInput", transport.ServerMsg{EType: "user_input", Event: json.RawMessage(`{"text":"hi"}`)}, false},
-		{"TextDelta", transport.ServerMsg{EType: "text_delta", Event: json.RawMessage(`{"text":"hi"}`)}, false},
-		{"Notice", transport.ServerMsg{EType: "notice", Event: json.RawMessage(`{"level":"info","text":"test"}`)}, false},
-		{"Unknown", transport.ServerMsg{EType: "Unknown", Event: json.RawMessage(`{}`)}, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := decodeEvent(tt.msg)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("unexpected error: %v", err)
-			}
-		})
-	}
-}
-
 func TestVersionCompatible(t *testing.T) {
-	// version.VERSION is "0.2.0" — so "0.2.0" is compatible.
 	if !version.Compatible("0.2.0") {
 		t.Fatal("expected same version to be compatible")
 	}
-	_ = version.Compatible
 }

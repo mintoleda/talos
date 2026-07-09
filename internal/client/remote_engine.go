@@ -10,34 +10,44 @@ import (
 	"github.com/mintoleda/talos/internal/client/rpc"
 	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/protocol"
-	"github.com/mintoleda/talos/internal/server"
 	"github.com/mintoleda/talos/internal/tui/dialogs"
 )
 
 // RemoteEngine is the socket-backed Engine implementation.
 type RemoteEngine struct {
-	conn          *server.ClientConn
+	conn          *ClientConn
 	events        <-chan protocol.Event
 	thinkingLevel string
+	Session       string
 }
 
-func NewRemoteEngine(conn *server.ClientConn, events <-chan protocol.Event) *RemoteEngine {
-	return &RemoteEngine{conn: conn, events: events}
+func NewRemoteEngine(conn *ClientConn, events <-chan protocol.Event) *RemoteEngine {
+	return &RemoteEngine{conn: conn, events: events, Session: conn.Session}
+}
+
+func (e *RemoteEngine) syncSession() {
+	if e.Session != "" {
+		e.conn.Session = e.Session
+	}
 }
 
 func (e *RemoteEngine) Submit(blocks []protocol.ContentBlock) {
+	e.syncSession()
 	_ = e.conn.Send(blocksText(blocks))
 }
 
 func (e *RemoteEngine) Interrupt() {
+	e.syncSession()
 	_ = e.conn.Interrupt()
 }
 
 func (e *RemoteEngine) Approve(ok bool, plan []byte) {
+	e.syncSession()
 	_ = e.conn.Approve(ok, plan)
 }
 
 func (e *RemoteEngine) Steer(blocks []protocol.ContentBlock) {
+	e.syncSession()
 	_ = e.conn.Steer(blocksText(blocks))
 }
 
@@ -223,9 +233,14 @@ func (e *RemoteEngine) Events() <-chan protocol.Event {
 func (e *RemoteEngine) Close() {}
 
 func (e *RemoteEngine) request(method string, params any, out any) error {
+	e.syncSession()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	raw, err := e.conn.Request(ctx, method, params)
+	var rawParams any = params
+	if params == nil {
+		rawParams = json.RawMessage("null")
+	}
+	raw, err := e.conn.Request(ctx, method, rawParams)
 	if err != nil {
 		return err
 	}
