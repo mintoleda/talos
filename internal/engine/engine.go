@@ -424,19 +424,26 @@ func (e *Engine) SetSessionID(id string) {
 }
 
 // Submit sends user content blocks (client.Engine / TUI path).
+// A single text block is ResolveInput'd so @image paths become ImageBlocks
+// (TUI/local clients submit bare text; no client-side pre-resolution).
 func (e *Engine) Submit(blocks []protocol.ContentBlock) {
 	select {
 	case <-e.closed:
 		return
 	default:
 	}
-	select {
-	case e.inCh <- blocks:
-	case <-e.closed:
+	if len(blocks) == 1 && blocks[0].Type == protocol.BlockText {
+		resolved, _, err := e.ResolveInput(blocks[0].Text)
+		if err != nil {
+			e.Emit(protocol.Notice{Level: "error", Text: err.Error()})
+			return
+		}
+		blocks = resolved
 	}
+	e.enqueueTurn(blocks)
 }
 
-// SubmitText is the daemon entry: slash intercept, UserInput broadcast, then turn.
+// SubmitText is the daemon entry: slash intercept, ResolveInput, UserInput, then turn.
 func (e *Engine) SubmitText(text string) {
 	select {
 	case <-e.closed:
@@ -449,8 +456,20 @@ func (e *Engine) SubmitText(text string) {
 		e.Emit(protocol.Notice{Level: "info", Text: result})
 		return
 	}
-	e.Emit(protocol.UserInput{Text: text})
-	e.Submit(protocol.TextBlocks(text))
+	blocks, display, err := e.ResolveInput(text)
+	if err != nil {
+		e.Emit(protocol.Notice{Level: "error", Text: err.Error()})
+		return
+	}
+	e.Emit(protocol.UserInput{Text: display})
+	e.enqueueTurn(blocks)
+}
+
+func (e *Engine) enqueueTurn(blocks []protocol.ContentBlock) {
+	select {
+	case e.inCh <- blocks:
+	case <-e.closed:
+	}
 }
 
 // Interrupt cancels the currently running turn.
@@ -748,6 +767,15 @@ func (e *Engine) CyclePermissionMode() (string, error) {
 	next := safety.NextMode(e.pol.Mode())
 	e.pol.SetMode(next)
 	return next.String(), nil
+}
+
+// SetPermissionMode sets the policy mode from a string (auto/ask/panic).
+func (e *Engine) SetPermissionMode(mode string) error {
+	if e.pol == nil {
+		return fmt.Errorf("permission policy not configured")
+	}
+	e.pol.SetMode(safety.ParseMode(mode))
+	return nil
 }
 
 func (e *Engine) PermissionMode() string {
