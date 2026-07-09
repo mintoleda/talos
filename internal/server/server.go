@@ -34,9 +34,9 @@ func PidFile(baseDir, sessionID string) string {
 
 type Engine interface {
 	SessionID() string
-	Subscribe(fn func(protocol.Event))
-	Submit(text string)
-	Steer(text string)
+	Subscribe(fn func(protocol.Event)) (cancel func())
+	SubmitText(text string)
+	SteerText(text string)
 	Interrupt()
 	Approve(approved bool, plan []byte)
 	Snapshot() protocol.EngineSnapshot
@@ -365,8 +365,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}()
 
 	// Send a snapshot of the engine's current state so the newly-attached
-	// client sees any in-progress turn (busy indicator, streamed text, tools).
-	if snap := s.engine.Snapshot(); snap.Busy || snap.StreamedText != "" || len(snap.ActiveTools) > 0 {
+	// client sees any in-progress turn (busy indicator, streamed text, tools,
+	// or a pending permission prompt).
+	if snap := s.engine.Snapshot(); snap.Busy || snap.StreamedText != "" || len(snap.ActiveTools) > 0 || snap.PendingPermission != nil {
 		s.encodeEvent(enc, &encMu, snap)
 	}
 
@@ -388,9 +389,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		s.mu.Unlock()
 		switch cm.Type {
 		case "input":
-			s.engine.Submit(cm.Text)
+			s.engine.SubmitText(cm.Text)
 		case "steer":
-			s.engine.Steer(cm.Text)
+			s.engine.SteerText(cm.Text)
 		case "interrupt":
 			s.engine.Interrupt()
 		case "approve":

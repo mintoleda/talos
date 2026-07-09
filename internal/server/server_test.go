@@ -22,13 +22,19 @@ type testEngine struct {
 }
 
 func (e *testEngine) SessionID() string { return e.sessionID }
-func (e *testEngine) Subscribe(fn func(protocol.Event)) {
+func (e *testEngine) Subscribe(fn func(protocol.Event)) (cancel func()) {
 	e.subs = append(e.subs, fn)
+	idx := len(e.subs) - 1
+	return func() {
+		if idx >= 0 && idx < len(e.subs) {
+			e.subs[idx] = nil
+		}
+	}
 }
-func (e *testEngine) Submit(text string) {
+func (e *testEngine) SubmitText(text string) {
 	e.inputs = append(e.inputs, text)
 }
-func (e *testEngine) Steer(text string) {}
+func (e *testEngine) SteerText(text string) {}
 func (e *testEngine) Interrupt() {
 	e.interrupts++
 }
@@ -265,10 +271,8 @@ func TestKillMissingServer(t *testing.T) {
 	}
 }
 
-func TestLoopEngineEventSubscription(t *testing.T) {
-	// LoopEngine requires concrete *loop.Loop and *safety.Checkpointer types.
-	// The emit/subscribe mechanism is tested indirectly through the server
-	// broadcast tests above.
+func TestEngineEventSubscription(t *testing.T) {
+	// Engine Subscribe/Emit is covered by server broadcast tests above.
 }
 
 func contains(s, substr string) bool {
