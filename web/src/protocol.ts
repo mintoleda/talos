@@ -34,6 +34,9 @@ export interface SessionInfo {
   dir: string;
   project_dir: string;
   isolation: string;
+  branch?: string;
+  ahead?: number;
+  dirty?: boolean;
   state: "idle" | "busy" | "awaiting_approval" | "unloaded" | string;
   live: boolean;
   provider: string;
@@ -63,6 +66,11 @@ export interface DaemonStatusResult {
   version: string;
   uptime_seconds: number;
   sessions: number;
+  orphan_worktrees?: string[];
+}
+
+export interface GCWorktreesResult {
+  removed: string[];
 }
 
 export const DaemonRPC = {
@@ -71,6 +79,7 @@ export const DaemonRPC = {
   StopSession: "daemon.stopSession",
   DeleteSession: "daemon.deleteSession",
   Status: "daemon.status",
+  GCWorktrees: "daemon.gcWorktrees",
 } as const;
 
 // ── Content blocks (message.go) ──────────────────────────────────────────
