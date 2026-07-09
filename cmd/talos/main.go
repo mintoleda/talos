@@ -64,6 +64,7 @@ func run() error {
 	var (
 		f          Flags
 		serverMode bool
+		noWeb      bool
 	)
 	flag.StringVar(&f.Print, "p", "", "run a single prompt and exit")
 	flag.StringVar(&f.Print, "print", "", "run a single prompt and exit")
@@ -79,6 +80,7 @@ func run() error {
 	flag.StringVar(&f.SystemPrompt, "system-prompt", "", "system prompt override")
 	flag.BoolVar(&f.DebugCache, "debug-cache", false, "log cache prefix hashes")
 	flag.BoolVar(&serverMode, "server", false, "run as a long-lived daemon")
+	flag.BoolVar(&noWeb, "no-web", false, "disable the WebSocket listener in server mode")
 	flag.Parse()
 
 	cfg, err := config.Load()
@@ -93,7 +95,13 @@ func run() error {
 	}
 
 	if len(flag.Args()) > 0 && flag.Args()[0] == "server" {
-		if len(flag.Args()) == 1 || (len(flag.Args()) >= 2 && flag.Args()[1] == "start") {
+		// Check for --no-web in positional args (subcommand form).
+		for _, a := range flag.Args()[1:] {
+			if a == "--no-web" {
+				noWeb = true
+			}
+		}
+		if len(flag.Args()) == 1 || (len(flag.Args()) >= 2 && (flag.Args()[1] == "start" || flag.Args()[1] == "--no-web")) {
 			serverMode = true
 		} else if len(flag.Args()) >= 2 && flag.Args()[1] == "help" {
 			return fmt.Errorf(`talos server commands:
@@ -149,6 +157,10 @@ func run() error {
 				return fmt.Errorf("unknown server command: %s\n\ntalos server help for usage", flag.Args()[1])
 			}
 		}
+	}
+
+	if serverMode && !noWeb && cfg.ServerListen == "" {
+		cfg.ServerListen = "ws:localhost:0"
 	}
 
 	if len(flag.Args()) > 0 && flag.Args()[0] == "attach" {
@@ -857,7 +869,15 @@ func runServer(ctx context.Context, cfg *config.Config, a *app, lp *loop.Loop, c
 			fmt.Fprintf(os.Stderr, "[server token %s]\n", token)
 		}
 		srv.SetToken(token)
-		fmt.Fprintf(os.Stderr, "[server listening on %s %s]\n", network, addr)
+		if network != "ws" {
+			fmt.Fprintf(os.Stderr, "[server listening on %s %s]\n", network, addr)
+		}
+
+		if network == "ws" {
+			if webDir := findWebDist(); webDir != "" {
+				srv.SetWebDir(webDir)
+			}
+		}
 	}
 	prices := pricing.Load(cfg.BaseDir)
 	srv.SetRequestHandler(func(reqCtx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
@@ -1179,6 +1199,29 @@ func findRepoRoot(dir string) string {
 		}
 	}
 	return dir
+}
+
+func findWebDist() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Dir(exe)
+	candidates := []string{
+		filepath.Join(dir, "web", "dist"),
+		filepath.Join(dir, "..", "web", "dist"),
+		filepath.Join(dir, "..", "..", "web", "dist"),
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(filepath.Join(c, "index.html")); err == nil && !info.IsDir() {
+			return c
+		}
+	}
+	return ""
 }
 
 func generateID() string {

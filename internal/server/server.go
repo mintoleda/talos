@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -52,6 +53,7 @@ type Server struct {
 	network     string
 	address     string
 	token       string
+	webDir      string // path to static web assets (empty = no static serving)
 
 	mu            sync.Mutex
 	subscribers   map[int]func(protocol.Event)
@@ -90,6 +92,10 @@ func (s *Server) SetToken(token string) {
 	s.token = token
 }
 
+func (s *Server) SetWebDir(dir string) {
+	s.webDir = dir
+}
+
 func (s *Server) SetRequestHandler(h RequestHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -108,8 +114,10 @@ func (s *Server) broadcast(e protocol.Event) {
 	}
 }
 
-// Start listens on the Unix socket and serves clients until ctx is done or
-// the idle timeout fires with no clients connected.
+// Start listens on the Unix socket (so attach and `server list` work) and
+// serves clients until ctx is done or the idle timeout fires with no clients
+// connected. If a ws listener was configured via SetListen, the web server
+// runs alongside the Unix socket.
 func (s *Server) Start(ctx context.Context) error {
 	if s.network == "" {
 		s.network = "unix"
@@ -117,21 +125,33 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.address == "" {
 		s.address = s.sockPath
 	}
-	if s.network == "ws" {
-		return s.startWebSocket(ctx)
+
+	network, address := s.network, s.address
+	if network == "ws" {
+		wsCtx, wsCancel := context.WithCancel(ctx)
+		defer wsCancel()
+		go func() {
+			if err := s.startWebSocket(wsCtx); err != nil {
+				fmt.Fprintf(os.Stderr, "[web] error: %v\n", err)
+			}
+		}()
+		// The web listener runs in the background; the main loop below
+		// still serves the Unix socket for attach/list/kill.
+		network, address = "unix", s.sockPath
 	}
-	if s.network == "unix" {
-		_ = os.Remove(s.address)
-		if err := os.MkdirAll(filepath.Dir(s.address), 0o755); err != nil {
+
+	if network == "unix" {
+		_ = os.Remove(address)
+		if err := os.MkdirAll(filepath.Dir(address), 0o755); err != nil {
 			return err
 		}
 	}
-	ln, err := net.Listen(s.network, s.address)
+	ln, err := net.Listen(network, address)
 	if err != nil {
-		return fmt.Errorf("listen %s %s: %w", s.network, s.address, err)
+		return fmt.Errorf("listen %s %s: %w", network, address, err)
 	}
-	if s.network == "unix" {
-		defer os.Remove(s.address)
+	if network == "unix" {
+		defer os.Remove(address)
 	}
 
 	if err := writePID(s.pidPath); err != nil {
@@ -178,7 +198,6 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) startWebSocket(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.Handle("/ws", websocket.Handler(func(conn *websocket.Conn) {
-		// Non-localhost listeners require Origin checking.
 		addr := s.address
 		if !isLocalhost(addr) {
 			origin := conn.Request().Header.Get("Origin")
@@ -192,18 +211,70 @@ func (s *Server) startWebSocket(ctx context.Context) error {
 		}
 		s.handleConn(ctx, conn)
 	}))
-	srv := &http.Server{Addr: s.address, Handler: mux}
+	if s.webDir != "" {
+		mux.Handle("/", http.FileServer(http.Dir(s.webDir)))
+	}
+
+	ln, err := listenWithFallback(s.address)
+	if err != nil {
+		return err
+	}
+	actualAddr := ln.Addr().String()
+	s.address = actualAddr
+
+	url := "http://" + displayAddr(actualAddr)
+	if s.token != "" {
+		url += "/?token=" + s.token
+	}
+	fmt.Fprintf(os.Stderr, "\n  web ui:  %s\n\n", url)
+
+	srv := &http.Server{Handler: mux}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
-	err := srv.ListenAndServe()
+	err = srv.Serve(ln)
 	if err == http.ErrServerClosed {
 		return nil
 	}
 	return err
+}
+
+// listenWithFallback listens on addr; if the port is busy it scans upward
+// (up to 20 ports) so a second server can start alongside a first.
+func listenWithFallback(addr string) (net.Listener, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("bad listen address %q: %w", addr, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("bad port in %q: %w", addr, err)
+	}
+	if port == 0 {
+		port = 8080
+	}
+	for i := 0; i < 20; i++ {
+		ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port+i)))
+		if err == nil {
+			return ln, nil
+		}
+	}
+	return nil, fmt.Errorf("no free port in %d-%d on %s", port, port+19, host)
+}
+
+// displayAddr rewrites wildcard/loopback IPs to something clickable.
+func displayAddr(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if host == "" || host == "::" || host == "0.0.0.0" || host == "127.0.0.1" || host == "::1" {
+		host = "localhost"
+	}
+	return net.JoinHostPort(host, port)
 }
 
 // isLocalhost returns true if addr is a loopback address or empty.
