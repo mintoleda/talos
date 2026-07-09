@@ -39,6 +39,7 @@ const (
 	DaemonDeleteSession = "daemon.deleteSession"
 	DaemonStatus        = "daemon.status"
 	DaemonGCWorktrees   = "daemon.gcWorktrees"
+	DaemonProbeDir      = "daemon.probeDir"
 )
 
 // SessionInfo describes a live or persisted-resumable session for the
@@ -93,6 +94,15 @@ type DaemonStatusResult struct {
 
 type GCWorktreesResult struct {
 	Removed []string `json:"removed"`
+}
+
+type ProbeDirParams struct {
+	Dir string `json:"dir"`
+}
+
+type ProbeDirResult struct {
+	IsRepo     bool   `json:"is_repo"`
+	ProjectDir string `json:"project_dir"`
 }
 
 type ResumeParams struct {
