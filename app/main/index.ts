@@ -141,6 +141,9 @@ function registerIPC(): void {
     shell.showItemInFolder(path)
   })
   ipcMain.handle('app:getVersion', () => app.getVersion())
+  ipcMain.handle('app:setBadgeCount', (_e, n: number) => {
+    app.setBadgeCount(typeof n === 'number' && n > 0 ? Math.floor(n) : 0)
+  })
 }
 
 app.whenReady().then(() => {

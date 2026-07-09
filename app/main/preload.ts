@@ -7,6 +7,7 @@ export type TalosAPI = {
   pickDirectory: () => Promise<string | null>
   openExternal: (url: string) => Promise<void>
   showItemInFolder: (path: string) => Promise<void>
+  setBadgeCount: (n: number) => Promise<void>
   onNewSession: (cb: () => void) => () => void
   getVersion: () => Promise<string>
 }
@@ -17,6 +18,7 @@ const api: TalosAPI = {
   pickDirectory: () => ipcRenderer.invoke('dialog:pickDirectory'),
   openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
   showItemInFolder: (path: string) => ipcRenderer.invoke('shell:showItemInFolder', path),
+  setBadgeCount: (n: number) => ipcRenderer.invoke('app:setBadgeCount', n),
   onNewSession: (cb: () => void) => {
     const handler = (): void => {
       cb()
