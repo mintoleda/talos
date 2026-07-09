@@ -20,6 +20,7 @@ import (
 	"github.com/mintoleda/talos/internal/client/rpc"
 	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/engine"
+	"github.com/mintoleda/talos/internal/gitutil"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/transport"
 	"github.com/mintoleda/talos/internal/version"
@@ -469,6 +470,27 @@ func (d *Daemon) handleDaemonRPC(ctx context.Context, method string, params json
 			return nil, err
 		}
 		return json.Marshal(rpc.GCWorktreesResult{Removed: removed})
+	case rpc.DaemonProbeDir:
+		p, err := decodeParams[rpc.ProbeDirParams](params)
+		if err != nil {
+			return nil, err
+		}
+		dir := p.Dir
+		if dir == "" {
+			return nil, fmt.Errorf("dir is required")
+		}
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve dir: %w", err)
+		}
+		result := rpc.ProbeDirResult{ProjectDir: abs}
+		if gitutil.IsRepo(abs) {
+			result.IsRepo = true
+			if root, err := gitutil.RepoRoot(abs); err == nil {
+				result.ProjectDir = root
+			}
+		}
+		return json.Marshal(result)
 	default:
 		return nil, fmt.Errorf("unknown method: %s", method)
 	}

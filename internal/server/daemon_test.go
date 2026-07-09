@@ -190,3 +190,35 @@ func TestDaemonSockPaths(t *testing.T) {
 		t.Fatal(DaemonPidPath("/tmp/x"))
 	}
 }
+
+func TestDaemonProbeDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg := &config.Config{BaseDir: filepath.Join(home, ".talos"), Provider: "test", Model: "m"}
+	d := NewDaemon(cfg, 0)
+
+	nonRepo := t.TempDir()
+	raw, err := d.handleDaemonRPC(context.Background(), rpc.DaemonProbeDir, mustJSON(t, rpc.ProbeDirParams{Dir: nonRepo}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result rpc.ProbeDirResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.IsRepo {
+		t.Fatalf("expected non-repo, got %+v", result)
+	}
+	if result.ProjectDir == "" {
+		t.Fatal("expected project_dir")
+	}
+}
+
+func mustJSON(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
