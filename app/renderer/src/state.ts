@@ -115,6 +115,8 @@ export function reduceState(s: ChatState, ev: Event): ChatState {
       return handleTurnEnded(s, ev);
     case 'permission_requested':
       return { ...s, permissionRequest: ev };
+    case 'approval_resolved':
+      return { ...s, permissionRequest: null };
     case 'model_changed':
       return { ...s, provider: ev.provider, model: ev.model, thinkingLevel: ev.thinking_level };
     case 'permission_mode_changed':
@@ -152,6 +154,7 @@ export function reduceState(s: ChatState, ev: Event): ChatState {
 }
 
 function handleSnapshot(s: ChatState, ev: EngineSnapshotEvent): ChatState {
+  const pending = ev.pending_permission
   return {
     ...s,
     busy: ev.busy,
@@ -163,6 +166,14 @@ function handleSnapshot(s: ChatState, ev: EngineSnapshotEvent): ChatState {
       output: '',
       finished: false,
     })),
+    permissionRequest: pending
+      ? {
+          etype: 'permission_requested',
+          tool_name: pending.tool_name,
+          command: pending.command,
+          reason: pending.reason,
+        }
+      : null,
   };
 }
 
