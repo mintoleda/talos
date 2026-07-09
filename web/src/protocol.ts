@@ -234,11 +234,21 @@ export interface ThinkingDeltaEvent {
   etype: "thinking_delta";
   text: string;
 }
+export interface PendingPermission {
+  tool_name: string;
+  command: string;
+  reason: string;
+}
 export interface EngineSnapshotEvent {
   etype: "engine_snapshot";
   busy: boolean;
   streamed_text: string;
   active_tools: ToolSnapshot[];
+  pending_permission?: PendingPermission;
+}
+export interface ApprovalResolvedEvent {
+  etype: "approval_resolved";
+  approved: boolean;
 }
 export interface SessionStatusEvent {
   etype: "session_status";
@@ -289,6 +299,7 @@ export type Event =
   | ThinkingBlockEvent
   | ThinkingDeltaEvent
   | EngineSnapshotEvent
+  | ApprovalResolvedEvent
   | SessionStatusEvent
   | SubagentEventEvent;
 

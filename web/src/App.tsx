@@ -36,21 +36,48 @@ export function App() {
     const eng = new Engine(url, token);
     engineRef.current = eng;
 
-    eng.onReady = (sid) => {
-      setSession(sid);
+    eng.onReady = async (sid) => {
       setConnected(true);
       setError('');
 
-      // Load history via RPC.
-      eng.request('engine.history').then((raw) => {
+      let sessionId = sid;
+      if (!sessionId) {
+        try {
+          const params = new URLSearchParams(window.location.search);
+          const dir = params.get('dir');
+          if (dir) {
+            const created = await eng.request('daemon.createSession', {
+              dir,
+              isolation: 'none',
+            }) as { session?: { id?: string } };
+            sessionId = created?.session?.id ?? '';
+          }
+          if (!sessionId) {
+            const listed = await eng.request('daemon.listSessions') as { sessions?: { id: string }[] };
+            sessionId = listed?.sessions?.[0]?.id ?? '';
+          }
+          if (!sessionId) {
+            setError('no session — pass ?dir=/absolute/project/path');
+            setConnected(false);
+            return;
+          }
+          eng.subscribe(sessionId);
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+          setConnected(false);
+          return;
+        }
+      } else {
+        eng.subscribe(sessionId);
+      }
+      setSession(sessionId);
+
+      eng.request('engine.history', undefined, sessionId).then((raw) => {
         const hist = (raw as { history?: unknown[] })?.history ?? [];
         setState((s) => ingestHistory(s, hist));
-      }).catch(() => {
-        // Non-fatal — history is a best-effort sync.
-      });
+      }).catch(() => {});
 
-      // Fetch initial permission mode.
-      eng.request('engine.permissionMode').then((raw) => {
+      eng.request('engine.permissionMode', undefined, sessionId).then((raw) => {
         const r = raw as { level?: string } | null;
         if (r?.level) {
           setState((s) => ({ ...s, permissionMode: r.level! }));
@@ -74,22 +101,22 @@ export function App() {
   }, []);
 
   const handleSubmit = useCallback((text: string) => {
-    engineRef.current?.submit(text);
-  }, []);
+    engineRef.current?.submit(text, session || undefined);
+  }, [session]);
 
   const handleInterrupt = useCallback(() => {
-    engineRef.current?.interrupt();
-  }, []);
+    engineRef.current?.interrupt(session || undefined);
+  }, [session]);
 
   const handleApprove = useCallback(() => {
-    engineRef.current?.approve(true);
+    engineRef.current?.approve(true, session || undefined);
     setState((s) => ({ ...s, permissionRequest: null }));
-  }, []);
+  }, [session]);
 
   const handleDeny = useCallback(() => {
-    engineRef.current?.approve(false);
+    engineRef.current?.approve(false, session || undefined);
     setState((s) => ({ ...s, permissionRequest: null }));
-  }, []);
+  }, [session]);
 
   if (!connected) {
     return (
@@ -102,7 +129,7 @@ export function App() {
             <p>connecting…</p>
           )}
           <p className="hint">
-            Start a server with <code>talos server</code>
+            Start a daemon with <code>talos serve</code>
           </p>
         </div>
       </div>
