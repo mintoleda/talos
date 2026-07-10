@@ -1,5 +1,7 @@
 package protocol
 
+import "time"
+
 type Event interface{ isEvent() }
 
 type BatchStarted struct {
@@ -141,6 +143,36 @@ type SessionStatus struct {
 	Dir     string `json:"dir,omitempty"`
 }
 
+// BgStarted is emitted when bash_background starts a process.
+type BgStarted struct {
+	ID      string `json:"id"`
+	Command string `json:"command"`
+	Dir     string `json:"dir"`
+}
+
+// BgOutput carries a coalesced chunk of background-process output for the UI.
+type BgOutput struct {
+	ID   string `json:"id"`
+	Text string `json:"text"`
+}
+
+// BgExited is emitted when a background process exits (naturally or after kill).
+type BgExited struct {
+	ID   string `json:"id"`
+	Code int    `json:"code"`
+}
+
+// BgSnapshot describes a background process in EngineSnapshot / late attach.
+type BgSnapshot struct {
+	ID           string    `json:"id"`
+	Command      string    `json:"command"`
+	Dir          string    `json:"dir"`
+	Running      bool      `json:"running"`
+	ExitCode     int       `json:"exit_code,omitempty"`
+	RecentOutput string    `json:"recent_output,omitempty"`
+	StartedAt    time.Time `json:"started_at,omitempty"`
+}
+
 // EngineSnapshot is sent to newly-attached clients so they can sync with the
 // server's current turn state (busy flag, streamed text, active tools).
 // Without this, a client that attaches mid-turn sees a blank idle screen.
@@ -149,6 +181,7 @@ type EngineSnapshot struct {
 	StreamedText      string             `json:"streamed_text"`
 	ActiveTools       []ToolSnapshot     `json:"active_tools"`
 	PendingPermission *PendingPermission `json:"pending_permission,omitempty"`
+	BgProcs           []BgSnapshot       `json:"bg_procs,omitempty"`
 }
 
 // PendingPermission describes an outstanding permission request so a newly
@@ -188,10 +221,13 @@ func (SubagentStarted) isEvent()     {}
 func (SubagentEvent) isEvent()       {}
 func (PromptEstimate) isEvent()      {}
 func (SubagentFinished) isEvent()    {}
-func (SessionStatus) isEvent()           {}
-func (EngineSnapshot) isEvent()          {}
-func (ApprovalResolved) isEvent()        {}
-func (PermissionModeChanged) isEvent()   {}
+func (SessionStatus) isEvent()         {}
+func (EngineSnapshot) isEvent()        {}
+func (ApprovalResolved) isEvent()      {}
+func (PermissionModeChanged) isEvent() {}
+func (BgStarted) isEvent()             {}
+func (BgOutput) isEvent()              {}
+func (BgExited) isEvent()              {}
 
 type Usage struct {
 	PromptTokens       int `json:"prompt_tokens"`

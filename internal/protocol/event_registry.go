@@ -32,6 +32,9 @@ var (
 		"SubagentStarted":        "subagent_started",
 		"SubagentEvent":          "subagent_event",
 		"SubagentFinished":       "subagent_finished",
+		"BgStarted":              "bg_started",
+		"BgOutput":               "bg_output",
+		"BgExited":               "bg_exited",
 	}
 
 	// eventTypeByWireName maps wire name → zero-value instance for decode.
@@ -69,6 +72,9 @@ func init() {
 		SubagentStarted{},
 		SubagentEvent{},
 		SubagentFinished{},
+		BgStarted{},
+		BgOutput{},
+		BgExited{},
 	}
 
 	for _, ev := range all {
