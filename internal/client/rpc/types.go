@@ -34,6 +34,10 @@ const (
 	PushInstruction     = "engine.pushInstruction"
 	ListCommands        = "engine.listCommands"
 	SetPermissionMode   = "engine.setPermissionMode"
+	ListBg              = "engine.listBg"
+	KillBg              = "engine.killBg"
+	BgLog               = "engine.bgLog"
+	DismissBg           = "engine.dismissBg"
 
 	DaemonCreateSession = "daemon.createSession"
 	DaemonListSessions  = "daemon.listSessions"
@@ -212,4 +216,34 @@ type ListCommandsResult struct {
 
 type SetPermissionModeParams struct {
 	Mode string `json:"mode"`
+}
+
+type BgProcInfo struct {
+	ID        string    `json:"id"`
+	Command   string    `json:"command"`
+	Dir       string    `json:"dir"`
+	Running   bool      `json:"running"`
+	ExitCode  int       `json:"exit_code"`
+	StartedAt time.Time `json:"started_at"`
+}
+
+type ListBgResult struct {
+	Procs []BgProcInfo `json:"procs"`
+}
+
+type KillBgParams struct {
+	ID string `json:"id"`
+}
+
+type DismissBgParams struct {
+	ID string `json:"id"`
+}
+
+type BgLogParams struct {
+	ID        string `json:"id"`
+	TailBytes int    `json:"tail_bytes"`
+}
+
+type BgLogResult struct {
+	Text string `json:"text"`
 }
