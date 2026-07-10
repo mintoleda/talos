@@ -48,6 +48,14 @@ func (r *Registry) KillBg() {
 	}
 }
 
+// Background returns the background-process registry, or nil if none.
+func (r *Registry) Background() *BackgroundRegistry {
+	if r == nil {
+		return nil
+	}
+	return r.bg
+}
+
 func (r *Registry) Close() {
 	r.KillBg()
 }
