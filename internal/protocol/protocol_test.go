@@ -66,9 +66,12 @@ func TestEventRoundTrip(t *testing.T) {
 		{"UserInput", UserInput{Text: "hello"}},
 		{"ThinkingBlock", ThinkingBlock{Text: "...thinking..."}},
 		{"ThinkingDelta", ThinkingDelta{Text: "..."}},
-		{"EngineSnapshot", EngineSnapshot{Busy: true, StreamedText: "hello", ActiveTools: []ToolSnapshot{{ID: "t1", Name: "read", Args: map[string]any{"path": "x.go"}}}, PendingPermission: &PendingPermission{ToolName: "bash", Command: "ls", Reason: "ask"}}},
+		{"EngineSnapshot", EngineSnapshot{Busy: true, StreamedText: "hello", ActiveTools: []ToolSnapshot{{ID: "t1", Name: "read", Args: map[string]any{"path": "x.go"}}}, PendingPermission: &PendingPermission{ToolName: "bash", Command: "ls", Reason: "ask"}, BgProcs: []BgSnapshot{{ID: "bg-1", Command: "sleep 1", Running: true}}}},
 		{"ApprovalResolved", ApprovalResolved{Approved: true}},
 		{"SessionStatus", SessionStatus{ID: "s1", State: "busy", Preview: "hello", Dir: "/tmp/proj"}},
+		{"BgStarted", BgStarted{ID: "bg-1", Command: "sleep 1", Dir: "/tmp"}},
+		{"BgOutput", BgOutput{ID: "bg-1", Text: "hello\n"}},
+		{"BgExited", BgExited{ID: "bg-1", Code: 0}},
 		{"SubagentEvent with TextDelta", SubagentEvent{ID: "s1", Agent: "scout", Inner: TextDelta{Text: "hello"}}},
 		{"SubagentEvent with ToolStarted", SubagentEvent{ID: "s1", Agent: "scout", Inner: ToolStarted{ID: "t1", Name: "read"}}},
 	}
