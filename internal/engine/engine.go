@@ -180,6 +180,12 @@ func NewEngine(p Params) *Engine {
 
 	p.Loop.SteerFunc = e.sq.Drain
 
+	if p.OwnStack != nil && p.OwnStack.Registry != nil {
+		if bg := p.OwnStack.Registry.Background(); bg != nil {
+			bg.SetEmit(e.Emit)
+		}
+	}
+
 	e.wg.Add(1)
 	go e.runInput(inCh, intCh)
 
@@ -523,12 +529,12 @@ func (e *Engine) PendingSteers() int {
 // Snapshot returns live turn state for newly-attached clients.
 func (e *Engine) Snapshot() protocol.EngineSnapshot {
 	e.stateMu.Lock()
-	tools := make([]protocol.ToolSnapshot, len(e.stateTools))
-	copy(tools, e.stateTools)
+	toolSnaps := make([]protocol.ToolSnapshot, len(e.stateTools))
+	copy(toolSnaps, e.stateTools)
 	snap := protocol.EngineSnapshot{
 		Busy:         e.stateBusy,
 		StreamedText: e.stateText,
-		ActiveTools:  tools,
+		ActiveTools:  toolSnaps,
 	}
 	e.stateMu.Unlock()
 
@@ -540,6 +546,19 @@ func (e *Engine) Snapshot() protocol.EngineSnapshot {
 			ToolName: pending.toolName,
 			Command:  pending.command,
 			Reason:   pending.reason,
+		}
+	}
+	if bg := e.bgRegistry(); bg != nil {
+		for _, s := range bg.List() {
+			snap.BgProcs = append(snap.BgProcs, protocol.BgSnapshot{
+				ID:           s.ID,
+				Command:      s.Command,
+				Dir:          s.Dir,
+				Running:      s.Running,
+				ExitCode:     s.ExitCode,
+				RecentOutput: s.RecentOutput,
+				StartedAt:    s.StartedAt,
+			})
 		}
 	}
 	return snap

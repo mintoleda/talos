@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
 	"github.com/mintoleda/talos/internal/testutil"
+	"github.com/mintoleda/talos/internal/tools"
 )
 
 // recordingProvider captures the last StreamTurn request for assertions.
@@ -564,5 +566,104 @@ func TestSubmitTextResolvesImage(t *testing.T) {
 	}
 	if !hasImage || !hasText {
 		t.Fatalf("expected text+image blocks in turn, got %#v", blocks)
+	}
+}
+
+func TestBgRPCs(t *testing.T) {
+	tx := testutil.NewTestTranscript(t)
+	prov := &testutil.FakeProvider{}
+	exec := &testutil.FakeExecutor{}
+	pb := loop.NewPromptBuilder("system", nil, "test-model")
+	lp := loop.New(prov, exec, tx, pb)
+
+	tmpDir := t.TempDir()
+	baseDir := filepath.Join(tmpDir, ".talos")
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := tools.DefaultRegistry(tmpDir, tools.NewReadSet(), tools.BashConfig{}, "")
+	built := &Built{Registry: reg, Dir: tmpDir}
+	eng := NewEngine(Params{
+		Loop:          lp,
+		PromptBuilder: pb,
+		Prices:        pricing.Default,
+		Provider:      "test",
+		Model:         "test-model",
+		BaseDir:       baseDir,
+		CWD:           tmpDir,
+		Context:       context.Background(),
+		OwnStack:      built,
+	})
+	defer eng.Close()
+
+	bg := reg.Background()
+	id, err := bg.Start(`printf 'bg-log-line\n'; sleep 30`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		text, _ := bg.UILog(id, 0)
+		if strings.Contains(text, "bg-log-line") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	raw, err := eng.HandleRequest(context.Background(), rpc.ListBg, nil)
+	if err != nil {
+		t.Fatalf("listBg: %v", err)
+	}
+	var listed rpc.ListBgResult
+	if err := json.Unmarshal(raw, &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Procs) != 1 || listed.Procs[0].ID != id || !listed.Procs[0].Running {
+		t.Fatalf("listBg unexpected: %#v", listed)
+	}
+
+	logParams, _ := json.Marshal(rpc.BgLogParams{ID: id, TailBytes: 4096})
+	raw, err = eng.HandleRequest(context.Background(), rpc.BgLog, logParams)
+	if err != nil {
+		t.Fatalf("bgLog: %v", err)
+	}
+	var logRes rpc.BgLogResult
+	if err := json.Unmarshal(raw, &logRes); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logRes.Text, "bg-log-line") {
+		t.Fatalf("bgLog missing output: %q", logRes.Text)
+	}
+
+	killParams, _ := json.Marshal(rpc.KillBgParams{ID: id})
+	if _, err := eng.HandleRequest(context.Background(), rpc.KillBg, killParams); err != nil {
+		t.Fatalf("killBg: %v", err)
+	}
+	killDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(killDeadline) {
+		snaps := bg.List()
+		if len(snaps) == 1 && !snaps[0].Running {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	snaps := bg.List()
+	if len(snaps) != 1 || snaps[0].Running {
+		t.Fatalf("expected exited lingering proc, got %#v", snaps)
+	}
+
+	dismissParams, _ := json.Marshal(rpc.DismissBgParams{ID: id})
+	if _, err := eng.HandleRequest(context.Background(), rpc.DismissBg, dismissParams); err != nil {
+		t.Fatalf("dismissBg: %v", err)
+	}
+	if len(bg.List()) != 0 {
+		t.Fatal("expected empty after dismiss")
+	}
+
+	snap := eng.Snapshot()
+	if len(snap.BgProcs) != 0 {
+		t.Fatalf("snapshot should have no bg procs, got %#v", snap.BgProcs)
 	}
 }
