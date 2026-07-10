@@ -9,6 +9,7 @@ import (
 	"github.com/mintoleda/talos/internal/client/rpc"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/session"
+	"github.com/mintoleda/talos/internal/tools"
 )
 
 func rpcResult(v any, errs ...error) (json.RawMessage, error) {
@@ -217,7 +218,82 @@ func (e *Engine) HandleRequest(ctx context.Context, method string, params json.R
 			return nil, err
 		}
 		return rpcResult(rpc.PushInstructionResult{Message: msg, Notice: notice})
+	case rpc.ListBg:
+		return rpcResult(rpc.ListBgResult{Procs: e.listBg()})
+	case rpc.KillBg:
+		p, err := decodeRPC[rpc.KillBgParams](params)
+		if err != nil {
+			return nil, err
+		}
+		return rpcResult(nil, e.killBg(p.ID))
+	case rpc.BgLog:
+		p, err := decodeRPC[rpc.BgLogParams](params)
+		if err != nil {
+			return nil, err
+		}
+		text, err := e.bgLog(p.ID, p.TailBytes)
+		if err != nil {
+			return nil, err
+		}
+		return rpcResult(rpc.BgLogResult{Text: text})
+	case rpc.DismissBg:
+		p, err := decodeRPC[rpc.DismissBgParams](params)
+		if err != nil {
+			return nil, err
+		}
+		return rpcResult(nil, e.dismissBg(p.ID))
 	default:
 		return nil, fmt.Errorf("unknown method %s", method)
 	}
+}
+
+func (e *Engine) bgRegistry() *tools.BackgroundRegistry {
+	if e.ownStack == nil || e.ownStack.Registry == nil {
+		return nil
+	}
+	return e.ownStack.Registry.Background()
+}
+
+func (e *Engine) listBg() []rpc.BgProcInfo {
+	reg := e.bgRegistry()
+	if reg == nil {
+		return nil
+	}
+	snaps := reg.List()
+	out := make([]rpc.BgProcInfo, 0, len(snaps))
+	for _, s := range snaps {
+		out = append(out, rpc.BgProcInfo{
+			ID:        s.ID,
+			Command:   s.Command,
+			Dir:       s.Dir,
+			Running:   s.Running,
+			ExitCode:  s.ExitCode,
+			StartedAt: s.StartedAt,
+		})
+	}
+	return out
+}
+
+func (e *Engine) killBg(id string) error {
+	reg := e.bgRegistry()
+	if reg == nil {
+		return fmt.Errorf("unknown background handle: %s", id)
+	}
+	return reg.Kill(id)
+}
+
+func (e *Engine) dismissBg(id string) error {
+	reg := e.bgRegistry()
+	if reg == nil {
+		return fmt.Errorf("unknown background handle: %s", id)
+	}
+	return reg.Dismiss(id)
+}
+
+func (e *Engine) bgLog(id string, tailBytes int) (string, error) {
+	reg := e.bgRegistry()
+	if reg == nil {
+		return "", fmt.Errorf("unknown background handle: %s", id)
+	}
+	return reg.UILog(id, tailBytes)
 }
