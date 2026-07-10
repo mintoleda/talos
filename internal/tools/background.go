@@ -7,49 +7,142 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/mintoleda/talos/internal/protocol"
+)
+
+const (
+	modelBufSize   = 32 * 1024
+	uiBufSize      = 256 * 1024
+	coalesceBytes  = 4 * 1024
+	coalescePeriod = 100 * time.Millisecond
+	snapshotTail   = 2 * 1024
 )
 
 // BackgroundRegistry owns long-running child processes spawned by the
 // bash_background tool. It is safe for concurrent use.
 type BackgroundRegistry struct {
-	mu    sync.Mutex
-	procs map[string]*backgroundProc
-	cwd   string
+	mu     sync.Mutex
+	procs  map[string]*backgroundProc
+	cwd    string
+	nextID int
+	emit   protocol.EmitFunc // nil = silent (tests OK)
 }
 
 type backgroundProc struct {
-	id     string
-	cmd    *exec.Cmd
-	buffer *ringBuffer
+	id        string
+	command   string
+	dir       string
+	cmd       *exec.Cmd
+	modelBuf  *ringBuffer // 32KB, Drain() for bash_read_output
+	uiBuf     *ringBuffer // 256KB, Peek()/String() non-draining for UI
+	startedAt time.Time
+	exited    bool
+	exitCode  int
+	coal      *outputCoalescer
+}
+
+// BgProcSnapshot is a point-in-time view of a background process.
+type BgProcSnapshot struct {
+	ID           string
+	Command      string
+	Dir          string
+	Running      bool
+	ExitCode     int
+	StartedAt    time.Time
+	RecentOutput string
 }
 
 func NewBackgroundRegistry(cwd string) *BackgroundRegistry {
 	return &BackgroundRegistry{procs: make(map[string]*backgroundProc), cwd: cwd}
 }
 
+// SetEmit wires lifecycle/output events onto the session event stream.
+// Passing nil disables emission (silent; used by tools tests).
+func (r *BackgroundRegistry) SetEmit(fn protocol.EmitFunc) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.emit = fn
+}
+
+func (r *BackgroundRegistry) emitLocked(ev protocol.Event) {
+	if r.emit != nil {
+		r.emit(ev)
+	}
+}
+
 func (r *BackgroundRegistry) Start(command string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	id := fmt.Sprintf("bg-%d", len(r.procs)+1)
+	r.nextID++
+	id := fmt.Sprintf("bg-%d", r.nextID)
 	cmd := exec.Command("/bin/sh", "-c", command)
 	cmd.Dir = r.cwd
 	cmd.Env = nonInteractiveEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	buf := newRingBuffer(32 * 1024)
-	cmd.Stdout = buf
-	cmd.Stderr = buf
+	modelBuf := newRingBuffer(modelBufSize)
+	uiBuf := newRingBuffer(uiBufSize)
+	coal := newOutputCoalescer(id, func() protocol.EmitFunc {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.emit
+	})
+
+	tee := &teeWriter{model: modelBuf, ui: uiBuf, coal: coal}
+	cmd.Stdout = tee
+	cmd.Stderr = tee
+
+	startedAt := time.Now()
 	if err := cmd.Start(); err != nil {
+		coal.stop()
 		return "", err
 	}
-	r.procs[id] = &backgroundProc{id: id, cmd: cmd, buffer: buf}
+
+	p := &backgroundProc{
+		id:        id,
+		command:   command,
+		dir:       r.cwd,
+		cmd:       cmd,
+		modelBuf:  modelBuf,
+		uiBuf:     uiBuf,
+		startedAt: startedAt,
+		coal:      coal,
+	}
+	r.procs[id] = p
+	r.emitLocked(protocol.BgStarted{ID: id, Command: command, Dir: r.cwd})
+
+	go r.waitProc(p)
 	return id, nil
 }
 
-// Read returns the accumulated output for a handle and clears it.
+func (r *BackgroundRegistry) waitProc(p *backgroundProc) {
+	err := p.cmd.Wait()
+	code := 0
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			code = ee.ExitCode()
+		} else {
+			code = -1
+		}
+	}
+
+	p.coal.flush()
+	p.coal.stop()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cur, ok := r.procs[p.id]; !ok || cur != p {
+		return
+	}
+	p.exited = true
+	p.exitCode = code
+	r.emitLocked(protocol.BgExited{ID: p.id, Code: code})
+}
+
+// Read returns the accumulated model-facing output for a handle and clears it.
 func (r *BackgroundRegistry) Read(id string) (string, error) {
 	r.mu.Lock()
 	p, ok := r.procs[id]
@@ -57,14 +150,14 @@ func (r *BackgroundRegistry) Read(id string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("unknown background handle: %s", id)
 	}
-	return p.buffer.Drain(), nil
+	return p.modelBuf.Drain(), nil
 }
 
-// Kill terminates a background process and its process group.
+// Kill signals a background process (and its process group) with SIGKILL.
+// The process stays in the registry until Dismiss so the UI can show exit state.
 func (r *BackgroundRegistry) Kill(id string) error {
 	r.mu.Lock()
 	p, ok := r.procs[id]
-	delete(r.procs, id)
 	r.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("unknown background handle: %s", id)
@@ -72,18 +165,193 @@ func (r *BackgroundRegistry) Kill(id string) error {
 	if p.cmd.Process == nil {
 		return nil
 	}
+	r.mu.Lock()
+	exited := p.exited
+	r.mu.Unlock()
+	if exited {
+		return nil
+	}
 	return syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+}
+
+// Dismiss removes a process from the registry (typically after exit).
+// Running processes are killed first.
+func (r *BackgroundRegistry) Dismiss(id string) error {
+	r.mu.Lock()
+	p, ok := r.procs[id]
+	if !ok {
+		r.mu.Unlock()
+		return fmt.Errorf("unknown background handle: %s", id)
+	}
+	exited := p.exited
+	r.mu.Unlock()
+
+	if !exited {
+		_ = r.Kill(id)
+		// Wait briefly for Wait goroutine to mark exited; still remove either way.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			r.mu.Lock()
+			exited = p.exited
+			r.mu.Unlock()
+			if exited {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	r.mu.Lock()
+	delete(r.procs, id)
+	r.mu.Unlock()
+	return nil
 }
 
 func (r *BackgroundRegistry) KillAll() {
 	r.mu.Lock()
 	ids := make([]string, 0, len(r.procs))
-	for id := range r.procs {
+	for id, p := range r.procs {
 		ids = append(ids, id)
+		if !p.exited && p.cmd.Process != nil {
+			_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+		}
 	}
 	r.mu.Unlock()
-	for _, id := range ids {
-		_ = r.Kill(id)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		allDone := true
+		for _, p := range r.procs {
+			if !p.exited {
+				allDone = false
+				break
+			}
+		}
+		r.mu.Unlock()
+		if allDone {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	r.mu.Lock()
+	r.procs = make(map[string]*backgroundProc)
+	r.mu.Unlock()
+	_ = ids
+}
+
+// List returns snapshots of all background processes.
+func (r *BackgroundRegistry) List() []BgProcSnapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]BgProcSnapshot, 0, len(r.procs))
+	for _, p := range r.procs {
+		out = append(out, p.snapshot(snapshotTail))
+	}
+	return out
+}
+
+// UILog returns up to maxBytes of the non-draining UI buffer tail.
+func (r *BackgroundRegistry) UILog(id string, maxBytes int) (string, error) {
+	r.mu.Lock()
+	p, ok := r.procs[id]
+	r.mu.Unlock()
+	if !ok {
+		return "", fmt.Errorf("unknown background handle: %s", id)
+	}
+	if maxBytes <= 0 {
+		maxBytes = uiBufSize
+	}
+	return p.uiBuf.Peek(maxBytes), nil
+}
+
+func (p *backgroundProc) snapshot(tail int) BgProcSnapshot {
+	return BgProcSnapshot{
+		ID:           p.id,
+		Command:      p.command,
+		Dir:          p.dir,
+		Running:      !p.exited,
+		ExitCode:     p.exitCode,
+		StartedAt:    p.startedAt,
+		RecentOutput: p.uiBuf.Peek(tail),
+	}
+}
+
+// teeWriter fans out process output to the model buffer, UI buffer, and coalescer.
+type teeWriter struct {
+	model *ringBuffer
+	ui    *ringBuffer
+	coal  *outputCoalescer
+}
+
+func (t *teeWriter) Write(p []byte) (int, error) {
+	_, _ = t.model.Write(p)
+	_, _ = t.ui.Write(p)
+	t.coal.write(p)
+	return len(p), nil
+}
+
+// outputCoalescer batches BgOutput emissions (≥4KB or ≥100ms).
+type outputCoalescer struct {
+	mu      sync.Mutex
+	id      string
+	getEmit func() protocol.EmitFunc
+	buf     []byte
+	timer   *time.Timer
+	closed  bool
+}
+
+func newOutputCoalescer(id string, getEmit func() protocol.EmitFunc) *outputCoalescer {
+	return &outputCoalescer{id: id, getEmit: getEmit}
+}
+
+func (c *outputCoalescer) write(p []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.getEmit == nil || c.getEmit() == nil {
+		return
+	}
+	c.buf = append(c.buf, p...)
+	if len(c.buf) >= coalesceBytes {
+		c.flushLocked()
+		return
+	}
+	if c.timer == nil {
+		c.timer = time.AfterFunc(coalescePeriod, c.flush)
+	}
+}
+
+func (c *outputCoalescer) flush() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flushLocked()
+}
+
+func (c *outputCoalescer) flushLocked() {
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	emit := protocol.EmitFunc(nil)
+	if c.getEmit != nil {
+		emit = c.getEmit()
+	}
+	if len(c.buf) == 0 || emit == nil {
+		return
+	}
+	text := string(c.buf)
+	c.buf = c.buf[:0]
+	emit(protocol.BgOutput{ID: c.id, Text: text})
+}
+
+func (c *outputCoalescer) stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
 	}
 }
 
@@ -114,6 +382,20 @@ func (r *ringBuffer) Drain() string {
 	s := string(r.data)
 	r.data = r.data[:0]
 	return s
+}
+
+// Peek returns up to n trailing bytes without draining. n<=0 returns all.
+func (r *ringBuffer) Peek(n int) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n <= 0 || n >= len(r.data) {
+		return string(r.data)
+	}
+	return string(r.data[len(r.data)-n:])
+}
+
+func (r *ringBuffer) String() string {
+	return r.Peek(0)
 }
 
 type bashBackgroundTool struct {
