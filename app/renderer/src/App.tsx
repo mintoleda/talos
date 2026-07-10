@@ -25,11 +25,16 @@ import {
 } from './appState'
 import { ChatView } from './ChatView'
 import { Composer } from './Composer'
+import { ShellSessions } from './ShellSessions'
+import { ShellLogDrawer } from './ShellLogDrawer'
 import { PermissionPrompt } from './PermissionPrompt'
 import { StatusBar } from './StatusBar'
 import { Sidebar } from './Sidebar'
 import { CreatePopover } from './CreatePopover'
 import { ConfirmDialog } from './ConfirmDialog'
+import type { BgProcInfo, ListBgResult, BgLogResult } from './protocol'
+import { EngineRPC } from './protocol'
+import type { BgProcState } from './state'
 
 function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search)
@@ -49,6 +54,7 @@ export function App() {
   const refetchingRef = useRef(false)
   const [showCreate, setShowCreate] = useState(false)
   const [pendingDelete, setPendingDelete] = useState<SessionInfo | null>(null)
+  const [pendingStop, setPendingStop] = useState<SessionInfo | null>(null)
   const [daemonVersion, setDaemonVersion] = useState('')
   const [booting, setBooting] = useState(true)
   const [steerClearSignal, setSteerClearSignal] = useState(0)
@@ -80,10 +86,42 @@ export function App() {
     return list
   }, [])
 
+  const refreshBgProcs = useCallback(async (eng: Engine, sessionId: string) => {
+    try {
+      const raw = (await eng.request(EngineRPC.ListBg, undefined, sessionId)) as ListBgResult
+      setApp((a) => {
+        const prev = a.transcripts.get(sessionId) ?? initialState()
+        const byID = new Map(prev.bgProcs.map((p) => [p.id, p]))
+        const procs: BgProcState[] = (raw?.procs ?? []).map((p: BgProcInfo) => {
+          const existing = byID.get(p.id)
+          return {
+            id: p.id,
+            command: p.command,
+            dir: p.dir,
+            running: p.running,
+            exitCode: p.exit_code ?? 0,
+            recentLines: existing?.recentLines ?? '',
+            startedAt: p.started_at ?? existing?.startedAt ?? '',
+          }
+        })
+        const logStillOpen = prev.bgLogID && procs.some((p) => p.id === prev.bgLogID)
+        return setTranscript(a, sessionId, {
+          ...prev,
+          bgProcs: procs,
+          bgLogID: logStillOpen ? prev.bgLogID : null,
+          bgLogText: logStillOpen ? prev.bgLogText : '',
+        })
+      })
+    } catch {
+      // older daemons may lack listBg
+    }
+  }, [])
+
   const focusSession = useCallback(async (eng: Engine, sessionId: string) => {
     const prev = focusedRef.current
     if (prev === sessionId) {
       eng.subscribe(sessionId)
+      void refreshBgProcs(eng, sessionId)
       return
     }
     if (prev) {
@@ -142,7 +180,9 @@ export function App() {
         })
       })
       .catch(() => {})
-  }, [])
+
+    void refreshBgProcs(eng, sessionId)
+  }, [refreshBgProcs])
 
   const checkVersionMismatch = useCallback(async (helloVersion: string, discoveryVersion: string) => {
     if (!helloVersion || !discoveryVersion) {
@@ -415,18 +455,90 @@ export function App() {
     })
   }, [fid])
 
-  const handleStop = useCallback(async (id: string) => {
+  const handleStopConfirm = useCallback(async () => {
+    const target = pendingStop
+    setPendingStop(null)
+    if (!target) return
     const eng = engineRef.current
     if (!eng) return
     try {
-      await eng.request(DaemonRPC.StopSession, { id })
+      await eng.request(DaemonRPC.StopSession, { id: target.id })
     } catch (e) {
       setApp((a) => ({
         ...a,
         error: e instanceof Error ? e.message : String(e),
       }))
     }
-  }, [])
+  }, [pendingStop])
+
+  const handleToggleBgExpand = useCallback(() => {
+    if (!fid) return
+    setApp((a) => {
+      const prev = a.transcripts.get(fid) ?? initialState()
+      return setTranscript(a, fid, { ...prev, bgExpanded: !prev.bgExpanded })
+    })
+  }, [fid])
+
+  const handleOpenBgLog = useCallback(
+    (id: string) => {
+      if (!fid) return
+      const eng = engineRef.current
+      setApp((a) => {
+        const prev = a.transcripts.get(fid) ?? initialState()
+        return setTranscript(a, fid, { ...prev, bgLogID: id, bgLogText: '', bgExpanded: true })
+      })
+      if (!eng) return
+      void eng
+        .request(EngineRPC.BgLog, { id, tail_bytes: 256 * 1024 }, fid)
+        .then((raw) => {
+          const text = (raw as BgLogResult)?.text ?? ''
+          setApp((a) => {
+            const prev = a.transcripts.get(fid) ?? initialState()
+            if (prev.bgLogID !== id) return a
+            return setTranscript(a, fid, { ...prev, bgLogText: text })
+          })
+        })
+        .catch(() => {})
+    },
+    [fid],
+  )
+
+  const handleCloseBgLog = useCallback(() => {
+    if (!fid) return
+    setApp((a) => {
+      const prev = a.transcripts.get(fid) ?? initialState()
+      return setTranscript(a, fid, { ...prev, bgLogID: null, bgLogText: '' })
+    })
+  }, [fid])
+
+  const handleKillBg = useCallback(
+    (id: string) => {
+      if (!fid) return
+      void engineRef.current?.request(EngineRPC.KillBg, { id }, fid)
+    },
+    [fid],
+  )
+
+  const handleDismissBg = useCallback(
+    (id: string) => {
+      if (!fid) return
+      void engineRef.current
+        ?.request(EngineRPC.DismissBg, { id }, fid)
+        .then(() => {
+          setApp((a) => {
+            const prev = a.transcripts.get(fid) ?? initialState()
+            return setTranscript(a, fid, {
+              ...prev,
+              bgProcs: prev.bgProcs.filter((p) => p.id !== id),
+              bgLogID: prev.bgLogID === id ? null : prev.bgLogID,
+              bgLogText: prev.bgLogID === id ? '' : prev.bgLogText,
+            })
+          })
+        })
+        .catch(() => {})
+    },
+    [fid],
+  )
 
   const handleDeleteConfirm = useCallback(async () => {
     const target = pendingDelete
@@ -512,7 +624,10 @@ export function App() {
             const eng = engineRef.current
             if (eng) void focusSession(eng, id)
           }}
-          onStop={(id) => void handleStop(id)}
+          onStop={(id) => {
+            const s = app.sessions.get(id)
+            if (s) setPendingStop(s)
+          }}
           onDelete={(id) => {
             const s = app.sessions.get(id)
             if (s) setPendingDelete(s)
@@ -558,6 +673,27 @@ export function App() {
                   onDeny={handleDeny}
                 />
               )}
+              {chat.bgLogID && (() => {
+                const proc = chat.bgProcs.find((p) => p.id === chat.bgLogID)
+                if (!proc) return null
+                return (
+                  <ShellLogDrawer
+                    proc={proc}
+                    text={chat.bgLogText}
+                    onClose={handleCloseBgLog}
+                    onKill={() => handleKillBg(proc.id)}
+                    onDismiss={() => handleDismissBg(proc.id)}
+                  />
+                )
+              })()}
+              <ShellSessions
+                procs={chat.bgProcs}
+                expanded={chat.bgExpanded}
+                onToggleExpand={handleToggleBgExpand}
+                onOpenLog={handleOpenBgLog}
+                onKill={handleKillBg}
+                onDismiss={handleDismissBg}
+              />
               <Composer
                 busy={chat.busy}
                 session={focusedSession}
@@ -584,6 +720,16 @@ export function App() {
           engine={engineRef.current}
           onCreated={handleCreated}
           onClose={() => setShowCreate(false)}
+        />
+      )}
+      {pendingStop && (
+        <ConfirmDialog
+          title="Stop session"
+          body="Stopping this session will kill any background shell processes it started."
+          confirmLabel="Stop"
+          danger
+          onConfirm={() => void handleStopConfirm()}
+          onCancel={() => setPendingStop(null)}
         />
       )}
       {pendingDelete && (
