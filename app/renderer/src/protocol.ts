@@ -109,7 +109,28 @@ export const EngineRPC = {
   ListCommands: "engine.listCommands",
   History: "engine.history",
   MCPCount: "engine.mcpCount",
+  ListBg: "engine.listBg",
+  KillBg: "engine.killBg",
+  BgLog: "engine.bgLog",
+  DismissBg: "engine.dismissBg",
 } as const;
+
+export interface BgProcInfo {
+  id: string;
+  command: string;
+  dir: string;
+  running: boolean;
+  exit_code: number;
+  started_at: string;
+}
+
+export interface ListBgResult {
+  procs: BgProcInfo[];
+}
+
+export interface BgLogResult {
+  text: string;
+}
 
 export interface CommandDesc {
   name: string;
@@ -312,12 +333,38 @@ export interface PendingPermission {
   command: string;
   reason: string;
 }
+export interface BgSnapshot {
+  id: string;
+  command: string;
+  dir: string;
+  running: boolean;
+  exit_code?: number;
+  recent_output?: string;
+  started_at?: string;
+}
 export interface EngineSnapshotEvent {
   etype: "engine_snapshot";
   busy: boolean;
   streamed_text: string;
   active_tools: ToolSnapshot[];
   pending_permission?: PendingPermission;
+  bg_procs?: BgSnapshot[];
+}
+export interface BgStartedEvent {
+  etype: "bg_started";
+  id: string;
+  command: string;
+  dir: string;
+}
+export interface BgOutputEvent {
+  etype: "bg_output";
+  id: string;
+  text: string;
+}
+export interface BgExitedEvent {
+  etype: "bg_exited";
+  id: string;
+  code: number;
 }
 export interface ApprovalResolvedEvent {
   etype: "approval_resolved";
@@ -372,6 +419,9 @@ export type Event =
   | ThinkingBlockEvent
   | ThinkingDeltaEvent
   | EngineSnapshotEvent
+  | BgStartedEvent
+  | BgOutputEvent
+  | BgExitedEvent
   | ApprovalResolvedEvent
   | SessionStatusEvent
   | SubagentEventEvent;

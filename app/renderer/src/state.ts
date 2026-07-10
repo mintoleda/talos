@@ -25,6 +25,10 @@ import type {
   BatchFinishedEvent,
   SubagentStartedEvent,
   SubagentFinishedEvent,
+  BgStartedEvent,
+  BgOutputEvent,
+  BgExitedEvent,
+  BgSnapshot,
 } from './protocol';
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -44,6 +48,16 @@ export interface MessageEntry {
   text: string;
   toolCalls: ToolCallState[];
   usage?: { prompt_tokens: number; completion_tokens: number; cached_prompt_tokens: number };
+}
+
+export interface BgProcState {
+  id: string;
+  command: string;
+  dir: string;
+  running: boolean;
+  exitCode: number;
+  recentLines: string;
+  startedAt: string;
 }
 
 export interface ChatState {
@@ -69,6 +83,11 @@ export interface ChatState {
   contextLimit: number;
   /** Current batch nesting (0 = no batch) */
   batchDepth: number;
+  /** Background shell sessions for this engine */
+  bgProcs: BgProcState[];
+  bgExpanded: boolean;
+  bgLogID: string | null;
+  bgLogText: string;
 }
 
 export function initialState(): ChatState {
@@ -86,6 +105,10 @@ export function initialState(): ChatState {
     promptTokens: 0,
     contextLimit: 0,
     batchDepth: 0,
+    bgProcs: [],
+    bgExpanded: false,
+    bgLogID: null,
+    bgLogText: '',
   };
 }
 
@@ -148,13 +171,71 @@ export function reduceState(s: ChatState, ev: Event): ChatState {
           },
         ],
       };
+    case 'bg_started':
+      return handleBgStarted(s, ev);
+    case 'bg_output':
+      return handleBgOutput(s, ev);
+    case 'bg_exited':
+      return handleBgExited(s, ev);
     default:
       return s;
   }
 }
 
+function bgFromSnapshot(p: BgSnapshot): BgProcState {
+  return {
+    id: p.id,
+    command: p.command,
+    dir: p.dir,
+    running: p.running,
+    exitCode: p.exit_code ?? 0,
+    recentLines: p.recent_output ?? '',
+    startedAt: p.started_at ?? '',
+  };
+}
+
+function handleBgStarted(s: ChatState, ev: BgStartedEvent): ChatState {
+  const rest = s.bgProcs.filter((p) => p.id !== ev.id);
+  return {
+    ...s,
+    bgProcs: [
+      ...rest,
+      {
+        id: ev.id,
+        command: ev.command,
+        dir: ev.dir,
+        running: true,
+        exitCode: 0,
+        recentLines: '',
+        startedAt: new Date().toISOString(),
+      },
+    ],
+  };
+}
+
+function handleBgOutput(s: ChatState, ev: BgOutputEvent): ChatState {
+  return {
+    ...s,
+    bgProcs: s.bgProcs.map((p) =>
+      p.id === ev.id ? { ...p, recentLines: (p.recentLines + ev.text).slice(-8192) } : p,
+    ),
+    bgLogText: s.bgLogID === ev.id ? s.bgLogText + ev.text : s.bgLogText,
+  };
+}
+
+function handleBgExited(s: ChatState, ev: BgExitedEvent): ChatState {
+  return {
+    ...s,
+    bgProcs: s.bgProcs.map((p) =>
+      p.id === ev.id ? { ...p, running: false, exitCode: ev.code } : p,
+    ),
+  };
+}
+
 function handleSnapshot(s: ChatState, ev: EngineSnapshotEvent): ChatState {
   const pending = ev.pending_permission
+  const bgProcs = (ev.bg_procs ?? []).map(bgFromSnapshot)
+  const logStillOpen = s.bgLogID && bgProcs.some((p) => p.id === s.bgLogID)
   return {
     ...s,
     busy: ev.busy,
@@ -174,6 +255,9 @@ function handleSnapshot(s: ChatState, ev: EngineSnapshotEvent): ChatState {
           reason: pending.reason,
         }
       : null,
+    bgProcs,
+    bgLogID: logStillOpen ? s.bgLogID : null,
+    bgLogText: logStillOpen ? s.bgLogText : '',
   };
 }
 
