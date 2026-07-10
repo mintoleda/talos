@@ -1289,6 +1289,8 @@ func (m Model) handleEvent(e protocol.Event) Model {
 		m.subagents = m.subagents.HandleEvent(ev)
 	case protocol.SubagentFinished:
 		m.subagents = m.subagents.HandleEvent(ev)
+	case protocol.BgStarted, protocol.BgOutput, protocol.BgExited:
+		// Desktop shell sessions panel; TUI ignores for now.
 	}
 	return m
 }
