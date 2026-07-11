@@ -37,6 +37,7 @@ export type AppSettings = {
 const POLL_MS = 250
 const SPAWN_TIMEOUT_MS = 10_000
 const PROBE_TIMEOUT_MS = 2_000
+const ensureInFlight = new Map<string, Promise<DaemonInfo>>()
 
 export function talosHome(homeDir?: string): string {
   return join(homeDir ?? homedir(), '.talos')
@@ -249,23 +250,53 @@ export async function resolveTalosPath(cached?: string, homeDir?: string): Promi
   )
 }
 
-async function spawnDaemon(talosPath: string): Promise<void> {
+type SpawnResult = { stderr: () => string }
+
+async function spawnDaemon(talosPath: string): Promise<SpawnResult> {
+  // `serve -d` re-execs the real daemon detached (its output goes to
+  // ~/.talos/daemon.log); we only pipe the short-lived parent's stderr.
+  let buf = ''
   const child = spawn(talosPath, ['serve', '-d'], {
     detached: true,
-    stdio: 'ignore',
+    stdio: ['ignore', 'ignore', 'pipe'],
     env: process.env,
   })
+  child.stderr?.on('data', (d: Buffer) => {
+    buf += d.toString()
+  })
+  child.on('error', (err) => {
+    buf += `spawn error: ${err.message}\n`
+  })
   child.unref()
+  return { stderr: () => buf.trim() }
 }
 
-async function waitForDiscovery(homeDir?: string, timeoutMs = SPAWN_TIMEOUT_MS): Promise<Discovery> {
+async function daemonLogTail(homeDir?: string, lines = 10): Promise<string> {
+  try {
+    const raw = await fs.readFile(join(talosHome(homeDir), 'daemon.log'), 'utf8')
+    return raw.trimEnd().split('\n').slice(-lines).join('\n')
+  } catch {
+    return ''
+  }
+}
+
+async function waitForDiscovery(
+  spawned: SpawnResult,
+  homeDir?: string,
+  timeoutMs = SPAWN_TIMEOUT_MS,
+): Promise<Discovery> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const d = await readDiscoveryAsync(homeDir)
     if (d) return d
     await new Promise((r) => setTimeout(r, POLL_MS))
   }
-  throw new Error('timed out waiting for ~/.talos/daemon.json after spawning talos serve -d')
+  let msg = 'timed out waiting for ~/.talos/daemon.json after spawning talos serve -d'
+  const stderr = spawned.stderr()
+  if (stderr) msg += `\nspawn stderr: ${stderr}`
+  const logTail = await daemonLogTail(homeDir)
+  if (logTail) msg += `\n~/.talos/daemon.log tail:\n${logTail}`
+  throw new Error(msg)
 }
 
 function discoveryToInfo(d: Discovery): DaemonInfo {
@@ -279,7 +310,7 @@ function discoveryToInfo(d: Discovery): DaemonInfo {
   }
 }
 
-export async function ensureDaemon(opts?: {
+async function ensureDaemonOnce(opts?: {
   talosPath?: string
   homeDir?: string
 }): Promise<DaemonInfo> {
@@ -295,13 +326,31 @@ export async function ensureDaemon(opts?: {
   }
 
   const talosPath = await resolveTalosPath(opts?.talosPath, homeDir)
-  await spawnDaemon(talosPath)
-  const d = await waitForDiscovery(homeDir)
+  const spawned = await spawnDaemon(talosPath)
+  const d = await waitForDiscovery(spawned, homeDir)
   const hello = await probeDaemon(d.ws, d.token)
   if (!hello) {
     throw new Error(`spawned daemon at ${d.ws} but probe failed`)
   }
   return discoveryToInfo(d)
+}
+
+// Renderer development mode can mount effects twice. Coalesce concurrent IPC
+// requests so they cannot spawn competing daemons for the same Talos home.
+export function ensureDaemon(opts?: {
+  talosPath?: string
+  homeDir?: string
+}): Promise<DaemonInfo> {
+  const key = talosHome(opts?.homeDir)
+  const pending = ensureInFlight.get(key)
+  if (pending) return pending
+
+  let task: Promise<DaemonInfo>
+  task = ensureDaemonOnce(opts).finally(() => {
+    if (ensureInFlight.get(key) === task) ensureInFlight.delete(key)
+  })
+  ensureInFlight.set(key, task)
+  return task
 }
 
 function killPid(pid: number): void {
@@ -332,6 +381,15 @@ export async function restartDaemon(opts?: {
   homeDir?: string
 }): Promise<DaemonInfo> {
   const homeDir = opts?.homeDir
+  const key = talosHome(homeDir)
+  const pending = ensureInFlight.get(key)
+  if (pending) {
+    try {
+      await pending
+    } catch {
+      // A failed ensure has already cleared its in-flight entry.
+    }
+  }
   const existing = await readDiscoveryAsync(homeDir)
   if (existing?.pid) {
     killPid(existing.pid)
