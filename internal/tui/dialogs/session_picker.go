@@ -16,19 +16,16 @@ import (
 type SessionEntry struct {
 	ID      string
 	ModTime time.Time
-	Preview string // truncated last user message
+	Preview string
 }
 
-// SessionPickerDoneMsg is sent when the user selects or cancels.
 type SessionPickerDoneMsg struct {
 	ID       string
 	Canceled bool
 }
 
-// FetchSessionsFunc returns all sessions for the current project.
 type FetchSessionsFunc func() ([]SessionEntry, error)
 
-// DeleteSessionFunc removes a session by ID. It should return nil on success.
 type DeleteSessionFunc func(id string) error
 
 type sessionsLoadedMsg struct {
@@ -36,7 +33,6 @@ type sessionsLoadedMsg struct {
 	err     error
 }
 
-// SessionPickerDialog is a full-screen interactive session selector.
 type SessionPickerDialog struct {
 	entries       []SessionEntry
 	selected      int
@@ -63,14 +59,11 @@ func NewSessionPickerDialog(fetch FetchSessionsFunc) *SessionPickerDialog {
 	}
 }
 
-// WithDeleteFn sets the delete callback for the picker.
 func (d *SessionPickerDialog) WithDeleteFn(fn DeleteSessionFunc) *SessionPickerDialog {
 	d.deleteFn = fn
 	return d
 }
 
-// WithSize pre-seeds the dialog dimensions so the first render is correct
-// without waiting for a WindowSizeMsg.
 func (d *SessionPickerDialog) WithSize(w, h int) *SessionPickerDialog {
 	d.width, d.height = w, h
 	return d

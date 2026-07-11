@@ -15,23 +15,19 @@ import (
 
 const maxVisible = 10
 
-// ModelPickerDoneMsg is sent when the user selects or cancels.
 type ModelPickerDoneMsg struct {
 	Provider string
 	Model    string
 	Canceled bool
 }
 
-// modelsLoadedMsg carries the result of the async fetch.
 type modelsLoadedMsg struct {
 	entries []models.Entry
 	err     error
 }
 
-// FetchModelsFunc fetches all available models across all logged-in providers.
 type FetchModelsFunc func() ([]models.Entry, error)
 
-// ModelPickerDialog is a full-screen interactive model selector.
 type ModelPickerDialog struct {
 	all      []models.Entry
 	filtered []models.Entry
