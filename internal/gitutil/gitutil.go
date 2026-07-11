@@ -34,7 +34,17 @@ func IsDirty(dir string) (bool, error) {
 // WorktreeAdd creates a detached worktree at wtDir from projectDir's HEAD,
 // then creates and checks out branch in that worktree.
 func WorktreeAdd(projectDir, wtDir, branch string) error {
-	if _, err := run(projectDir, "worktree", "add", "--detach", wtDir); err != nil {
+	return WorktreeAddAtRef(projectDir, wtDir, branch, "HEAD")
+}
+
+// WorktreeAddAtRef creates a detached worktree from ref, then creates branch
+// in that worktree. Callers that will merge back into a known base should pass
+// that base rather than inheriting whatever branch happens to be checked out.
+func WorktreeAddAtRef(projectDir, wtDir, branch, ref string) error {
+	if ref == "" {
+		ref = "HEAD"
+	}
+	if _, err := run(projectDir, "worktree", "add", "--detach", wtDir, ref); err != nil {
 		return err
 	}
 	if _, err := run(wtDir, "switch", "-c", branch); err != nil {
@@ -53,6 +63,12 @@ func WorktreeAddFromBranch(projectDir, wtDir, branch string) error {
 // WorktreeRemove force-removes a worktree registration and directory.
 func WorktreeRemove(projectDir, wtDir string) error {
 	_, err := run(projectDir, "worktree", "remove", "--force", wtDir)
+	return err
+}
+
+// WorktreeRemoveClean removes a verified-clean worktree without force.
+func WorktreeRemoveClean(projectDir, wtDir string) error {
+	_, err := run(projectDir, "worktree", "remove", wtDir)
 	return err
 }
 
@@ -78,7 +94,7 @@ func BranchDelete(projectDir, branch string) error {
 }
 
 // BranchForceDelete deletes a branch even if unmerged (git branch -D).
-// Used only for cleanup after a failed Create, never for user Delete.
+// Used only after failed creation or verified squash-merge cleanup.
 func BranchForceDelete(projectDir, branch string) error {
 	_, err := run(projectDir, "branch", "-D", branch)
 	return err

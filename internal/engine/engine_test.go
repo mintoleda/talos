@@ -57,6 +57,8 @@ func engineHarness(t *testing.T) *Engine {
 	lp := loop.New(prov, exec, tx, pb)
 
 	tmpDir := t.TempDir()
+	// Session transcripts/metas resolve via $HOME; keep them out of the real one.
+	t.Setenv("HOME", tmpDir)
 	baseDir := filepath.Join(tmpDir, ".talos")
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		t.Fatal(err)
@@ -487,6 +489,8 @@ func TestSubmitTextResolvesImage(t *testing.T) {
 	lp := loop.New(rec, exec, tx, pb)
 
 	tmpDir := t.TempDir()
+	// Session transcripts/metas resolve via $HOME; keep them out of the real one.
+	t.Setenv("HOME", tmpDir)
 	baseDir := filepath.Join(tmpDir, ".talos")
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		t.Fatal(err)
@@ -577,6 +581,8 @@ func TestBgRPCs(t *testing.T) {
 	lp := loop.New(prov, exec, tx, pb)
 
 	tmpDir := t.TempDir()
+	// Session transcripts/metas resolve via $HOME; keep them out of the real one.
+	t.Setenv("HOME", tmpDir)
 	baseDir := filepath.Join(tmpDir, ".talos")
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		t.Fatal(err)

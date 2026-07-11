@@ -81,3 +81,14 @@ func lastUserMessage(path string) string {
 	}
 	return last
 }
+
+// PreviewSession returns the truncated last-user-message preview for a single
+// transcript, without scanning the project's other sessions.
+func PreviewSession(projectRoot, id string) string {
+	path := filepath.Join(SessionsDir(), ProjectHash(projectRoot), id+".jsonl")
+	preview := lastUserMessage(path)
+	if len(preview) > 80 {
+		preview = preview[:77] + "..."
+	}
+	return preview
+}

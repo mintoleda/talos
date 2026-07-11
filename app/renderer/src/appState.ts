@@ -188,11 +188,12 @@ export function applySessionStatus(app: AppState, ev: SessionStatusEvent): AppSt
   const patched: SessionInfo = {
     ...existing,
     state: ev.state,
-    live: ev.state !== 'unloaded',
+    live: ev.state !== 'unloaded' && ev.state !== 'merged',
   }
   if (ev.preview !== undefined) patched.preview = ev.preview
   if (ev.dir !== undefined) patched.dir = ev.dir
-  if (ev.state === 'unloaded') patched.live = false
+  if (ev.state === 'unloaded' || ev.state === 'merged') patched.live = false
+  if (ev.state === 'merged') patched.merged = true
   if (ev.state === 'idle' || ev.state === 'busy' || ev.state === 'awaiting_approval') {
     patched.live = true
   }

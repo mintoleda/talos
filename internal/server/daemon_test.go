@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,10 +85,23 @@ func TestDaemonHandleConnSubscribeAndRoute(t *testing.T) {
 	if err := enc.Encode(transport.ClientMsg{Type: "request", ID: 1, Method: rpc.DaemonCreateSession, Params: raw}); err != nil {
 		t.Fatal(err)
 	}
-	var resp transport.ServerMsg
-	if err := dec.Decode(&resp); err != nil {
-		t.Fatalf("create resp: %v", err)
+	// Session-status broadcasts are pushed by an async writer and may
+	// interleave anywhere; skip them when expecting a specific reply.
+	decodeSkipStatus := func(what string) transport.ServerMsg {
+		t.Helper()
+		for {
+			var sm transport.ServerMsg
+			if err := dec.Decode(&sm); err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+			if sm.Type == "event" && sm.EType == "session_status" {
+				continue
+			}
+			return sm
+		}
 	}
+
+	resp := decodeSkipStatus("create resp")
 	if resp.Err != "" {
 		t.Fatalf("create err: %s", resp.Err)
 	}
@@ -102,10 +116,7 @@ func TestDaemonHandleConnSubscribeAndRoute(t *testing.T) {
 	if err := enc.Encode(transport.ClientMsg{Type: "input", Text: "nope"}); err != nil {
 		t.Fatal(err)
 	}
-	var errMsg transport.ServerMsg
-	if err := dec.Decode(&errMsg); err != nil {
-		t.Fatalf("err msg: %v", err)
-	}
+	errMsg := decodeSkipStatus("err msg")
 	if errMsg.Type != "error" || errMsg.Err != "no session selected" {
 		t.Fatalf("expected no session selected, got %+v", errMsg)
 	}
@@ -113,10 +124,7 @@ func TestDaemonHandleConnSubscribeAndRoute(t *testing.T) {
 	if err := enc.Encode(transport.ClientMsg{Type: "subscribe", Session: created.Session.ID}); err != nil {
 		t.Fatal(err)
 	}
-	var snapMsg transport.ServerMsg
-	if err := dec.Decode(&snapMsg); err != nil {
-		t.Fatalf("snap: %v", err)
-	}
+	snapMsg := decodeSkipStatus("snap")
 	if snapMsg.Type != "event" || snapMsg.Session != created.Session.ID {
 		t.Fatalf("snap = %+v", snapMsg)
 	}
@@ -188,6 +196,99 @@ func TestDaemonSockPaths(t *testing.T) {
 	}
 	if DaemonPidPath("/tmp/x") != "/tmp/x/daemon.pid" {
 		t.Fatal(DaemonPidPath("/tmp/x"))
+	}
+}
+
+func TestDaemonStartKeepsLiveSocket(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), ".talos")
+	cfg := &config.Config{BaseDir: baseDir, Provider: "test", Model: "m"}
+	first := NewDaemon(cfg, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- first.Start(ctx) }()
+
+	sock := DaemonSockPath(baseDir)
+	deadline := time.Now().Add(time.Second)
+	for !IsAlive(sock) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !IsAlive(sock) {
+		cancel()
+		t.Fatal("first daemon did not start")
+	}
+
+	second := NewDaemon(cfg, 0)
+	err := second.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "already accepting connections") {
+		cancel()
+		t.Fatalf("second Start error = %v", err)
+	}
+	if !IsAlive(sock) {
+		cancel()
+		t.Fatal("second daemon removed the first daemon socket")
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("first Start: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first daemon did not stop")
+	}
+}
+
+func TestDaemonRestoresMissingDiscovery(t *testing.T) {
+	baseDir := filepath.Join(t.TempDir(), ".talos")
+	cfg := &config.Config{BaseDir: baseDir, Provider: "test", Model: "m"}
+	d := NewDaemon(cfg, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- d.Start(ctx) }()
+
+	path := DiscoveryPath(baseDir)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	orig, err := ReadDiscovery(path)
+	if err != nil {
+		t.Fatalf("daemon did not write discovery: %v", err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	// The accept loop heals the file within one ~2s tick.
+	deadline = time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	restored, err := ReadDiscovery(path)
+	if err != nil {
+		t.Fatalf("discovery not restored: %v", err)
+	}
+	if restored.Token != orig.Token || restored.WS != orig.WS || restored.PID != orig.PID {
+		t.Fatalf("restored discovery differs: %+v vs %+v", restored, orig)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("daemon did not stop")
 	}
 }
 

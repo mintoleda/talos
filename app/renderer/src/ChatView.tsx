@@ -4,6 +4,7 @@
 
 import React, { useRef, useEffect } from 'react';
 import type { MessageEntry, ToolCallState } from './state';
+import { Markdown } from './Markdown';
 
 interface ChatViewProps {
   messages: MessageEntry[];
@@ -11,9 +12,10 @@ interface ChatViewProps {
   streamedThinking: string;
   activeTools: ToolCallState[];
   busy: boolean;
+  thinkExpanded: boolean;
 }
 
-export function ChatView({ messages, streamedText, streamedThinking, activeTools, busy }: ChatViewProps) {
+export function ChatView({ messages, streamedText, streamedThinking, activeTools, busy, thinkExpanded }: ChatViewProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -23,7 +25,7 @@ export function ChatView({ messages, streamedText, streamedThinking, activeTools
   return (
     <div className="chat-view">
       {messages.map((msg, i) => (
-        <MessageRow key={i} msg={msg} />
+        <MessageRow key={i} msg={msg} thinkExpanded={thinkExpanded} />
       ))}
 
       {/* In-progress assistant response */}
@@ -31,14 +33,18 @@ export function ChatView({ messages, streamedText, streamedThinking, activeTools
         <>
           {streamedThinking && (
             <div className="message assistant">
-              <div className="msg-label thinking-label">thinking</div>
-              <div className="msg-text thinking-text">{streamedThinking}</div>
+              <div className="msg-label thinking-label">
+                {thinkExpanded ? 'thinking' : `thinking·${Math.round(streamedThinking.length / 4)}tok`}
+              </div>
+              {thinkExpanded && (
+                <div className="msg-text thinking-text">{streamedThinking}</div>
+              )}
             </div>
           )}
           {streamedText && (
             <div className="message assistant">
               <div className="msg-label">assistant</div>
-              <div className="msg-text">{streamedText}</div>
+              <div className="msg-text"><Markdown text={streamedText} /></div>
             </div>
           )}
           {activeTools.length > 0 && (
@@ -57,7 +63,7 @@ export function ChatView({ messages, streamedText, streamedThinking, activeTools
   );
 }
 
-function MessageRow({ msg }: { msg: MessageEntry }) {
+function MessageRow({ msg, thinkExpanded }: { msg: MessageEntry; thinkExpanded: boolean }) {
   if (msg.role === 'tool') {
     return (
       <div className="message tool">
@@ -69,11 +75,24 @@ function MessageRow({ msg }: { msg: MessageEntry }) {
     );
   }
 
+  if (msg.type === 'thinking') {
+    return (
+      <div className="message assistant">
+        <div className="msg-label thinking-label">
+          {thinkExpanded ? 'thinking' : `thinking·${Math.round(msg.text.length / 4)}tok`}
+        </div>
+        {thinkExpanded && <div className="msg-text thinking-text">{msg.text}</div>}
+      </div>
+    );
+  }
+
   const cls = msg.role === 'user' ? 'user' : 'assistant';
   return (
     <div className={`message ${cls}`}>
       <div className="msg-label">{msg.role}</div>
-      <div className="msg-text">{msg.text}</div>
+      <div className="msg-text">
+        {msg.role === 'assistant' ? <Markdown text={msg.text} /> : msg.text}
+      </div>
       {msg.usage && (
         <div className="msg-usage">
           {msg.usage.prompt_tokens}↑ {msg.usage.completion_tokens}↓

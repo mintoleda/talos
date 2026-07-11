@@ -57,7 +57,7 @@
 
 1. **`cmd/talos/`** wires everything together: parses CLI flags, loads config and auth, creates the provider, executor, loop, and session, then hands control to the TUI, one-shot renderer, or server.
 
-2. **`internal/tui/`** — Bubble Tea TUI with a chat pane (markdown rendering), tools pane, subagents pane, and dialogs for login, confirm, plan review, merge review, model picking, and session picking.
+2. **`internal/tui/`** — Bubble Tea TUI with a chat pane (markdown rendering), tools pane, subagents pane, and dialogs for login, confirm, plan review, model picking, and session picking. Worktree merge-back review lives in the Electron app (`merge.*` RPCs), not the TUI.
 
 3. **`internal/loop/`** — drives the LLM conversation: builds requests from the system prompt + tool schemas + transcript, streams responses from the provider, assembles tool results back into messages, and compacts when context is near capacity.
 

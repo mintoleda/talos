@@ -37,7 +37,8 @@ export interface SessionInfo {
   branch?: string;
   ahead?: number;
   dirty?: boolean;
-  state: "idle" | "busy" | "awaiting_approval" | "unloaded" | string;
+  merged?: boolean;
+  state: "idle" | "busy" | "awaiting_approval" | "unloaded" | "merged" | string;
   live: boolean;
   provider: string;
   model: string;
@@ -91,6 +92,81 @@ export const DaemonRPC = {
   GCWorktrees: "daemon.gcWorktrees",
   ProbeDir: "daemon.probeDir",
 } as const;
+
+export const MergeRPC = {
+  Preview: "merge.preview",
+  FileDiff: "merge.fileDiff",
+  Execute: "merge.execute",
+  CommitWorktree: "merge.commitWorktree",
+} as const;
+
+export interface MergeCommitInfo {
+  sha: string;
+  subject: string;
+  author: string;
+  time: string;
+}
+
+export interface MergeFileStat {
+  path: string;
+  status: string;
+  additions: number;
+  deletions: number;
+}
+
+export interface MergePreviewParams {
+  id: string;
+  base?: string;
+}
+
+export interface MergePreviewResult {
+  base: string;
+  branch: string;
+  ahead: number;
+  behind: number;
+  dirty_worktree: boolean;
+  dirty_main: boolean;
+  dirty_main_hit?: string[];
+  commits: MergeCommitInfo[];
+  files: MergeFileStat[];
+  can_ff: boolean;
+  session_state: string;
+}
+
+export interface MergeFileDiffParams {
+  id: string;
+  path: string;
+  context?: number;
+  base?: string;
+}
+
+export interface MergeFileDiffResult {
+  unified: string;
+}
+
+export interface MergeExecuteParams {
+  id: string;
+  strategy: "squash" | "merge" | "ff" | string;
+  message?: string;
+  cleanup?: boolean;
+  base?: string;
+}
+
+export interface MergeExecuteResult {
+  merged: boolean;
+  conflict: boolean;
+  conflict_files?: string[];
+  sha?: string;
+}
+
+export interface MergeCommitWorktreeParams {
+  id: string;
+  message: string;
+}
+
+export interface MergeCommitWorktreeResult {
+  sha: string;
+}
 
 export const EngineRPC = {
   ListModels: "engine.listModels",

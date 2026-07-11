@@ -32,6 +32,9 @@ export type ComposerProps = {
   onLocalCommand: (name: string) => void
   /** Increment / change to clear local steer chips (e.g. on TurnEnded). */
   steerClearSignal?: number
+  /** External text to place in the composer (e.g. conflict resolution prompt). */
+  prefill?: string | null
+  onPrefillConsumed?: () => void
 }
 
 type PopoverKind = 'none' | 'mention' | 'slash' | 'model' | 'permission'
@@ -51,6 +54,8 @@ export function Composer({
   onInterrupt,
   onLocalCommand,
   steerClearSignal = 0,
+  prefill = null,
+  onPrefillConsumed,
 }: ComposerProps) {
   const [value, setValue] = useState('')
   const [steers, setSteers] = useState<string[]>([])
@@ -69,6 +74,13 @@ export function Composer({
   useEffect(() => {
     setSteers([])
   }, [steerClearSignal, sessionId])
+
+  useEffect(() => {
+    if (!prefill) return
+    setValue(prefill)
+    onPrefillConsumed?.()
+    requestAnimationFrame(() => inputRef.current?.focus())
+  }, [prefill, onPrefillConsumed])
 
   const loadCommands = useCallback(async () => {
     if (commands || !engine) return commands ?? LOCAL_COMMANDS

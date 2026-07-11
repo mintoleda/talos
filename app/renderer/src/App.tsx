@@ -32,6 +32,7 @@ import { StatusBar } from './StatusBar'
 import { Sidebar } from './Sidebar'
 import { CreatePopover } from './CreatePopover'
 import { ConfirmDialog } from './ConfirmDialog'
+import { MergeReview } from './MergeReview'
 import type { BgProcInfo, ListBgResult, BgLogResult } from './protocol'
 import { EngineRPC } from './protocol'
 import type { BgProcState } from './state'
@@ -55,6 +56,8 @@ export function App() {
   const [showCreate, setShowCreate] = useState(false)
   const [pendingDelete, setPendingDelete] = useState<SessionInfo | null>(null)
   const [pendingStop, setPendingStop] = useState<SessionInfo | null>(null)
+  const [mergeSession, setMergeSession] = useState<SessionInfo | null>(null)
+  const [composerPrefill, setComposerPrefill] = useState<{ sessionID: string; text: string } | null>(null)
   const [daemonVersion, setDaemonVersion] = useState('')
   const [booting, setBooting] = useState(true)
   const [steerClearSignal, setSteerClearSignal] = useState(0)
@@ -117,18 +120,25 @@ export function App() {
     }
   }, [])
 
-  const focusSession = useCallback(async (eng: Engine, sessionId: string) => {
+  const focusSession = useCallback(async (eng: Engine, sessionId: string): Promise<boolean> => {
     const prev = focusedRef.current
     if (prev === sessionId) {
       eng.subscribe(sessionId)
       void refreshBgProcs(eng, sessionId)
-      return
+      return true
     }
     if (prev) {
       eng.unsubscribe(prev)
     }
 
     const existing = sessionsRef.current.get(sessionId)
+    if (existing?.merged) {
+      setApp((a) => ({
+        ...a,
+        error: 'This session has already been merged and cannot be resumed.',
+      }))
+      return false
+    }
     // Resume unloaded sessions via createSession{resume}.
     if (existing && !existing.live) {
       try {
@@ -142,7 +152,7 @@ export function App() {
           ...a,
           error: e instanceof Error ? e.message : String(e),
         }))
-        return
+        return false
       }
     }
 
@@ -150,7 +160,7 @@ export function App() {
     focusedRef.current = sessionId
 
     setApp((a) => {
-      let next = { ...a, focusedID: sessionId, connected: true, needsProject: false, error: '' }
+      let next: AppState = { ...a, focusedID: sessionId, connected: true, needsProject: false, error: '' }
       if (!next.transcripts.has(sessionId)) {
         next = setTranscript(next, sessionId, initialState())
       }
@@ -182,6 +192,8 @@ export function App() {
       .catch(() => {})
 
     void refreshBgProcs(eng, sessionId)
+
+    return true
   }, [refreshBgProcs])
 
   const checkVersionMismatch = useCallback(async (helloVersion: string, discoveryVersion: string) => {
@@ -355,6 +367,22 @@ export function App() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [focusSession])
+
+  // Alt+T to toggle thinking expansion.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 't' || !e.altKey) return
+      const fid = focusedRef.current
+      if (!fid) return
+      e.preventDefault()
+      setApp((a) => {
+        const prev = a.transcripts.get(fid) ?? initialState()
+        return setTranscript(a, fid, { ...prev, thinkExpanded: !prev.thinkExpanded })
+      })
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   const handleRestartDaemon = useCallback(async () => {
     if (!window.talos) return
@@ -633,6 +661,10 @@ export function App() {
             if (s) setPendingDelete(s)
           }}
           onReveal={handleReveal}
+          onMerge={(id) => {
+            const s = app.sessions.get(id)
+            if (s) setMergeSession(s)
+          }}
         />
         <main className="main-column">
           {app.error && !fid && (
@@ -658,6 +690,16 @@ export function App() {
                 contextLimit={chat.contextLimit}
                 busy={chat.busy}
                 stats={stats}
+                mergeReady={
+                  focusedSession?.isolation === 'worktree' &&
+                  !focusedSession.merged &&
+                  (focusedSession.ahead ?? 0) > 0
+                    ? {
+                        ahead: focusedSession.ahead ?? 0,
+                        onClick: () => setMergeSession(focusedSession),
+                      }
+                    : null
+                }
               />
               <ChatView
                 messages={chat.messages}
@@ -665,6 +707,7 @@ export function App() {
                 streamedThinking={chat.streamedThinking}
                 activeTools={chat.activeTools}
                 busy={chat.busy}
+                thinkExpanded={chat.thinkExpanded}
               />
               {chat.permissionRequest && (
                 <PermissionPrompt
@@ -709,6 +752,12 @@ export function App() {
                 onInterrupt={handleInterrupt}
                 onLocalCommand={handleLocalCommand}
                 steerClearSignal={steerClearSignal}
+                prefill={composerPrefill?.sessionID === fid ? composerPrefill.text : null}
+                onPrefillConsumed={() => {
+                  setComposerPrefill((prefill) =>
+                    prefill?.sessionID === fid ? null : prefill,
+                  )
+                }}
               />
             </>
           )}
@@ -740,6 +789,29 @@ export function App() {
           danger
           onConfirm={() => void handleDeleteConfirm()}
           onCancel={() => setPendingDelete(null)}
+        />
+      )}
+      {mergeSession && engineRef.current && (
+        <MergeReview
+          session={mergeSession}
+          engine={engineRef.current}
+          onClose={() => setMergeSession(null)}
+          onMerged={() => {
+            const eng = engineRef.current
+            if (eng) void refetchSessions(eng)
+          }}
+          onCopyPrompt={(text) => {
+            const sessionID = mergeSession.id
+            void (async () => {
+              const eng = engineRef.current
+              if (!eng) return
+              if (focusedRef.current !== sessionID) {
+                const focused = await focusSession(eng, sessionID)
+                if (!focused) return
+              }
+              setComposerPrefill({ sessionID, text })
+            })()
+          }}
         />
       )}
     </div>

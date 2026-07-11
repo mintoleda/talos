@@ -45,6 +45,7 @@ export interface ToolCallState {
 
 export interface MessageEntry {
   role: 'user' | 'assistant' | 'tool';
+  type?: 'thinking' | 'text'; // default 'text'; 'thinking' for model thinking blocks
   text: string;
   toolCalls: ToolCallState[];
   usage?: { prompt_tokens: number; completion_tokens: number; cached_prompt_tokens: number };
@@ -70,6 +71,8 @@ export interface ChatState {
   activeTools: ToolCallState[];
   /** Whether the engine is currently processing a turn */
   busy: boolean;
+  /** When false, thinking content is collapsed (shown as a brief indicator); alt+t toggles */
+  thinkExpanded: boolean;
   /** Pending permission request (null = no prompt) */
   permissionRequest: PermissionRequestedEvent | null;
   /** Model info */
@@ -97,6 +100,7 @@ export function initialState(): ChatState {
     streamedThinking: '',
     activeTools: [],
     busy: false,
+    thinkExpanded: true,
     permissionRequest: null,
     provider: '',
     model: '',
@@ -340,7 +344,7 @@ function handleTurnEnded(s: ChatState, ev: TurnEndedEvent): ChatState {
 
   // Flush thinking as a standalone message if non-empty.
   if (currentThinking) {
-    assyMsgs.push({ role: 'assistant', text: currentThinking, toolCalls: [] });
+    assyMsgs.push({ role: 'assistant', type: 'thinking', text: currentThinking, toolCalls: [] });
   }
   if (currentText || s.activeTools.length > 0) {
     assyMsgs.push({
