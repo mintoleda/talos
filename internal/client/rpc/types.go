@@ -46,6 +46,11 @@ const (
 	DaemonStatus        = "daemon.status"
 	DaemonGCWorktrees   = "daemon.gcWorktrees"
 	DaemonProbeDir      = "daemon.probeDir"
+
+	MergePreview       = "merge.preview"
+	MergeFileDiff      = "merge.fileDiff"
+	MergeExecute       = "merge.execute"
+	MergeCommitWorktree = "merge.commitWorktree"
 )
 
 // SessionInfo describes a live or persisted-resumable session for the
@@ -58,8 +63,9 @@ type SessionInfo struct {
 	Branch     string    `json:"branch,omitempty"`
 	Ahead      int       `json:"ahead,omitempty"`
 	Dirty      bool      `json:"dirty,omitempty"`
-	State      string    `json:"state"` // "idle"|"busy"|"awaiting_approval"|"unloaded"
-	Live       bool      `json:"live"`  // engine loaded in daemon
+	Merged     bool      `json:"merged,omitempty"` // true after merge.execute cleanup
+	State      string    `json:"state"`            // "idle"|"busy"|"awaiting_approval"|"unloaded"
+	Live       bool      `json:"live"`             // engine loaded in daemon
 	Provider   string    `json:"provider"`
 	Model      string    `json:"model"`
 	Preview    string    `json:"preview"` // first-user-message snippet
@@ -246,4 +252,74 @@ type BgLogParams struct {
 
 type BgLogResult struct {
 	Text string `json:"text"`
+}
+
+// ── merge.* ──────────────────────────────────────────────────────────────
+
+type MergeCommitInfo struct {
+	SHA     string    `json:"sha"`
+	Subject string    `json:"subject"`
+	Author  string    `json:"author"`
+	Time    time.Time `json:"time"`
+}
+
+type MergeFileStat struct {
+	Path      string `json:"path"`
+	Status    string `json:"status"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+}
+
+type MergePreviewParams struct {
+	ID   string `json:"id"`             // session id
+	Base string `json:"base,omitempty"` // override default branch
+}
+
+type MergePreviewResult struct {
+	Base          string            `json:"base"`
+	Branch        string            `json:"branch"`
+	Ahead         int               `json:"ahead"`
+	Behind        int               `json:"behind"`
+	DirtyWorktree bool              `json:"dirty_worktree"`
+	DirtyMain     bool              `json:"dirty_main"`
+	DirtyMainHit  []string          `json:"dirty_main_hit,omitempty"` // dirty main paths that overlap merge files
+	Commits       []MergeCommitInfo `json:"commits"`
+	Files         []MergeFileStat   `json:"files"`
+	CanFF         bool              `json:"can_ff"`
+	SessionState  string            `json:"session_state"`
+}
+
+type MergeFileDiffParams struct {
+	ID      string `json:"id"`
+	Path    string `json:"path"`
+	Context int    `json:"context,omitempty"`
+	Base    string `json:"base,omitempty"`
+}
+
+type MergeFileDiffResult struct {
+	Unified string `json:"unified"`
+}
+
+type MergeExecuteParams struct {
+	ID       string `json:"id"`
+	Strategy string `json:"strategy"` // "squash"|"merge"|"ff"
+	Message  string `json:"message,omitempty"`
+	Cleanup  bool   `json:"cleanup"`
+	Base     string `json:"base,omitempty"`
+}
+
+type MergeExecuteResult struct {
+	Merged        bool     `json:"merged"`
+	Conflict      bool     `json:"conflict"`
+	ConflictFiles []string `json:"conflict_files,omitempty"`
+	SHA           string   `json:"sha,omitempty"`
+}
+
+type MergeCommitWorktreeParams struct {
+	ID      string `json:"id"`
+	Message string `json:"message"`
+}
+
+type MergeCommitWorktreeResult struct {
+	SHA string `json:"sha"`
 }

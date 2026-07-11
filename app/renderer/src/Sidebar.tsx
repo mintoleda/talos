@@ -16,6 +16,7 @@ export type SidebarProps = {
   onStop: (id: string) => void
   onDelete: (id: string) => void
   onReveal: (dir: string) => void
+  onMerge?: (id: string) => void
 }
 
 export const Sidebar = forwardRef<HTMLElement, SidebarProps>(function Sidebar(
@@ -29,6 +30,7 @@ export const Sidebar = forwardRef<HTMLElement, SidebarProps>(function Sidebar(
     onStop,
     onDelete,
     onReveal,
+    onMerge,
   },
   ref,
 ) {
@@ -50,6 +52,7 @@ export const Sidebar = forwardRef<HTMLElement, SidebarProps>(function Sidebar(
         onStop={onStop}
         onDelete={onDelete}
         onReveal={onReveal}
+        onMerge={onMerge}
       />
       <footer className="sidebar-footer">
         <span className={`conn-dot ${connected ? 'on' : 'off'}`} aria-hidden />

@@ -102,7 +102,26 @@ func (d *Daemon) Start(ctx context.Context) error {
 		d.token = generateToken()
 	}
 
-	_ = os.Remove(d.sockPath)
+	if IsAlive(d.sockPath) {
+		// The IsAlive dial wakes the live daemon's accept loop, which
+		// self-heals a missing discovery file — give it a moment so callers
+		// polling for daemon.json can still find the running daemon.
+		discoveryPath := DiscoveryPath(d.baseDir)
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			if _, err := os.Stat(discoveryPath); err == nil {
+				return fmt.Errorf("daemon already accepting connections at %s", d.sockPath)
+			}
+			if !time.Now().Before(deadline) {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		return fmt.Errorf("daemon already accepting connections at %s but %s is missing and was not restored", d.sockPath, discoveryPath)
+	}
+	if err := os.Remove(d.sockPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale unix socket %s: %w", d.sockPath, err)
+	}
 	if err := os.MkdirAll(filepath.Dir(d.sockPath), 0o755); err != nil {
 		return err
 	}
@@ -127,14 +146,15 @@ func (d *Daemon) Start(ctx context.Context) error {
 	wsAddr := wsLn.Addr().String()
 
 	discoveryPath := DiscoveryPath(d.baseDir)
-	if err := WriteDiscovery(discoveryPath, Discovery{
+	discovery := Discovery{
 		PID:       os.Getpid(),
 		Socket:    d.sockPath,
 		WS:        "ws://" + displayAddr(wsAddr) + "/ws",
 		Token:     d.token,
 		Version:   version.VERSION,
 		StartedAt: d.startedAt,
-	}); err != nil {
+	}
+	if err := WriteDiscovery(discoveryPath, discovery); err != nil {
 		_ = wsLn.Close()
 		return err
 	}
@@ -176,6 +196,16 @@ func (d *Daemon) Start(ctx context.Context) error {
 				return nil
 			}
 		default:
+		}
+
+		// Self-heal: if daemon.json was deleted while we're alive, clients
+		// can't discover us and redundant spawns fail. Restore it.
+		if _, err := os.Stat(discoveryPath); os.IsNotExist(err) {
+			if err := WriteDiscovery(discoveryPath, discovery); err != nil {
+				fmt.Fprintf(os.Stderr, "[daemon] restore discovery: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[daemon] restored missing %s\n", discoveryPath)
+			}
 		}
 
 		if deadlineLn, ok := unixLn.(interface{ SetDeadline(time.Time) error }); ok {
@@ -223,18 +253,7 @@ func (d *Daemon) shouldIdleExit() bool {
 
 func (d *Daemon) serveWeb(ctx context.Context, ln net.Listener) error {
 	mux := http.NewServeMux()
-	mux.Handle("/ws", websocket.Handler(func(conn *websocket.Conn) {
-		addr := ln.Addr().String()
-		if !isLocalhost(addr) {
-			origin := conn.Request().Header.Get("Origin")
-			if origin == "" {
-				origin = conn.Request().Header.Get("Sec-WebSocket-Origin")
-			}
-			if !originAllowed(origin, addr) {
-				_ = encodeServerMsg(json.NewEncoder(conn), &sync.Mutex{}, transport.ServerMsg{Type: "error", Err: "origin not allowed"})
-				return
-			}
-		}
+	mux.Handle("/ws", wsHandler(func() string { return ln.Addr().String() }, func(conn *websocket.Conn) {
 		d.handleConn(ctx, conn)
 	}))
 	if d.webDir != "" {
@@ -418,7 +437,7 @@ func (d *Daemon) resolveEngine(ctx context.Context, dc *daemonConn, sessionHint 
 
 func (d *Daemon) handleRequest(ctx context.Context, dc *daemonConn, cm transport.ClientMsg) (json.RawMessage, string, error) {
 	method := cm.Method
-	if strings.HasPrefix(method, "daemon.") {
+	if strings.HasPrefix(method, "daemon.") || strings.HasPrefix(method, "merge.") {
 		result, err := d.handleDaemonRPC(ctx, method, cm.Params)
 		return result, "", err
 	}
@@ -489,6 +508,46 @@ func (d *Daemon) handleDaemonRPC(ctx context.Context, method string, params json
 			if root, err := gitutil.RepoRoot(abs); err == nil {
 				result.ProjectDir = root
 			}
+		}
+		return json.Marshal(result)
+	case rpc.MergePreview:
+		p, err := decodeParams[rpc.MergePreviewParams](params)
+		if err != nil {
+			return nil, err
+		}
+		result, err := d.manager.MergePreview(p)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(result)
+	case rpc.MergeFileDiff:
+		p, err := decodeParams[rpc.MergeFileDiffParams](params)
+		if err != nil {
+			return nil, err
+		}
+		result, err := d.manager.MergeFileDiff(p)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(result)
+	case rpc.MergeExecute:
+		p, err := decodeParams[rpc.MergeExecuteParams](params)
+		if err != nil {
+			return nil, err
+		}
+		result, err := d.manager.MergeExecute(p)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(result)
+	case rpc.MergeCommitWorktree:
+		p, err := decodeParams[rpc.MergeCommitWorktreeParams](params)
+		if err != nil {
+			return nil, err
+		}
+		result, err := d.manager.MergeCommitWorktree(p)
+		if err != nil {
+			return nil, err
 		}
 		return json.Marshal(result)
 	default:

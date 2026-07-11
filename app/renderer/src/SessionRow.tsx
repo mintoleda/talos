@@ -13,6 +13,7 @@ export type SessionRowProps = {
   onStop: () => void
   onDelete: () => void
   onReveal: () => void
+  onMerge?: () => void
 }
 
 function statusGlyph(state: string, live: boolean): { glyph: string; className: string } {
@@ -23,6 +24,7 @@ function statusGlyph(state: string, live: boolean): { glyph: string; className: 
 }
 
 function branchBadge(s: SessionInfo): string | null {
+  if (s.merged) return 'merged'
   if (s.isolation !== 'worktree') return null
   const ahead = s.ahead ?? 0
   const dirty = !!s.dirty
@@ -46,6 +48,7 @@ export function SessionRow({
   onStop,
   onDelete,
   onReveal,
+  onMerge,
 }: SessionRowProps) {
   const { glyph, className } = statusGlyph(session.state, session.live)
   const branch = branchBadge(session)
@@ -78,25 +81,22 @@ export function SessionRow({
         <span className={`session-glyph ${className}`} aria-hidden>
           {glyph}
         </span>
-        <span className="session-row-body">
-          <span className="session-row-top">
-            <span className="session-preview">{previewTitle(session)}</span>
-            {branch && <span className="session-branch">{branch}</span>}
-          </span>
-          <span className="session-row-meta">
-            {relativeTime(session.last_active || session.created_at)}
-          </span>
+        <span className="session-preview">{previewTitle(session)}</span>
+        {branch && <span className="session-branch">{branch}</span>}
+        <span className="session-row-meta">
+          {relativeTime(session.last_active || session.created_at)}
         </span>
       </button>
       <div className="session-row-actions">
-        {session.live && (
+        {session.state === 'busy' || session.state === 'awaiting_approval' ? (
           <button type="button" className="row-action" title="Stop" onClick={onStop}>
             Stop
           </button>
+        ) : (
+          <button type="button" className="row-action danger" title="Delete" onClick={onDelete}>
+            Del
+          </button>
         )}
-        <button type="button" className="row-action danger" title="Delete" onClick={onDelete}>
-          Del
-        </button>
       </div>
       {menu && (
         <div
@@ -105,6 +105,21 @@ export function SessionRow({
           role="menu"
           onClick={(e) => e.stopPropagation()}
         >
+          {onMerge &&
+            session.isolation === 'worktree' &&
+            !session.merged &&
+            (session.ahead ?? 0) > 0 && (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setMenu(null)
+                  onMerge()
+                }}
+              >
+                Review & merge…
+              </button>
+            )}
           {session.live && (
             <button
               type="button"

@@ -123,6 +123,10 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 		fmt.Fprintf(os.Stderr, "[notice] repaired session: removed %d orphaned tool call(s)\n", n)
 	}
 
+	// Every frontend goes through Build, so the meta sidecar exists (and its
+	// LastActive stays fresh) regardless of whether the daemon manages us.
+	session.EnsureSessionMeta(sess, dir, projectDir, cfg.Provider, cfg.Model)
+
 	// Versioned inputs load from Dir (worktree checkout).
 	if sp, err := config.LoadProjectSystemPrompt(dir); err != nil {
 		fmt.Fprintf(os.Stderr, "[warning] reading SYSTEM_PROMPT.md: %v\n", err)

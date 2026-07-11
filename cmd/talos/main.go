@@ -88,6 +88,8 @@ func run() error {
 			return runAttach(context.Background(), cfg, sid)
 		case "server":
 			return runServerCmd(cfg, args[1:])
+		case "sessions":
+			return runSessionsCmd(args[1:])
 		}
 	}
 
@@ -281,12 +283,33 @@ func runServe(cfg *config.Config, args []string) error {
 		}
 	}
 	if detach && os.Getenv("TALOS_SERVE_DAEMON") != "1" {
-		return detachServe()
+		return detachServe(cfg.BaseDir)
 	}
 	return runDaemon(cfg)
 }
 
-func detachServe() error {
+// runSessionsCmd handles `talos sessions backfill [extra candidate dirs...]`:
+// write meta sidecars for pre-sidecar transcripts so they list everywhere.
+func runSessionsCmd(args []string) error {
+	if len(args) == 0 || args[0] != "backfill" {
+		return fmt.Errorf("usage: talos sessions backfill [extra candidate dirs...]")
+	}
+	candidates := append(session.DefaultBackfillCandidates(), args[1:]...)
+	report, err := session.BackfillMetas(candidates)
+	if err != nil {
+		return err
+	}
+	for _, m := range report.Created {
+		fmt.Printf("backfilled %s → %s\n", m.ID, m.Dir)
+	}
+	for _, bucket := range report.Unresolved {
+		fmt.Printf("unresolved %s (dir not recovered; pass its project dir as an argument)\n", bucket)
+	}
+	fmt.Printf("%d backfilled, %d buckets unresolved\n", len(report.Created), len(report.Unresolved))
+	return nil
+}
+
+func detachServe(baseDir string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -297,6 +320,15 @@ func detachServe() error {
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
+	// The detached daemon's stderr goes to ~/.talos/daemon.log so spawn
+	// failures (e.g. socket conflicts) are diagnosable after the fact.
+	if logf, err := os.OpenFile(filepath.Join(baseDir, "daemon.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+		fmt.Fprintf(logf, "\n--- talos serve -d at %s ---\n", time.Now().Format(time.RFC3339))
+		cmd.Stdout = logf
+		cmd.Stderr = logf
+		defer logf.Close()
+	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("detach serve: %w", err)
 	}

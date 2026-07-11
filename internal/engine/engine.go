@@ -609,6 +609,7 @@ func (e *Engine) NewSession() (string, error) {
 	}
 	e.lp.SetTranscript(tx)
 	e.SetSessionID(ns.ID)
+	session.EnsureSessionMeta(ns, e.cwd, e.projectDir, e.ProviderName(), e.ModelName())
 	fmt.Fprintf(os.Stderr, "[started new session %s]\n", ns.ID)
 	return ns.ID, nil
 }
@@ -633,6 +634,7 @@ func (e *Engine) Resume(id string) (string, []protocol.FrozenMessage, error) {
 	}
 	e.lp.SetTranscript(tx)
 	e.SetSessionID(sess.ID)
+	session.EnsureSessionMeta(sess, e.cwd, e.projectDir, e.ProviderName(), e.ModelName())
 	fmt.Fprintf(os.Stderr, "[resumed session %s]\n", sess.ID)
 	return sess.ID, tx.Frozen(), nil
 }

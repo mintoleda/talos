@@ -197,18 +197,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 func (s *Server) startWebSocket(ctx context.Context) error {
 	mux := http.NewServeMux()
-	mux.Handle("/ws", websocket.Handler(func(conn *websocket.Conn) {
-		addr := s.address
-		if !isLocalhost(addr) {
-			origin := conn.Request().Header.Get("Origin")
-			if origin == "" {
-				origin = conn.Request().Header.Get("Sec-WebSocket-Origin")
-			}
-			if !originAllowed(origin, addr) {
-				_ = encodeServerMsg(json.NewEncoder(conn), &sync.Mutex{}, transport.ServerMsg{Type: "error", Err: "origin not allowed"})
-				return
-			}
-		}
+	mux.Handle("/ws", wsHandler(func() string { return s.address }, func(conn *websocket.Conn) {
 		s.handleConn(ctx, conn)
 	}))
 	if s.webDir != "" {
@@ -287,6 +276,30 @@ func isLocalhost(addr string) bool {
 		return false
 	}
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+// wsHandler wraps handle in a websocket.Server whose handshake applies our
+// origin policy. The default websocket.Handler handshake 403s any request
+// without a parseable Origin header, which rejects every non-browser client
+// (Go, Node ws); token auth is the real barrier, so missing origins are fine.
+func wsHandler(addr func() string, handle func(*websocket.Conn)) http.Handler {
+	return websocket.Server{
+		Handshake: func(_ *websocket.Config, req *http.Request) error {
+			a := addr()
+			if isLocalhost(a) {
+				return nil
+			}
+			origin := req.Header.Get("Origin")
+			if origin == "" {
+				origin = req.Header.Get("Sec-WebSocket-Origin")
+			}
+			if !originAllowed(origin, a) {
+				return fmt.Errorf("origin not allowed")
+			}
+			return nil
+		},
+		Handler: handle,
+	}
 }
 
 // originAllowed checks if a browser origin is permitted to connect. Token

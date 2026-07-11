@@ -2,12 +2,10 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,19 +17,18 @@ import (
 	"github.com/mintoleda/talos/internal/session"
 )
 
-// SessionMeta is the sidecar written next to a transcript so Resume/List can
-// recover cwd and provider without scanning JSONL.
-type SessionMeta struct {
-	ID         string    `json:"id"`
-	Dir        string    `json:"dir"`
-	ProjectDir string    `json:"project_dir"`
-	Isolation  string    `json:"isolation"` // "worktree" | "none"
-	Branch     string    `json:"branch,omitempty"`
-	Provider   string    `json:"provider"`
-	Model      string    `json:"model"`
-	CreatedAt  time.Time `json:"created_at"`
-	LastActive time.Time `json:"last_active"`
-}
+// SessionMeta lives in internal/session so the engine (TUI path) can write
+// the same sidecar the daemon does; aliased here for existing callers.
+type SessionMeta = session.SessionMeta
+
+var (
+	MetaPath            = session.MetaPath
+	WriteSessionMeta    = session.WriteSessionMeta
+	ReadSessionMeta     = session.ReadSessionMeta
+	FindSessionMeta     = session.FindSessionMeta
+	ListAllSessionMetas = session.ListAllSessionMetas
+	TouchSessionMeta    = session.TouchSessionMeta
+)
 
 type gitEnrichment struct {
 	ahead int
@@ -41,24 +38,27 @@ type gitEnrichment struct {
 
 // SessionManager owns live engines and persisted session metadata.
 type SessionManager struct {
-	mu       sync.Mutex
-	cfg      *config.Config
-	engines  map[string]*engine.Engine
-	states   map[string]string // last known SessionStatus state for live engines
-	statusFn func(protocol.SessionStatus)
-	buildFn  func(ctx context.Context, o engine.BuildOpts) (*engine.Built, error)
-	newEng   func(b *engine.Built, ctx context.Context) *engine.Engine
-	gitCache map[string]gitEnrichment
+	mu           sync.Mutex
+	mergeMu      sync.Mutex
+	projectLocks map[string]*sync.Mutex
+	cfg          *config.Config
+	engines      map[string]*engine.Engine
+	states       map[string]string // last known SessionStatus state for live engines
+	statusFn     func(protocol.SessionStatus)
+	buildFn      func(ctx context.Context, o engine.BuildOpts) (*engine.Built, error)
+	newEng       func(b *engine.Built, ctx context.Context) *engine.Engine
+	gitCache     map[string]gitEnrichment
 }
 
 // NewSessionManager creates an empty manager. Engines are created on demand.
 func NewSessionManager(cfg *config.Config) *SessionManager {
 	return &SessionManager{
-		cfg:      cfg,
-		engines:  make(map[string]*engine.Engine),
-		states:   make(map[string]string),
-		gitCache: make(map[string]gitEnrichment),
-		buildFn:  engine.Build,
+		cfg:          cfg,
+		engines:      make(map[string]*engine.Engine),
+		states:       make(map[string]string),
+		gitCache:     make(map[string]gitEnrichment),
+		projectLocks: make(map[string]*sync.Mutex),
+		buildFn:      engine.Build,
 		newEng: func(b *engine.Built, ctx context.Context) *engine.Engine {
 			return b.NewEngine(ctx)
 		},
@@ -127,13 +127,23 @@ func (m *SessionManager) Create(ctx context.Context, params rpc.CreateSessionPar
 
 	wtDir := dir
 	branch := ""
+	defaultBranch := ""
 	if isolation == "worktree" {
+		unlock := m.lockProject(projectDir)
+		defer unlock()
+		defaultBranch, err = gitutil.DefaultBranch(projectDir)
+		if err != nil {
+			return rpc.SessionInfo{}, fmt.Errorf("detect default branch: %w", err)
+		}
+		if err := gitutil.EnsureLocalBranch(projectDir, defaultBranch); err != nil {
+			return rpc.SessionInfo{}, err
+		}
 		wtDir = filepath.Join(m.cfg.BaseDir, "worktrees", session.ProjectHash(projectDir), sessionID)
 		branch = "talos/" + sessionID
 		if err := os.MkdirAll(filepath.Dir(wtDir), 0o755); err != nil {
 			return rpc.SessionInfo{}, fmt.Errorf("worktree parent: %w", err)
 		}
-		if err := gitutil.WorktreeAdd(projectDir, wtDir, branch); err != nil {
+		if err := gitutil.WorktreeAddAtRef(projectDir, wtDir, branch, defaultBranch); err != nil {
 			return rpc.SessionInfo{}, fmt.Errorf("worktree add: %w", err)
 		}
 	}
@@ -162,15 +172,16 @@ func (m *SessionManager) Create(ctx context.Context, params rpc.CreateSessionPar
 
 	now := time.Now()
 	meta := SessionMeta{
-		ID:         built.Session.ID,
-		Dir:        wtDir,
-		ProjectDir: projectDir,
-		Isolation:  isolation,
-		Branch:     branch,
-		Provider:   built.Cfg.Provider,
-		Model:      built.Cfg.Model,
-		CreatedAt:  now,
-		LastActive: now,
+		ID:            built.Session.ID,
+		Dir:           wtDir,
+		ProjectDir:    projectDir,
+		Isolation:     isolation,
+		Branch:        branch,
+		DefaultBranch: defaultBranch,
+		Provider:      built.Cfg.Provider,
+		Model:         built.Cfg.Model,
+		CreatedAt:     now,
+		LastActive:    now,
 	}
 	if err := WriteSessionMeta(meta); err != nil {
 		built.Close()
@@ -229,6 +240,10 @@ func (m *SessionManager) Stop(id string) error {
 // For worktree sessions, removes the worktree and deletes the branch only if merged.
 func (m *SessionManager) Delete(id string) error {
 	meta, metaErr := FindSessionMeta(id)
+	if metaErr == nil && meta.Isolation == "worktree" && meta.ProjectDir != "" {
+		unlock := m.lockProject(meta.ProjectDir)
+		defer unlock()
+	}
 
 	m.mu.Lock()
 	_, live := m.engines[id]
@@ -240,7 +255,7 @@ func (m *SessionManager) Delete(id string) error {
 		return metaErr
 	}
 
-	projectKey := metaProjectKey(meta)
+	projectKey := session.MetaProjectKey(meta)
 	txPath := filepath.Join(session.SessionsDir(), session.ProjectHash(projectKey), id+".jsonl")
 	_ = os.Remove(txPath)
 	_ = os.Remove(txPath + ".reads.json")
@@ -279,13 +294,18 @@ func (m *SessionManager) List() []rpc.SessionInfo {
 	byID := make(map[string]rpc.SessionInfo)
 	for _, meta := range persisted {
 		preview := sessionPreview(meta)
+		state := "unloaded"
+		if meta.Merged {
+			state = "merged"
+		}
 		info := rpc.SessionInfo{
 			ID:         meta.ID,
 			Dir:        meta.Dir,
 			ProjectDir: meta.ProjectDir,
 			Isolation:  meta.Isolation,
 			Branch:     meta.Branch,
-			State:      "unloaded",
+			Merged:     meta.Merged,
+			State:      state,
 			Live:       false,
 			Provider:   meta.Provider,
 			Model:      meta.Model,
@@ -360,8 +380,13 @@ func (m *SessionManager) Resume(ctx context.Context, id string) (*engine.Engine,
 	if err != nil {
 		return nil, err
 	}
+	if meta.Merged {
+		return nil, fmt.Errorf("session %s has already been merged and cannot be resumed", id)
+	}
 
 	if meta.Isolation == "worktree" {
+		unlock := m.lockProject(meta.ProjectDir)
+		defer unlock()
 		if err := m.ensureWorktree(meta); err != nil {
 			return nil, err
 		}
@@ -505,7 +530,9 @@ func (m *SessionManager) GCWorktrees() ([]string, error) {
 		// Best-effort: find a project root via git from the worktree itself.
 		projectDir, err := gitutil.RepoRoot(wt)
 		if err == nil {
+			unlock := m.lockProject(projectDir)
 			_ = gitutil.WorktreeRemove(projectDir, wt)
+			unlock()
 		}
 		if err := os.RemoveAll(wt); err != nil {
 			fmt.Fprintf(os.Stderr, "[notice] gc worktree %s: %v\n", wt, err)
@@ -549,12 +576,17 @@ func (m *SessionManager) emitStatus(st protocol.SessionStatus) {
 }
 
 func (m *SessionManager) sessionInfo(eng *engine.Engine, meta SessionMeta, live bool, state string) rpc.SessionInfo {
+	if meta.Merged {
+		state = "merged"
+		live = false
+	}
 	info := rpc.SessionInfo{
 		ID:         meta.ID,
 		Dir:        meta.Dir,
 		ProjectDir: meta.ProjectDir,
 		Isolation:  meta.Isolation,
 		Branch:     meta.Branch,
+		Merged:     meta.Merged,
 		State:      state,
 		Live:       live,
 		Provider:   meta.Provider,
@@ -579,8 +611,22 @@ func (m *SessionManager) sessionInfo(eng *engine.Engine, meta SessionMeta, live 
 	return info
 }
 
+// lockProject serializes Git mutations that touch one primary checkout.
+func (m *SessionManager) lockProject(projectDir string) func() {
+	key := filepath.Clean(projectDir)
+	m.mergeMu.Lock()
+	lock := m.projectLocks[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		m.projectLocks[key] = lock
+	}
+	m.mergeMu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
 func (m *SessionManager) enrichGit(info *rpc.SessionInfo, meta SessionMeta) {
-	if meta.Isolation != "worktree" || meta.Dir == "" || meta.ProjectDir == "" {
+	if meta.Merged || meta.Isolation != "worktree" || meta.Dir == "" || meta.ProjectDir == "" {
 		return
 	}
 	const ttl = 5 * time.Second
@@ -608,134 +654,6 @@ func (m *SessionManager) enrichGit(info *rpc.SessionInfo, meta SessionMeta) {
 	info.Dirty = dirty
 }
 
-func metaProjectKey(meta SessionMeta) string {
-	if meta.ProjectDir != "" {
-		return meta.ProjectDir
-	}
-	return meta.Dir
-}
-
-// MetaPath returns the sidecar path for a transcript path.
-func MetaPath(transcriptPath string) string {
-	return strings.TrimSuffix(transcriptPath, ".jsonl") + ".meta.json"
-}
-
-// WriteSessionMeta persists meta next to the transcript.
-func WriteSessionMeta(meta SessionMeta) error {
-	dir := filepath.Join(session.SessionsDir(), session.ProjectHash(metaProjectKey(meta)))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	path := filepath.Join(dir, meta.ID+".meta.json")
-	data, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-// ReadSessionMeta loads meta from an explicit path.
-func ReadSessionMeta(path string) (SessionMeta, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return SessionMeta{}, err
-	}
-	var meta SessionMeta
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return SessionMeta{}, err
-	}
-	return meta, nil
-}
-
-// FindSessionMeta searches all project dirs under SessionsDir for id.meta.json.
-func FindSessionMeta(id string) (SessionMeta, error) {
-	root := session.SessionsDir()
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return SessionMeta{}, fmt.Errorf("session not found: %s", id)
-		}
-		return SessionMeta{}, err
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		path := filepath.Join(root, e.Name(), id+".meta.json")
-		meta, err := ReadSessionMeta(path)
-		if err == nil {
-			return meta, nil
-		}
-		// Fallback: transcript exists without meta — cannot recover dir.
-		tx := filepath.Join(root, e.Name(), id+".jsonl")
-		if _, err := os.Stat(tx); err == nil {
-			return SessionMeta{}, fmt.Errorf("session %s has no meta sidecar (dir unknown)", id)
-		}
-	}
-	return SessionMeta{}, fmt.Errorf("session not found: %s", id)
-}
-
-// ListAllSessionMetas walks every project under SessionsDir.
-func ListAllSessionMetas() ([]SessionMeta, error) {
-	root := session.SessionsDir()
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	var out []SessionMeta
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		proj := filepath.Join(root, e.Name())
-		files, err := os.ReadDir(proj)
-		if err != nil {
-			continue
-		}
-		seen := make(map[string]bool)
-		for _, f := range files {
-			name := f.Name()
-			if strings.HasSuffix(name, ".meta.json") {
-				meta, err := ReadSessionMeta(filepath.Join(proj, name))
-				if err != nil {
-					continue
-				}
-				out = append(out, meta)
-				seen[meta.ID] = true
-			}
-		}
-		// Transcripts without meta are skipped (cannot recover dir).
-		_ = seen
-	}
-	return out, nil
-}
-
-// TouchSessionMeta updates LastActive on an existing meta file.
-func TouchSessionMeta(id string) error {
-	meta, err := FindSessionMeta(id)
-	if err != nil {
-		return err
-	}
-	meta.LastActive = time.Now()
-	return WriteSessionMeta(meta)
-}
-
 func sessionPreview(meta SessionMeta) string {
-	previews, err := session.ListSessionPreviews(metaProjectKey(meta))
-	if err != nil {
-		return ""
-	}
-	for _, p := range previews {
-		if p.ID == meta.ID {
-			return p.Preview
-		}
-	}
-	return ""
+	return session.PreviewSession(session.MetaProjectKey(meta), meta.ID)
 }
