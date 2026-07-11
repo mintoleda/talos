@@ -21,7 +21,6 @@ import (
 	"github.com/mintoleda/talos/internal/tui/styles"
 )
 
-// Mode selects the TUI layout.
 type Mode int
 
 const (

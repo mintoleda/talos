@@ -15,43 +15,32 @@ import (
 	"github.com/mintoleda/talos/internal/tui/styles"
 )
 
-// segment is one styled block of the transcript. text is stored unstyled and
-// without surrounding newlines so it can be re-wrapped to the pane width on
-// resize; before/after carry the raw (unstyled) newlines that separate blocks.
 type segment struct {
 	style            lipgloss.Style
 	text             string
 	before           string
 	after            string
-	renderAsMarkdown bool // if true, text is rendered through the markdown renderer
+	renderAsMarkdown bool
 
-	// Rendered markdown cache. Pre-computed when the segment is created
-	// and invalidated only on pane resize (mdCacheVersion mismatch).
 	renderedMarkdown string
 	mdVersion        int
 
-	// Tool-call segments are rendered lazily in body() so they reflow to the
-	// current pane width (a pre-styled string could not).
 	isTool     bool
 	toolName   string
 	toolArgs   map[string]any
 	toolOK     bool
-	toolOutput string // raw result content; shown truncated when expanded
+	toolOutput string
 
-	// Thinking segments hold the model's extended-thinking text for one block.
 	isThinking bool
 	thinkText  string
 }
 
-// provisionalTool holds the in-progress state of a running tool whose output
-// is streaming to the TUI before the tool finishes.
 type provisionalTool struct {
 	name   string
 	args   map[string]any
-	output strings.Builder // accumulated output chunks
+	output strings.Builder
 }
 
-// ChatModel renders the scrollback transcript for a single agent.
 type ChatModel struct {
 	vp          viewport.Model
 	segments    []segment // finalized turns
@@ -223,9 +212,6 @@ func (c ChatModel) RemoveActiveTool(id string) ChatModel {
 	return c
 }
 
-// AddProvisionalTool creates a provisional segment for a running tool.
-// Called on ToolStarted alongside AddActiveTool so the tool's output can
-// stream live when Ctrl+O is toggled.
 func (c ChatModel) AddProvisionalTool(id, name string, args map[string]any) ChatModel {
 	if c.provisionalTools == nil {
 		c.provisionalTools = make(map[string]*provisionalTool)
@@ -235,7 +221,6 @@ func (c ChatModel) AddProvisionalTool(id, name string, args map[string]any) Chat
 	return c
 }
 
-// AppendToolDelta appends a chunk of live output to a running tool's buffer.
 func (c ChatModel) AppendToolDelta(id, text string) ChatModel {
 	if pt, ok := c.provisionalTools[id]; ok {
 		pt.output.WriteString(text)
@@ -244,9 +229,6 @@ func (c ChatModel) AppendToolDelta(id, text string) ChatModel {
 	return c
 }
 
-// FinalizeProvisionalTool converts a provisional tool into a finalized
-// tool segment using the accumulated output. If no output was streamed
-// (non-streaming tool), falls back to resultContent from ToolFinished.
 func (c ChatModel) FinalizeProvisionalTool(id string, ok bool, resultContent string) ChatModel {
 	pt, exists := c.provisionalTools[id]
 	if !exists {
@@ -260,8 +242,6 @@ func (c ChatModel) FinalizeProvisionalTool(id string, ok bool, resultContent str
 	return c.AppendToolUse(pt.name, pt.args, ok, out)
 }
 
-// markdownSegment pre-renders a segment's text through glamour so body() can
-// use the cached string instead of re-parsing markdown on every frame.
 func (c ChatModel) markdownSegment(s segment) segment {
 	if s.renderAsMarkdown && s.text != "" && s.renderedMarkdown == "" {
 		s.renderedMarkdown = c.md.Render(s.text)
@@ -280,8 +260,6 @@ func (c ChatModel) AppendUserInput(text string) ChatModel {
 	return c.append(segment{style: styles.UserStyle, text: "› " + text, before: "\n", after: "\n"})
 }
 
-// AppendUserBlocks renders a user message that may contain image blocks.
-// Text blocks are shown inline; image blocks appear as "[image]" tags.
 func (c ChatModel) AppendUserBlocks(blocks []protocol.ContentBlock) ChatModel {
 	var parts []string
 	for _, b := range blocks {
@@ -297,8 +275,6 @@ func (c ChatModel) AppendUserBlocks(blocks []protocol.ContentBlock) ChatModel {
 	return c.append(segment{style: styles.UserStyle, text: "› " + strings.Join(parts, " "), before: "\n", after: "\n"})
 }
 
-// AppendDelta accumulates streaming text without touching the viewport.
-// View() will render it combined with finalized content each frame.
 func (c ChatModel) AppendDelta(text string) ChatModel {
 	c.streaming += text
 	c.dirty = true
@@ -314,9 +290,6 @@ func (c ChatModel) AppendBatchHeading(_ int) ChatModel {
 	})
 }
 
-// AppendToolUse adds a completed tool-call entry inline in the chat transcript.
-// The call descriptor (path/command/query) is derived from the arguments and
-// rendered lazily so it reflows on resize.
 func (c ChatModel) AppendToolUse(name string, args map[string]any, ok bool, output string) ChatModel {
 	// Group a run of consecutive tool calls into a compact block: only the
 	// first one (preceded by text) gets a blank separator line above it.
@@ -335,7 +308,6 @@ func (c ChatModel) AppendToolUse(name string, args map[string]any, ok bool, outp
 	})
 }
 
-// ToggleToolExpand flips the global tool-output expansion flag (ctrl+o).
 func (c ChatModel) ToggleToolExpand() ChatModel {
 	c.toolExpanded = !c.toolExpanded
 	c.syncViewportContent()
@@ -359,16 +331,12 @@ func (c ChatModel) AppendThinkingBlock(text string) ChatModel {
 	})
 }
 
-// AppendThinkDelta accumulates streaming thinking text without touching the
-// viewport. View() will render it as a live thinking segment each frame.
 func (c ChatModel) AppendThinkDelta(text string) ChatModel {
 	c.streamingThink += text
 	c.dirty = true
 	return c
 }
 
-// FlushThinkStreaming moves the in-progress streaming thinking text into a
-// finalized thinking segment.
 func (c ChatModel) FlushThinkStreaming() ChatModel {
 	if c.streamingThink == "" {
 		return c
@@ -388,7 +356,6 @@ func (c ChatModel) FlushThinkStreaming() ChatModel {
 	return c
 }
 
-// ToggleThinkExpand flips the global thinking-block expansion flag (alt+t).
 func (c ChatModel) ToggleThinkExpand() ChatModel {
 	c.thinkExpanded = !c.thinkExpanded
 	c.syncViewportContent()

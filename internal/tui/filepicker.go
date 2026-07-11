@@ -25,10 +25,8 @@ type filePickerState struct {
 	query    string
 	results  []filePickerEntry
 	selected int
-	atIndex  int // index of the @ character in the input
+	atIndex  int
 
-	// Cached directory entries to avoid re-walking on every keystroke
-	// within a single @ session. Invalidated on deactivate.
 	cachedRoot    string
 	cachedEntries []filePickerEntry
 }
@@ -47,9 +45,6 @@ func compileGitignore(root string) *ignore.GitIgnore {
 	return ignore.CompileIgnoreLines(strings.Split(string(data), "\n")...)
 }
 
-// shouldSkipDir returns true for directories that are always skipped during
-// file-picker walks. The list is aggressive because the file picker must
-// never hang — even in $HOME with its enormous hidden/commercial trees.
 func shouldSkipDir(name string) bool {
 	switch name {
 	// Version control
@@ -77,9 +72,6 @@ func shouldSkipDir(name string) bool {
 	return strings.HasPrefix(name, ".")
 }
 
-// collectDirEntries walks root up to maxDepth and returns file/dir paths.
-// Hidden dirs and gitignored files are skipped. The walk is designed to be
-// fast (no FFF index building) so it's safe to call on any directory.
 func collectDirEntries(root string, maxDepth int) []filePickerEntry {
 	gi := compileGitignore(root)
 	var entries []filePickerEntry
@@ -327,7 +319,7 @@ func (fp *filePickerState) render(width int) string {
 			rel += "/"
 		}
 
-		// Truncate if too long
+// Truncate if too long
 		maxPathW := width - 4
 		if maxPathW < 20 {
 			maxPathW = 20
