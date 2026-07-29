@@ -51,7 +51,7 @@ func Run(
 ) error {
 	// Seed the TUI's cumulative counters from the loop's restored stats so
 	// resumed sessions show historical token/cost data on the status bar.
-	in, out, cacheMiss, seedCost, _ := engine.Stats()
+	in, out, cacheMiss, _, _, seedCost, _ := engine.Stats()
 
 	seedStats := struct {
 		InputTokens  int

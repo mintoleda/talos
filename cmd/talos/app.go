@@ -55,9 +55,6 @@ func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices 
 		if a.cfg.CompactEmergencyThreshold > 0 {
 			comp.EmergencyThreshold = a.cfg.CompactEmergencyThreshold
 		}
-		if a.cfg.CompactChunkSize > 0 {
-			comp.ChunkSize = a.cfg.CompactChunkSize
-		}
 		comp.Clamp()
 		if a.cfg.Historian && a.memStore != nil {
 			hist, err := engine.NewHistorian(a.cfg, a.memStore)

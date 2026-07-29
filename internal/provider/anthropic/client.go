@@ -3,10 +3,13 @@ package anthropic
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -75,8 +78,59 @@ func (c *Client) StreamTurn(ctx context.Context, req protocol.Request) (<-chan p
 	return out, nil
 }
 
-// ListModels is not supported by the Anthropic API; callers should use a
-// hardcoded list or the Anthropic docs for available model IDs.
-func (c *Client) ListModels(_ context.Context) ([]string, error) {
-	return nil, fmt.Errorf("model listing not supported for anthropic provider")
+func (c *Client) ListModels(ctx context.Context) ([]string, error) {
+	var ids []string
+	afterID := ""
+	for {
+		u, err := url.Parse(c.baseURL + "/v1/models")
+		if err != nil {
+			return nil, err
+		}
+		if afterID != "" {
+			q := u.Query()
+			q.Set("after_id", afterID)
+			u.RawQuery = q.Encode()
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("X-Api-Key", c.apiKey)
+		req.Header.Set("Anthropic-Version", "2023-06-01")
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("http do: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+			resp.Body.Close()
+			return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+		}
+		var body struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+			HasMore bool   `json:"has_more"`
+			LastID  string `json:"last_id"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("decode: %w", err)
+		}
+		for _, model := range body.Data {
+			if model.ID != "" {
+				ids = append(ids, model.ID)
+			}
+		}
+		if !body.HasMore {
+			break
+		}
+		if body.LastID == "" || body.LastID == afterID {
+			return nil, fmt.Errorf("models pagination returned no advancing last_id")
+		}
+		afterID = body.LastID
+	}
+	sort.Strings(ids)
+	return ids, nil
 }

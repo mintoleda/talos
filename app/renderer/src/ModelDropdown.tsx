@@ -1,7 +1,3 @@
-/**
- * ModelDropdown — listModels grouped by provider, search, switchModel.
- */
-
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import type { Engine } from './engine'
 import type { ModelEntry, ModelsResult } from './protocol'

@@ -1,10 +1,9 @@
 package dialogs
 
 import (
-	"fmt"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/tui/styles"
@@ -35,10 +34,10 @@ func (d *ConfirmDialog) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		d.width, d.height = msg.Width, msg.Height
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "y", "Y":
+		case "y", "Y", "enter":
 			d.approved = true
 			d.dismissed = true
-		case "n", "N", "esc", "q":
+		case "n", "N", "esc", "q", "ctrl+c":
 			d.approved = false
 			d.dismissed = true
 		}
@@ -47,18 +46,40 @@ func (d *ConfirmDialog) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (d *ConfirmDialog) View() string {
-	body := fmt.Sprintf("%s\n\n%s\n\n%s",
-		styles.DialogTitleStyle.Render("Permission Request"),
-		styles.DimStyle.Render("Tool:"),
-		d.ev.ToolName)
-	if d.ev.Command != "" {
-		body += fmt.Sprintf("\n\n%s\n%s", styles.DimStyle.Render("Command:"), d.ev.Command)
-	}
-	body += fmt.Sprintf("\n\n%s\n%s", styles.DimStyle.Render("Reason:"), d.ev.Reason)
-	body += "\n\n" + styles.DimStyle.Render("[Y] allow  [N] deny")
+	prompt := styles.DimStyle.Render("[Y] allow  [N] deny  [enter] allow  [esc] cancel")
 
-	dialog := styles.DialogBoxStyle.Render(lipgloss.Place(d.width-4, d.height-4, lipgloss.Center, lipgloss.Center, body))
-	return lipgloss.Place(d.width, d.height, lipgloss.Center, lipgloss.Center, dialog)
+	var parts []string
+	parts = append(parts, styles.ToolRunningStyle.Render(d.ev.ToolName))
+	if d.ev.Command != "" {
+		maxCmd := d.width - 30
+		if maxCmd < 20 {
+			maxCmd = 20
+		}
+		cmd := d.ev.Command
+		if len(cmd) > maxCmd {
+			cmd = cmd[:maxCmd-1] + "\u2026"
+		}
+		parts = append(parts, styles.DimStyle.Render(cmd))
+	}
+	if d.ev.Reason != "" {
+		reason := d.ev.Reason
+		maxReason := d.width - 12
+		if maxReason < 20 {
+			maxReason = 20
+		}
+		if len(reason) > maxReason {
+			reason = reason[:maxReason-1] + "\u2026"
+		}
+		parts = append(parts, styles.DimStyle.Render(reason))
+	}
+
+	body := styles.DialogTitleStyle.Render("\u26a0 Permission ") + strings.Join(parts, " \u00b7 ") + "\n" + prompt
+
+	w := d.width - 4
+	if w < 30 {
+		w = 30
+	}
+	return styles.DialogBoxStyle.Width(w).Render(body)
 }
 
 func (d *ConfirmDialog) IsDismissed() bool { return d.dismissed }

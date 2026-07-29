@@ -134,3 +134,38 @@ func TestPromptBuilderPermissionModeBeforeContext(t *testing.T) {
 		t.Fatalf("expected permission mode text before context text, got: %q", text)
 	}
 }
+
+func TestEstimatedTokensCalibration(t *testing.T) {
+	pb := NewPromptBuilder(strings.Repeat("a", 40_000), nil, "m")
+	req := pb.Build(mustTranscript(t))
+	base := pb.EstimatedTokens(req)
+
+	pb.Calibrate(base, base*2)
+	scaled := pb.EstimatedTokens(req)
+	if scaled <= base {
+		t.Fatalf("expected estimate to grow after under-estimation, base=%d scaled=%d", base, scaled)
+	}
+
+	pb2 := NewPromptBuilder(strings.Repeat("a", 40_000), nil, "m")
+	pb2.Calibrate(10, 20)
+	if got := pb2.EstimatedTokens(req); got != base {
+		t.Fatalf("tiny samples should not calibrate: got %d, want %d", got, base)
+	}
+
+	pb3 := NewPromptBuilder(strings.Repeat("a", 40_000), nil, "m")
+	for i := 0; i < 50; i++ {
+		pb3.Calibrate(1000, 100_000)
+	}
+	if got := pb3.EstimatedTokens(req); got > base*4 {
+		t.Fatalf("calibration ratio not clamped: got %d, base %d", got, base)
+	}
+}
+
+func mustTranscript(t *testing.T) *session.Transcript {
+	t.Helper()
+	tx, err := session.Create(filepath.Join(t.TempDir(), "t.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tx
+}

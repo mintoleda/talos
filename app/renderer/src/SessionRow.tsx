@@ -1,7 +1,3 @@
-/**
- * SessionRow — one session in the sidebar list.
- */
-
 import React, { useEffect, useRef, useState } from 'react'
 import type { SessionInfo } from './protocol'
 import { relativeTime } from './appState'

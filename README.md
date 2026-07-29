@@ -122,12 +122,36 @@ the status bar update automatically.
 | `/new` | start a fresh session |
 | `/compact [focus]` | compact conversation history |
 | `/model [query]` | switch provider/model |
+| command | description |
+|---|---|---|
+| `/help` | show this help |
+| `/new` | start a fresh session |
+| `/compact [focus]` | compact conversation history |
+| `/model [query]` | switch provider/model |
 | `/thinking` | cycle thinking level (off → minimal → low → medium → high → xhigh) |
+| `/permission` | cycle permission mode (auto → ask → panic → auto) |
+| `/panic` | toggle panic mode (blocks all tool calls) |
 | `/login` | add an api key |
 | `/stats` | token usage and cache hit rate |
 | `/resume [id]` | resume a session |
-| `/push` | commit and push changes |
+| `/subagents` | toggle subagent delegation on/off |
+| `/mcp` | list connected MCP servers and their tools |
 | `/exit` | quit |
+
+## skills
+
+User-defined skills live in `~/.talos/skills/<name>/SKILL.md` files. They are
+scanned at startup, injected into the system prompt, and appear in slash
+autocompletion. Type `/<name>` in the prompt box to tab-complete — selecting a
+skill populates the input with `skill:<name>`, which the model interprets as a
+skill invocation (the model reads the SKILL.md via the `skill` tool).
+
+The built-in `push` skill is now defined this way:
+
+```bash
+mkdir -p ~/.talos/skills/push
+# write SKILL.md describing commit-and-push steps
+```
 
 ## further reading
 

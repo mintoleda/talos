@@ -1,7 +1,3 @@
-/**
- * DiffView — hand-rolled unified diff renderer.
- */
-
 import React from 'react'
 
 export type DiffViewProps = {

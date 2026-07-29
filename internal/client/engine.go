@@ -57,7 +57,7 @@ type Engine interface {
 	// Compact triggers manual compaction, optionally guided by a focus string.
 	Compact(focus string) error
 	// Stats returns cumulative token and cost counters.
-	Stats() (input, output, cacheMiss int, cost float64, err error)
+	Stats() (input, output, cacheMiss, cached, cacheCreation int, cost float64, err error)
 	// LoginProviders returns the list of known providers with login status.
 	LoginProviders() ([]dialogs.LoginProvider, error)
 	// Login persists an API key for the given provider.
@@ -74,8 +74,6 @@ type Engine interface {
 	ListFiles(prefix string) ([]string, error)
 	// ResolveInput turns user text into content blocks on the engine machine.
 	ResolveInput(text string) ([]protocol.ContentBlock, string, error)
-	// PushInstruction builds the /push agent instruction on the engine machine.
-	PushInstruction() (msg string, notice string, err error)
 
 	// Events returns a read-only channel of protocol events emitted by the
 	// engine (text deltas, tool calls, notices, turn-end, etc.).

@@ -1,7 +1,3 @@
-/**
- * SessionList — sessions grouped by project_dir basename.
- */
-
 import React, { useState } from 'react'
 import type { SessionInfo } from './protocol'
 import { groupSessionsByProject } from './appState'

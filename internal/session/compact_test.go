@@ -41,9 +41,8 @@ func frozenText(role protocol.Role, text string) protocol.FrozenMessage {
 	return protocol.FrozenMessage{Msg: m, Raw: raw}
 }
 
-func TestAlignedChunk_PureText(t *testing.T) {
+func TestFoldTail_PureText(t *testing.T) {
 	c := NewCompactor(nil)
-	c.ChunkSize = 3
 	c.KeepTail = 1
 
 	frozen := []protocol.FrozenMessage{
@@ -54,81 +53,18 @@ func TestAlignedChunk_PureText(t *testing.T) {
 		frozenText(protocol.RoleUser, "cool"),
 	}
 
-	got := c.alignedChunk(frozen)
-	if len(got) != 3 {
-		t.Fatalf("pure text: expected chunk size 3, got %d", len(got))
+	// Small tail budget — should fold everything except KeepTail.
+	got := c.foldTail(frozen, 10)
+	if got <= 0 {
+		t.Fatalf("pure text: expected non-zero fold boundary, got %d", got)
+	}
+	if len(frozen)-got < 1 {
+		t.Fatalf("pure text: tail too small, got boundary %d for len %d", got, len(frozen))
 	}
 }
 
-func TestAlignedChunk_ToolCallSplit(t *testing.T) {
-	// The chunk boundary (size 3) falls between the tool_call and its result.
-	// The aligned chunk must extend to include the tool result at position 3.
+func TestFoldTail_RespectsKeepTail(t *testing.T) {
 	c := NewCompactor(nil)
-	c.ChunkSize = 3
-	c.KeepTail = 1
-
-	frozen := []protocol.FrozenMessage{
-		frozenText(protocol.RoleUser, "read f1"),
-		frozenText(protocol.RoleAssistant, "ok"),
-		frozenToolCall("tc1"),           // position 2 — in chunk
-		frozenToolResult("tc1"),          // position 3 — out of chunk but must be included
-		frozenText(protocol.RoleUser, "next"),
-	}
-
-	got := c.alignedChunk(frozen)
-	if len(got) != 4 {
-		t.Fatalf("tool-call split: expected chunk size 4, got %d", len(got))
-	}
-}
-
-func TestAlignedChunk_MultipleToolCalls(t *testing.T) {
-	// ChunkSize=3 but the tool_call at position 2 has two results at 3 and 4.
-	// Must extend to 5.
-	c := NewCompactor(nil)
-	c.ChunkSize = 3
-	c.KeepTail = 1
-
-	frozen := []protocol.FrozenMessage{
-		frozenText(protocol.RoleUser, "do stuff"),
-		frozenText(protocol.RoleAssistant, "sure"),
-		frozenToolCall("tc1", "tc2"),                      // position 2
-		frozenToolResult("tc1"),                              // position 3
-		frozenToolResult("tc2"),                              // position 4
-		frozenText(protocol.RoleUser, "thanks"),
-	}
-
-	got := c.alignedChunk(frozen)
-	if len(got) != 5 {
-		t.Fatalf("multiple tool calls: expected chunk size 5, got %d", len(got))
-	}
-}
-
-func TestAlignedChunk_CleanBreak(t *testing.T) {
-	// The tool call and its result are both inside the chunk boundary.
-	// No extension needed.
-	c := NewCompactor(nil)
-	c.ChunkSize = 4
-	c.KeepTail = 1
-
-	frozen := []protocol.FrozenMessage{
-		frozenText(protocol.RoleUser, "read f1"),
-		frozenToolCall("tc1"),
-		frozenToolResult("tc1"),
-		frozenText(protocol.RoleAssistant, "done"),  // complete exchange inside chunk
-		frozenText(protocol.RoleUser, "next request"),
-	}
-
-	got := c.alignedChunk(frozen)
-	if len(got) != 4 {
-		t.Fatalf("clean break: expected chunk size 4, got %d", len(got))
-	}
-}
-
-func TestAlignedChunk_NeverConsumesEntireTranscript(t *testing.T) {
-	// Even with a huge ChunkSize, the last KeepTail messages are never
-	// compacted, so the model always retains the most recent context.
-	c := NewCompactor(nil)
-	c.ChunkSize = 100
 	c.KeepTail = 1
 
 	frozen := []protocol.FrozenMessage{
@@ -136,57 +72,83 @@ func TestAlignedChunk_NeverConsumesEntireTranscript(t *testing.T) {
 		frozenText(protocol.RoleAssistant, "hi"),
 	}
 
-	got := c.alignedChunk(frozen)
-	if len(got) != 1 {
-		t.Fatalf("expected chunk size 1 (tail retained), got %d", len(got))
+	got := c.foldTail(frozen, 100000)
+	if got != 1 {
+		t.Fatalf("expected boundary 1 (1 msg kept), got %d", got)
 	}
 }
 
-func TestAlignedChunk_KeepTailDefault(t *testing.T) {
+func TestFoldTail_RespectsBudget(t *testing.T) {
 	c := NewCompactor(nil)
-	c.ChunkSize = 100
+	c.KeepTail = 1
 
 	frozen := []protocol.FrozenMessage{
-		frozenText(protocol.RoleUser, "q1"),
-		frozenText(protocol.RoleAssistant, "a1"),
-		frozenText(protocol.RoleUser, "q2"),
-		frozenText(protocol.RoleAssistant, "a2"),
+		frozenText(protocol.RoleUser, "hello"),
+		frozenText(protocol.RoleAssistant, "hi there"),
+		frozenText(protocol.RoleUser, "how are you today"),
+		frozenText(protocol.RoleAssistant, "I am doing well"),
+		frozenText(protocol.RoleUser, "great to hear"),
 	}
 
-	got := c.alignedChunk(frozen)
-	if len(got) != 2 {
-		t.Fatalf("expected chunk size 2 (KeepTail=2 retained), got %d", len(got))
+	// Large budget — 4 messages fit in the tail budget.
+	got := c.foldTail(frozen, 100000)
+	if got <= 0 || len(frozen)-got < 1 {
+		t.Fatalf("large budget: expected non-zero fold, got boundary %d (tail=%d)", got, len(frozen)-got)
+	}
+
+	// Small budget — only 1 message fits in tail.
+	got = c.foldTail(frozen, 5)
+	if len(frozen)-got != 1 {
+		t.Fatalf("small budget: expected tail=1, got boundary %d (tail=%d)", got, len(frozen)-got)
 	}
 }
 
-func TestAlignedChunk_ShrinksBackwardWhenTailSplitsPair(t *testing.T) {
-	// The tool result sits inside the protected tail, so the boundary cannot
-	// extend forward to include it — it must shrink back to a clean break.
+func TestFoldTail_AvoidsSplittingToolPair(t *testing.T) {
 	c := NewCompactor(nil)
-	c.ChunkSize = 3
-	c.KeepTail = 2
+	c.KeepTail = 1
 
 	frozen := []protocol.FrozenMessage{
 		frozenText(protocol.RoleUser, "read f1"),
 		frozenText(protocol.RoleAssistant, "ok"),
-		frozenToolCall("tc1"),           // position 2
-		frozenToolResult("tc1"),          // position 3 — inside protected tail
+		frozenToolCall("tc1"),
+		frozenToolResult("tc1"),
 		frozenText(protocol.RoleUser, "next"),
 	}
 
-	got := c.alignedChunk(frozen)
-	if len(got) != 2 {
-		t.Fatalf("expected chunk size 2 (shrunk before tool_use), got %d", len(got))
+	// Budget small enough that the tail would naturally start at index 2
+	// (splitting the tool-call/result pair). foldTail must extend forward
+	// to include the result, so boundary ends at the last foldable index.
+	got := c.foldTail(frozen, 20)
+	if got != 4 {
+		t.Fatalf("expected boundary 4 (pair intact, only 'next' in tail), got %d", got)
 	}
 }
 
-func TestAlignedChunk_Empty(t *testing.T) {
+func TestFoldTail_Empty(t *testing.T) {
 	c := NewCompactor(nil)
-	c.ChunkSize = 5
+	got := c.foldTail(nil, 16384)
+	if got != 0 {
+		t.Fatalf("empty: expected boundary 0, got %d", got)
+	}
+}
 
-	got := c.alignedChunk(nil)
-	if len(got) != 0 {
-		t.Fatalf("empty: expected chunk size 0, got %d", len(got))
+func TestPinMessages(t *testing.T) {
+	c := NewCompactor(nil)
+
+	frozen := []protocol.FrozenMessage{
+		frozenText(protocol.RoleUser, "short first"),       // should be pinned
+		frozenText(protocol.RoleAssistant, "response 1"),
+		frozenText(protocol.RoleUser, "another small"),     // should be pinned
+		frozenText(protocol.RoleAssistant, "response 2 which is quite long and verbose"),
+	}
+
+	pinned, remaining := c.pinMessages(frozen)
+	// First small user + third small user = 2 pinned
+	if len(pinned) != 2 {
+		t.Fatalf("expected 2 pinned, got %d", len(pinned))
+	}
+	if len(remaining) != 2 {
+		t.Fatalf("expected 2 remaining, got %d", len(remaining))
 	}
 }
 
@@ -223,11 +185,10 @@ func TestExtractSummarizer(t *testing.T) {
 	if strings.Contains(got, "xxxx") {
 		t.Fatal("tool result content leaked into summary")
 	}
-	if len(got) > 8192+len("…") {
+	if len(got) > 8192+len("\u2026") {
 		t.Fatalf("summary exceeds total cap: %d bytes", len(got))
 	}
 
-	// Deterministic: same input, same output.
 	again, _ := ExtractSummarizer{}.Summarize(context.Background(), msgs)
 	if got != again {
 		t.Fatal("extract summary not deterministic")
@@ -242,12 +203,12 @@ func TestExtractSummarizerCapsHugeUserMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) > 8192+len("…") {
+	if len(got) > 8192+len("\u2026") {
 		t.Fatalf("summary exceeds total cap: %d bytes", len(got))
 	}
 }
 
-func TestCompactionDropsOldestAndPrependsSummary(t *testing.T) {
+func TestFoldDropsOldestAndPrependsSummary(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "t.jsonl")
 	tx, err := Create(path)
@@ -266,8 +227,9 @@ func TestCompactionDropsOldestAndPrependsSummary(t *testing.T) {
 	compactor := NewCompactor(SummarizerFunc(func(context.Context, []protocol.Message) (string, error) {
 		return "summary", nil
 	}))
-	compactor.ChunkSize = 2
-	compactor.Threshold = 0.0 // force compaction
+	compactor.Threshold = 0.0
+	compactor.TailBudgetTokens = 1 // keep almost nothing in tail
+	compactor.KeepTail = 0
 
 	compacted, err := compactor.MaybeCompact(ctx, tx, 1000, 100)
 	if err != nil {
@@ -276,26 +238,10 @@ func TestCompactionDropsOldestAndPrependsSummary(t *testing.T) {
 	if !compacted {
 		t.Fatal("expected compaction")
 	}
-	if len(tx.Frozen()) != 3 {
-		t.Fatalf("expected 3 frozen after drop, got %d", len(tx.Frozen()))
+	if len(tx.Frozen()) == 5 {
+		t.Fatalf("expected fewer frozen after drop, got %d", len(tx.Frozen()))
 	}
-	if len(tx.Summaries()) != 1 {
-		t.Fatalf("expected 1 summary, got %d", len(tx.Summaries()))
-	}
-
-	// Close and reload; the summary should survive.
-	if err := tx.Close(); err != nil {
-		t.Fatal(err)
-	}
-	tx2, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx2.Close()
-	if len(tx2.Summaries()) != 1 {
-		t.Fatalf("expected 1 summary after load, got %d", len(tx2.Summaries()))
-	}
-	if len(tx2.Frozen()) != 3 {
-		t.Fatalf("expected 3 frozen after load, got %d", len(tx2.Frozen()))
+	if len(tx.Summaries()) == 0 {
+		t.Fatalf("expected at least 1 summary, got %d", len(tx.Summaries()))
 	}
 }

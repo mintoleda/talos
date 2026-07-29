@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -16,6 +18,7 @@ import (
 	"github.com/mintoleda/talos/internal/client"
 	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/protocol"
+	"github.com/mintoleda/talos/internal/skills"
 	"github.com/mintoleda/talos/internal/tui/dialogs"
 	"github.com/mintoleda/talos/internal/tui/panes"
 	"github.com/mintoleda/talos/internal/tui/styles"
@@ -35,28 +38,30 @@ const (
 	NormalMode
 )
 
-// slashCommand describes one available slash command.
+// slashCommand describes one available slash command (or skill).
 type slashCommand struct {
 	Name string
 	Desc string
+	// isSkill indicates this is a user-defined skill from ~/.talos/skills/.
+	// When selected via tab/enter the input is set to "skill:name" instead of "/name".
+	isSkill bool
 }
 
 // slashCommands is the canonical list used for both /help and live autocompletion.
 var slashCommands = []slashCommand{
-	{"/help", "Show this help"},
-	{"/new", "Start a new session"},
-	{"/compact", "Compact conversation history (optionally: /compact <focus message>)"},
-	{"/stats", "Show aggregate token usage and cache hit rate"},
-	{"/resume", "Resume a session (optionally: /resume <id>)"},
-	{"/login", "Add an API key for a provider"},
-	{"/model", "Switch provider/model (optionally: /model <query>)"},
-	{"/thinking", "Cycle thinking level"},
-	{"/permission", "Cycle permission mode (auto/ask/panic)"},
-	{"/panic", "Toggle panic mode (blocks all tools)"},
-	{"/subagents", "Toggle subagent delegation on/off"},
-	{"/mcp", "List connected MCP servers and their tools"},
-	{"/push", "Commit and push changes to GitHub"},
-	{"/exit", "Quit Talos"},
+	{"/help", "Show this help", false},
+	{"/new", "Start a new session", false},
+	{"/compact", "Compact conversation history (optionally: /compact <focus message>)", false},
+	{"/stats", "Show aggregate token usage and cache hit rate", false},
+	{"/resume", "Resume a session (optionally: /resume <id>)", false},
+	{"/login", "Add an API key for a provider", false},
+	{"/model", "Switch provider/model (optionally: /model <query>)", false},
+	{"/thinking", "Cycle thinking level", false},
+	{"/permission", "Cycle permission mode (auto/ask/panic)", false},
+	{"/panic", "Toggle panic mode (blocks all tools)", false},
+	{"/subagents", "Toggle subagent delegation on/off", false},
+	{"/mcp", "List connected MCP servers and their tools", false},
+	{"/exit", "Quit Talos", false},
 }
 
 // clearQuitConfirmMsg is sent 2s after the first ctrl+c to reset the quit prompt.
@@ -136,6 +141,13 @@ type Model struct {
 	totalCacheMiss int // cumulative non-cached prompt tokens
 	contextUsed    int // latest turn's prompt tokens = current context size
 	contextWin     int
+
+	// lastCacheRate is the fraction of the most recent turn's prompt tokens
+	// served from cache (0 if no turn has completed yet). Shown alongside the
+	// lifetime rate so a cache-prefix bust is visible immediately instead of
+	// being diluted into an unmoving cumulative average.
+	lastCacheRate    float64
+	hasLastCacheRate bool
 
 	// busySince is set when a prompt is submitted; used to compute elapsed time.
 	busySince time.Time
@@ -259,6 +271,19 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Spinner ticks must be processed unconditionally before the dialog
+	// guard — if a dialog intercepts the tick and doesn't re-schedule it,
+	// the main spinner chain dies and the animation freezes permanently.
+	var tickCmd tea.Cmd
+	if _, ok := msg.(spinner.TickMsg); ok {
+		m.spinner, tickCmd = m.spinner.Update(msg)
+		if m.busy {
+			broadcast := spinner.TickMsg{}
+			m.subagents, _ = m.subagents.Update(broadcast)
+			m.chat, _ = m.chat.Update(broadcast)
+		}
+	}
+
 	// Active dialog gets first crack at every message.
 	if m.dialog != nil {
 		newDlg, cmd := m.dialog.Update(msg)
@@ -269,6 +294,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.dialog = nil
 		} else {
 			m.dialog = newDlg
+		}
+		// If we processed a spinner tick, batch the dialog cmd with the
+		// model's tick cmd so the chain stays alive.
+		if tickCmd != nil {
+			return m, tea.Batch(cmd, tickCmd)
 		}
 		return m, cmd
 	}
@@ -517,10 +547,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// If slash completions are shown, auto-complete to the selected match
 				// when the input is still a proper prefix (not already an exact match).
 				if len(m.slashCompletions) > 0 && m.slashSelected >= 0 {
-					completed := m.slashCompletions[m.slashSelected].Name
-					if text != completed {
-						m.input.SetValue(completed)
-						m.input.CursorEnd()
+					sel := m.slashCompletions[m.slashSelected]
+					if text != sel.Name {
+						// Skills complete to "skill:name" instead of "/name".
+						if sel.isSkill {
+							m.input.SetValue(strings.TrimPrefix(sel.Name, "/"))
+							m.input.CursorEnd()
+						} else {
+							m.input.SetValue(sel.Name)
+							m.input.CursorEnd()
+						}
 						m.slashCompletions = nil
 						m.slashSelected = -1
 						m.relayout()
@@ -548,7 +584,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						if m.dialog != nil {
 							return m, tea.Batch(cmd, m.dialog.Init())
 						}
-						return m, cmd // handled but no dialog (e.g. /new)
+						// ClearScreen forces a full terminal repaint — replacing the
+						// whole chat pane changes the rendered height and the standard
+						// renderer would otherwise leave stale pixels ghosted on screen.
+						// Same pattern as applyResume (/resume).
+						return m, tea.Batch(cmd, tea.ClearScreen) // handled but no dialog (e.g. /new)
 					}
 					// Save to input history (non-slash messages only).
 					m.inputHistory = append(m.inputHistory, text)
@@ -666,25 +706,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case EventMsg:
 		m = m.handleEvent(msg.E)
-
-	case spinner.TickMsg:
-		// Always update the spinner model and schedule the next tick, even when
-		// not busy, so the animation is ready to run the moment busy becomes true.
-		var cmd tea.Cmd
-		m.spinner, cmd = m.spinner.Update(msg)
-		if m.busy {
-			// Send a broadcast tick (ID=0, tag=0) that all spinners accept so
-			// the chat's active-tool animation advances.
-			broadcast := spinner.TickMsg{}
-			m.subagents, _ = m.subagents.Update(broadcast)
-			m.chat, _ = m.chat.Update(broadcast)
-		}
-		return m, cmd
 	}
 
 	// Allow panes to handle their own updates (viewport scrolling, etc.).
 	var chatCmd tea.Cmd
 	m.chat, chatCmd = m.chat.Update(msg)
+	if tickCmd != nil {
+		return m, tea.Batch(chatCmd, tickCmd)
+	}
 	return m, chatCmd
 }
 
@@ -780,7 +809,7 @@ func (m *Model) reseedStats() {
 	if m.cfg.Engine == nil {
 		return
 	}
-	in, out, miss, cost, err := m.cfg.Engine.Stats()
+	in, out, miss, _, _, cost, err := m.cfg.Engine.Stats()
 	if err != nil {
 		return
 	}
@@ -928,11 +957,11 @@ func (m *Model) handleSlash(text string) (bool, error) {
 		if m.cfg.Engine == nil {
 			return true, fmt.Errorf("engine unavailable")
 		}
-		in, out, miss, cost, err := m.cfg.Engine.Stats()
+		in, out, miss, _, cc, cost, err := m.cfg.Engine.Stats()
 		if err != nil {
 			return true, err
 		}
-		m.chat = m.chat.AppendNotice("info", formatStats(in, out, miss, cost))
+		m.chat = m.chat.AppendNotice("info", formatStats(in, out, miss, cc, cost, m.cfg.Pricing, m.cfg.Model))
 		return true, nil
 	case "/model":
 		if m.cfg.Engine == nil {
@@ -974,23 +1003,6 @@ func (m *Model) handleSlash(text string) (bool, error) {
 			return true, err
 		}
 		m.chat = m.chat.AppendNotice("info", "panic mode: "+newMode)
-		return true, nil
-	case "/push":
-		if m.cfg.Engine == nil {
-			return true, fmt.Errorf("engine unavailable")
-		}
-		msg, notice, err := m.cfg.Engine.PushInstruction()
-		if err != nil {
-			return true, err
-		}
-		if notice != "" {
-			m.chat = m.chat.AppendNotice("info", notice)
-		}
-		if msg != "" {
-			if m.cfg.Engine != nil {
-				m.cfg.Engine.Submit(protocol.TextBlocks(msg))
-			}
-		}
 		return true, nil
 	case "/compact":
 		focus := ""
@@ -1037,22 +1049,56 @@ func (m *Model) slashHelp() string {
 	for _, sc := range slashCommands {
 		fmt.Fprintf(&b, "  %-12s %s\n", sc.Name, sc.Desc)
 	}
+	// Append user-defined skills.
+	skillsCmds := allSlashCommands()[len(slashCommands):]
+	if len(skillsCmds) > 0 {
+		b.WriteString("\nAvailable skills (tab-complete /<name>, sends skill:<name>):\n")
+		for _, sc := range skillsCmds {
+			fmt.Fprintf(&b, "  %-12s %s\n", sc.Name, sc.Desc)
+		}
+	}
 	return b.String()
 }
 
-func formatStats(input, output, cacheMiss int, cost float64) string {
-	cached := input - cacheMiss
-	if cached < 0 {
-		cached = 0
+// formatStats renders the /stats table: input split into cache hit/miss/write rows
+// plus output, each with its own token count and dollar cost, matching how
+// providers itemize a bill (they price hits, misses, writes, and output differently).
+func formatStats(input, output, cacheMiss, cacheCreation int, cost float64, prices *pricing.Table, model string) string {
+	hit := input - cacheMiss
+	if hit < 0 {
+		hit = 0
 	}
 	rate := 0.0
 	if input > 0 {
-		rate = float64(cached) / float64(input) * 100
+		rate = float64(hit) / float64(input) * 100
 	}
-	if cost > 0 {
-		return fmt.Sprintf("[stats] input=%d | output=%d | cached=%d (%.1f%%) | cost=$%.4f", input, output, cached, rate, cost)
+
+	var hitCost, missCost, creationCost, outCost float64
+	haveCosts := prices != nil && model != ""
+	if haveCosts {
+		missCost, hitCost, creationCost, outCost = prices.CostBreakdown(model, input, hit, cacheCreation, output)
 	}
-	return fmt.Sprintf("[stats] input=%d | output=%d | cached=%d (%.1f%%)", input, output, cached, rate)
+
+	var b strings.Builder
+	b.WriteString("[stats]\n")
+	if haveCosts {
+		fmt.Fprintf(&b, "  Input (cache hit)   %10s tok   $%.4f\n", humanCount(hit), hitCost)
+		fmt.Fprintf(&b, "  Input (cache miss)  %10s tok   $%.4f\n", humanCount(cacheMiss), missCost)
+		if cacheCreation > 0 {
+			fmt.Fprintf(&b, "  Input (cache write) %10s tok   $%.4f\n", humanCount(cacheCreation), creationCost)
+		}
+		fmt.Fprintf(&b, "  Output              %10s tok   $%.4f\n", humanCount(output), outCost)
+		fmt.Fprintf(&b, "  cache hit rate: %.1f%%   total: $%.4f", rate, cost)
+	} else {
+		fmt.Fprintf(&b, "  Input (cache hit)   %10s tok\n", humanCount(hit))
+		fmt.Fprintf(&b, "  Input (cache miss)  %10s tok\n", humanCount(cacheMiss))
+		if cacheCreation > 0 {
+			fmt.Fprintf(&b, "  Input (cache write) %10s tok\n", humanCount(cacheCreation))
+		}
+		fmt.Fprintf(&b, "  Output              %10s tok\n", humanCount(output))
+		fmt.Fprintf(&b, "  cache hit rate: %.1f%%", rate)
+	}
+	return b.String()
 }
 
 func (m *Model) updateFilePicker() {
@@ -1111,6 +1157,42 @@ func (m *Model) insertFilePickerSelection() {
 	m.input.CursorEnd()
 }
 
+// allSlashCommands returns the built-in commands merged with user-defined skills.
+// User skills are listed with a "/" prefix for discovery (typing "/" shows all
+// skills alongside built-in commands), but selecting one replaces the input with
+// "skill:<name>" instead of "/<name>".
+var allSlashCmds []slashCommand // lazy-init cached result
+var allSlashOnce sync.Once
+
+func allSlashCommands() []slashCommand {
+	allSlashOnce.Do(func() {
+		cmds := make([]slashCommand, len(slashCommands))
+		copy(cmds, slashCommands)
+
+		// Scan global and project-local skills.
+		skillDirs := []skills.Dir{
+			{Path: filepath.Join(os.Getenv("HOME"), ".talos", "skills")},
+		}
+		if wd, err := os.Getwd(); err == nil {
+			skillDirs = append(skillDirs, skills.Dir{Path: filepath.Join(wd, ".talos", "skills")})
+		}
+		allSkills, err := skills.Scan(skillDirs)
+		if err == nil {
+			for _, s := range allSkills {
+				cmds = append(cmds, slashCommand{
+					Name:    "/" + s.Name,
+					Desc:    s.Description,
+					isSkill: true,
+				})
+			}
+		}
+		allSlashCmds = cmds
+	})
+	return allSlashCmds
+}
+
+// updateSlashCompletions checks if the input starts with "/" and populates
+// m.slashCompletions with matching commands and skills.
 func (m *Model) updateSlashCompletions() {
 	val := m.input.Value()
 	m.slashCompletions = nil
@@ -1119,7 +1201,7 @@ func (m *Model) updateSlashCompletions() {
 		return
 	}
 	prefix := strings.ToLower(val)
-	for _, sc := range slashCommands {
+	for _, sc := range allSlashCommands() {
 		if strings.HasPrefix(strings.ToLower(sc.Name), prefix) {
 			m.slashCompletions = append(m.slashCompletions, sc)
 		}
@@ -1235,9 +1317,17 @@ func (m Model) handleEvent(e protocol.Event) Model {
 		m.totalInput += ev.Usage.PromptTokens
 		m.totalOutput += ev.Usage.CompletionTokens
 		m.totalCacheMiss += ev.Usage.PromptTokens - ev.Usage.CachedPromptTokens
-		m.contextUsed = ev.Usage.PromptTokens // latest turn = current context size
+		if ev.Usage.PromptTokens > 0 {
+			m.lastCacheRate = float64(ev.Usage.CachedPromptTokens) / float64(ev.Usage.PromptTokens)
+			m.hasLastCacheRate = true
+		}
+		if ev.ContextTokens > 0 {
+			m.contextUsed = ev.ContextTokens
+		} else {
+			m.contextUsed = ev.Usage.PromptTokens
+		}
 		if m.cfg.Pricing != nil && m.cfg.Model != "" {
-			m.totalCost += m.cfg.Pricing.Cost(m.cfg.Model, ev.Usage.PromptTokens, ev.Usage.CompletionTokens)
+			m.totalCost += m.cfg.Pricing.CostDetailed(m.cfg.Model, ev.Usage.PromptTokens, ev.Usage.CachedPromptTokens, ev.Usage.CacheCreationTokens, ev.Usage.CompletionTokens)
 			if m.contextWin == 0 {
 				m.contextWin = m.cfg.Pricing.ContextWindow(m.cfg.Model)
 			}
@@ -1296,9 +1386,23 @@ func (m Model) handleEvent(e protocol.Event) Model {
 
 func (m Model) View() string {
 	if m.dialog != nil {
+		if _, ok := m.dialog.(*dialogs.ConfirmDialog); ok {
+			return m.mainViewWithDialog()
+		}
 		return m.dialog.View()
 	}
 	return m.mainView()
+}
+
+func (m Model) mainViewWithDialog() string {
+	body := (&m.chat).View()
+	var sections []string
+	sections = append(sections, body)
+	if m.busy {
+		sections = append(sections, m.thinkingLine())
+	}
+	sections = append(sections, m.dialog.View())
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
 func (m Model) mainView() string {
@@ -1397,22 +1501,30 @@ func (m Model) statusParts() (left, right string) {
 			rp = append(rp, styles.StatusPctStyle.Render(humanCount(m.contextUsed)))
 		}
 	}
-	// Live streaming estimates: add estimated tokens from the current turn's
-	// streamed text so the user sees output/cost grow in real-time.
+	if m.totalInput > 0 {
+		lifetimeRate := float64(m.totalInput-m.totalCacheMiss) / float64(m.totalInput) * 100
+		cacheStr := fmt.Sprintf("%.0f%%", lifetimeRate)
+		cacheStyle := styles.StatusCacheStyle
+		if m.hasLastCacheRate {
+			recentPct := m.lastCacheRate * 100
+			cacheStr = fmt.Sprintf("%.0f%% (%.0f%%)", recentPct, lifetimeRate)
+			// A recent rate well below the lifetime average signals a
+			// cache-prefix bust on the last turn — flag it in red.
+			if recentPct < lifetimeRate-20 {
+				cacheStyle = styles.StatusCacheWarnStyle
+			}
+		}
+		rp = append(rp, cacheStyle.Render("CACHE "+cacheStr))
+	}
+	// Live streaming estimate: add estimated cost from the current turn's
+	// streamed text so the user sees cost grow in real-time.
 	liveOut := m.streamTextLen / 4
-	showOut := m.totalOutput + liveOut
 	showCost := m.totalCost
 	if liveOut > 0 && m.cfg.Pricing != nil && m.cfg.Model != "" {
 		showCost += m.cfg.Pricing.Cost(m.cfg.Model, 0, liveOut)
 	}
 	if showCost > 0 {
 		rp = append(rp, styles.StatusCostStyle.Render(fmt.Sprintf("$%.3f", showCost)))
-	}
-	if showOut > 0 {
-		rp = append(rp, styles.StatusOutStyle.Render("OUT "+humanCount(showOut)))
-	}
-	if m.totalCacheMiss > 0 {
-		rp = append(rp, styles.StatusMissStyle.Render("MISS "+humanCount(m.totalCacheMiss)))
 	}
 	if m.quitConfirm {
 		rp = append(rp, styles.VimNormalStyle.Render("ctrl+c again to exit"))

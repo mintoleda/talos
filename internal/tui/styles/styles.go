@@ -55,6 +55,8 @@ var (
 	StatusCostStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))
 	StatusOutStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("251"))
 	StatusMissStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	StatusCacheStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))
+	StatusCacheWarnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	StatusMCPStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("140"))
 	StatusPermStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("167"))
 

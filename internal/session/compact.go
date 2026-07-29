@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -12,9 +14,6 @@ import (
 
 type Summarizer interface {
 	Summarize(ctx context.Context, msgs []protocol.Message) (string, error)
-	// WithFocus returns a Summarizer that is guided by the given focus message.
-	// The focus tells the summarizer what to prioritise preserving. If focus is
-	// empty a nil-safe no-op summarizer is returned (the receiver itself).
 	WithFocus(focus string) Summarizer
 }
 
@@ -37,10 +36,6 @@ func (f SummarizerFunc) WithFocus(focus string) Summarizer {
 	})
 }
 
-// DropSummarizer replaces the oldest conversation chunk with a constant
-// placeholder text. The placeholder is byte-identical across all compactions,
-// so the post-compaction prefix is cacheable — same remaining messages after
-// the same boundary produce the same prefix hash. Zero cost, zero API calls.
 type DropSummarizer struct{}
 
 func (DropSummarizer) Summarize(_ context.Context, _ []protocol.Message) (string, error) {
@@ -49,16 +44,8 @@ func (DropSummarizer) Summarize(_ context.Context, _ []protocol.Message) (string
 
 func (d DropSummarizer) WithFocus(_ string) Summarizer { return d }
 
-// ExtractSummarizer builds a summary mechanically from the dropped chunk: user
-// messages verbatim (they carry the intent and are usually small), assistant
-// text trimmed to its first line, tool results dropped, plus a list of file
-// paths touched by tool calls. No LLM call, and the output is a pure function
-// of the chunk — so like DropSummarizer it is deterministic and reproducible
-// on replay, and costs the same single cache miss any compaction incurs.
 type ExtractSummarizer struct {
-	// MaxUserBytes caps each user message in the extract (0 = 2048).
-	MaxUserBytes int
-	// MaxTotalBytes caps the whole summary (0 = 8192).
+	MaxUserBytes  int
 	MaxTotalBytes int
 }
 
@@ -112,7 +99,7 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return s[:n] + "\u2026"
 }
 
 func firstLine(s string) string {
@@ -123,8 +110,6 @@ func firstLine(s string) string {
 	return s
 }
 
-// LLMSummarizer uses a provider to summarize a chunk of conversation history.
-// It emits no events and blocks until the summary is returned.
 type LLMSummarizer struct {
 	Provider provider
 	Model    string
@@ -184,30 +169,37 @@ func (s *LLMSummarizer) Summarize(ctx context.Context, msgs []protocol.Message) 
 	return summary, nil
 }
 
-// Compactor decides when and how to compact the oldest chunk of Zone B into a
+// Compactor decides when and how to fold the oldest conversation into a
 // stable summary prefix.
 type Compactor struct {
 	Summarizer         Summarizer
 	Historian          *Historian
-	ChunkSize          int
 	Threshold          float64
-	EmergencyThreshold float64 // above this, compact regardless of chunk size
+	EmergencyThreshold float64 // above this, compact regardless of fold size
+	SnipRatio          float64 // triggers snip pass (~0.60); 0 = disable
 	KeepTail           int     // most recent messages that are never compacted
-	OnCompaction       func() // called after each successful compaction
+	TailBudgetTokens   int     // token budget for kept tail (0 = 16384)
+	FoldMinTokens      int     // minimum tokens in fold region to trigger (0 = 400)
+	OnCompaction       func()  // called after each successful compaction
+
+	// Anti-loop latch: if compaction fires on consecutive checks while
+	// prompt stays above threshold, pause auto-compaction.
+	latchCount          int
+	latchedPromptTokens int
 }
 
 func NewCompactor(s Summarizer) *Compactor {
 	return &Compactor{
 		Summarizer:         s,
-		ChunkSize:          20,
 		Threshold:          0.85,
 		EmergencyThreshold: 0.95,
+		SnipRatio:          0.60,
 		KeepTail:           2,
+		TailBudgetTokens:   16384,
+		FoldMinTokens:      400,
 	}
 }
 
-// Clamp snaps compaction thresholds and chunk size to valid ranges.
-// Callers that set custom values after NewCompactor should call this afterward.
 func (c *Compactor) Clamp() {
 	if c.Threshold == 0 {
 		c.Threshold = 0.85
@@ -227,15 +219,6 @@ func (c *Compactor) Clamp() {
 	if c.EmergencyThreshold > 1.0 {
 		c.EmergencyThreshold = 1.0
 	}
-	if c.ChunkSize == 0 {
-		c.ChunkSize = 20
-	}
-	if c.ChunkSize < 5 {
-		c.ChunkSize = 5
-	}
-	if c.ChunkSize > 500 {
-		c.ChunkSize = 500
-	}
 	if c.KeepTail == 0 {
 		c.KeepTail = 2
 	}
@@ -245,47 +228,68 @@ func (c *Compactor) Clamp() {
 	if c.KeepTail > 50 {
 		c.KeepTail = 50
 	}
+	if c.TailBudgetTokens <= 0 {
+		c.TailBudgetTokens = 16384
+	}
+	if c.FoldMinTokens <= 0 {
+		c.FoldMinTokens = 400
+	}
+	if c.SnipRatio <= 0 {
+		c.SnipRatio = 0.60
+	}
+	if c.SnipRatio < 0.1 {
+		c.SnipRatio = 0.1
+	}
+	if c.SnipRatio > c.Threshold {
+		c.SnipRatio = c.Threshold
+	}
 }
 
-// alignedChunk returns the oldest chunk of messages whose boundary does not
-// split tool-call/result pairs. It extends the target ChunkSize forward to
-// include all tool-result messages for any assistant tool_calls in the window.
-// This prevents sending incomplete exchanges to providers (e.g. DeepSeek) that
-// reject messages with dangling tool_calls.
-//
-// The chunk never reaches into the last KeepTail messages, so compaction can
-// never consume the entire transcript (e.g. the in-flight turn's user message).
-// If forward extension would cross that boundary, the boundary shrinks
-// backward to the nearest clean break instead — possibly to zero (no chunk).
-func (c *Compactor) alignedChunk(frozen []protocol.FrozenMessage) []protocol.FrozenMessage {
+func estimateTokens(fms []protocol.FrozenMessage) int {
+	n := 0
+	for _, fm := range fms {
+		n += len(fm.Raw) / 4
+	}
+	return n
+}
+
+// foldTail finds the boundary index where everything before it is foldable
+// (older than the token-budgeted tail). It walks backward, accumulating
+// estimated token sizes from len(Raw)/4, stops when the tail budget is met,
+// then aligns the boundary so tool-call/result pairs are not split.
+// Returns 0 when nothing should be folded (e.g. everything fits in tail).
+func (c *Compactor) foldTail(frozen []protocol.FrozenMessage, tailBudget int) int {
+	if len(frozen) == 0 {
+		return 0
+	}
 	keep := c.KeepTail
 	if keep < 1 {
 		keep = 1
 	}
+	if len(frozen) <= keep {
+		return 0
+	}
 	maxEnd := len(frozen) - keep
-	if maxEnd <= 0 {
-		return nil
+	acc := 0
+	boundary := len(frozen)
+	for i := len(frozen) - 1; i >= keep && acc < tailBudget; i-- {
+		acc += len(frozen[i].Raw) / 4
+		boundary = i
 	}
-	target := c.ChunkSize
-	if target == 0 {
-		target = 20
+	if boundary > maxEnd {
+		boundary = maxEnd
 	}
-	end := target
-	if end > maxEnd {
-		end = maxEnd
+	for boundary < maxEnd && splitsToolPair(frozen, boundary) {
+		boundary++
 	}
-	for end < maxEnd && splitsToolPair(frozen, end) {
-		end++
+	for boundary > 0 && splitsToolPair(frozen, boundary) {
+		boundary--
 	}
-	for end > 0 && splitsToolPair(frozen, end) {
-		end--
-	}
-	return frozen[:end]
+	return boundary
 }
 
 // splitsToolPair reports whether cutting frozen at index end would separate an
-// assistant tool_use inside the chunk from its tool_result outside it. A
-// tool_use with no result anywhere in the transcript does not count as split.
+// assistant tool_use inside the chunk from its tool_result outside it.
 func splitsToolPair(frozen []protocol.FrozenMessage, end int) bool {
 	for i := 0; i < end; i++ {
 		if frozen[i].Msg.Role != protocol.RoleAssistant {
@@ -311,7 +315,6 @@ func splitsToolPair(frozen []protocol.FrozenMessage, end int) bool {
 			if found {
 				continue
 			}
-			// The result may exist beyond 'end' — that's a split.
 			for j := end; j < len(frozen); j++ {
 				if frozen[j].Msg.Role != protocol.RoleTool {
 					continue
@@ -328,41 +331,144 @@ func splitsToolPair(frozen []protocol.FrozenMessage, end int) bool {
 	return false
 }
 
-// compactChunk summarises the given chunk of frozen messages, persists a
-// CompactionRecord, and drops the chunk from the in-memory frozen list. If
-// focus is non-empty the summarizer is guided to preserve information about it.
-func (c *Compactor) compactChunk(ctx context.Context, tx *Transcript, chunk []protocol.FrozenMessage, focus string) (string, error) {
-	msgs := make([]protocol.Message, len(chunk))
-	for i, fm := range chunk {
-		msgs[i] = fm.Msg
+func isSmallUserMessage(fm protocol.FrozenMessage, maxTokens int) bool {
+	if fm.Msg.Role != protocol.RoleUser {
+		return false
 	}
-	if c.Historian != nil {
+	return len(fm.Raw)/4 <= maxTokens
+}
+
+// pinMessages extracts messages from the fold region that should be kept
+// verbatim: the first small user turn (<1500 tok) and any other small user
+// turns. Returns (pinned, remaining). Both slices share order with input.
+func (c *Compactor) pinMessages(frozen []protocol.FrozenMessage) (pinned, remaining []protocol.FrozenMessage) {
+	if len(frozen) == 0 {
+		return nil, nil
+	}
+
+	pinnedSet := make(map[int]bool)
+
+	firstUserIdx := -1
+	for i, fm := range frozen {
+		if fm.Msg.Role == protocol.RoleUser {
+			firstUserIdx = i
+			break
+		}
+	}
+	if firstUserIdx >= 0 && isSmallUserMessage(frozen[firstUserIdx], 1500) {
+		pinnedSet[firstUserIdx] = true
+	}
+
+	for i, fm := range frozen {
+		if i == firstUserIdx {
+			continue
+		}
+		if isSmallUserMessage(fm, 1500) {
+			pinnedSet[i] = true
+		}
+	}
+
+	pinned = make([]protocol.FrozenMessage, 0, len(pinnedSet))
+	remaining = make([]protocol.FrozenMessage, 0, len(frozen)-len(pinnedSet))
+	for i, fm := range frozen {
+		if pinnedSet[i] {
+			pinned = append(pinned, fm)
+		} else {
+			remaining = append(remaining, fm)
+		}
+	}
+	return
+}
+
+// archiveFolded writes the dropped raw messages to a JSONL sidecar next to
+// the transcript before they are removed, so history stays traceable.
+func archiveFolded(tx *Transcript, dropped []protocol.FrozenMessage) error {
+	archivePath := tx.Path() + ".archive.jsonl"
+	if err := os.MkdirAll(filepath.Dir(archivePath), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(archivePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	rec := struct {
+		Type      string    `json:"type"`
+		Timestamp time.Time `json:"timestamp"`
+		Messages  []json.RawMessage `json:"messages"`
+	}{
+		Type:      "fold_archive",
+		Timestamp: time.Now().UTC(),
+		Messages:  make([]json.RawMessage, len(dropped)),
+	}
+	for i, fm := range dropped {
+		rec.Messages[i] = fm.Raw
+	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	_, err = f.Write(data)
+	return err
+}
+
+// performFold summarises the non-pinned messages, archives the originals,
+// and rewrites the transcript: pinned messages are prepended to summaries,
+// the summary replaces the non-pinned region, and the tail stays in frozen.
+// If summarization fails, falls back to a mechanical drop placeholder.
+func (c *Compactor) performFold(ctx context.Context, tx *Transcript, foldRegion, toSummarize, pinned []protocol.FrozenMessage, tail []protocol.FrozenMessage) (string, error) {
+	if len(foldRegion) == 0 {
+		return "", nil
+	}
+
+	// Archive all dropped messages before rewriting anything.
+	if err := archiveFolded(tx, foldRegion); err != nil {
+		return "", fmt.Errorf("archive fold: %w", err)
+	}
+
+	// Run historian on the foldable region.
+	if c.Historian != nil && len(foldRegion) > 0 {
+		msgs := make([]protocol.Message, len(foldRegion))
+		for i, fm := range foldRegion {
+			msgs[i] = fm.Msg
+		}
 		c.Historian.ExtractAsync(msgs)
 	}
 
-	summarizer := c.Summarizer
-	if focus != "" {
-		summarizer = c.Summarizer.WithFocus(focus)
+	var summary string
+	var err error
+	if len(toSummarize) > 0 {
+		summarizeMsgs := make([]protocol.Message, len(toSummarize))
+		for i, fm := range toSummarize {
+			summarizeMsgs[i] = fm.Msg
+		}
+		summary, err = c.Summarizer.Summarize(ctx, summarizeMsgs)
+		if err != nil {
+			// Fallback: mechanical drop placeholder.
+			summary = fmt.Sprintf("[Earlier conversation has been folded to stay within context limits. %d messages archived.]", len(foldRegion))
+			err = nil
+		}
+	} else {
+		summary = fmt.Sprintf("[%d earlier messages folded; archived.]", len(foldRegion))
 	}
 
-	summary, err := summarizer.Summarize(ctx, msgs)
-	if err != nil {
-		return "", fmt.Errorf("compaction summarize: %w", err)
-	}
-
+	// Build the canonical summary message.
 	summaryMsg := protocol.TextMessage(protocol.RoleAssistant, summary)
 	summaryRaw, err := json.Marshal(summaryMsg)
 	if err != nil {
 		return "", err
 	}
 
-	chunkIDs := make([]int, len(chunk))
-	for i := range chunk {
-		chunkIDs[i] = i
+	// Pin messages: write each as its own frozen message to summaries.
+	for _, fm := range pinned {
+		if err := tx.PrependFrozenMessage(fm); err != nil {
+			return "", err
+		}
 	}
+
 	rec := CompactionRecord{
 		Type:       "compaction",
-		ChunkIDs:   chunkIDs,
 		Summary:    summary,
 		SummaryAt:  time.Now().UTC(),
 		MessageRaw: summaryRaw,
@@ -370,7 +476,9 @@ func (c *Compactor) compactChunk(ctx context.Context, tx *Transcript, chunk []pr
 	if err := tx.AppendCompaction(rec); err != nil {
 		return "", err
 	}
-	tx.DropOldest(len(chunk))
+
+	// Drop the entire fold region from the frozen list.
+	tx.DropOldest(len(foldRegion))
 
 	if c.OnCompaction != nil {
 		c.OnCompaction()
@@ -379,57 +487,122 @@ func (c *Compactor) compactChunk(ctx context.Context, tx *Transcript, chunk []pr
 	return summary, nil
 }
 
-// MaybeCompact compacts the oldest chunk if prompt usage exceeds the threshold.
-// It mutates the transcript in place: the chunk is removed from the in-memory
-// frozen list and a summary message is prepended to the prefix. A compaction
-// record is appended to the JSONL.
-//
-// When usage exceeds EmergencyThreshold, the ChunkSize guard is bypassed so
-// even short-but-dense conversations can be compacted to free headroom.
+// MaybeCompact attempts to reclaim context by first snipping/pruning stale
+// tool results, then folding old history into a summary prefix if still needed.
+// Must be called at turn boundaries (not in per-iteration tool loops) using
+// real prompt tokens from the last API call.
 func (c *Compactor) MaybeCompact(ctx context.Context, tx *Transcript, promptTokens, ctxLimit int) (bool, error) {
 	if c.Threshold == 0 {
 		c.Threshold = 0.85
 	}
-	if c.ChunkSize == 0 {
-		c.ChunkSize = 20
+
+	// Phase 2 — Snip/prune tier: free context reclamation before paying
+	// for a summarization. Runs at SnipRatio (~60%) and above.
+	if snipped, _ := c.SnipPrune(tx, promptTokens, ctxLimit); snipped {
+		// Snip/prune itself is a cache-reset pass. Re-read usage after
+		// it. If pruning alone dropped us below threshold, skip the fold.
+		newFrozen := tx.Frozen()
+		newEstimate := estimateTokens(newFrozen)
+		if ctxLimit > 0 && float64(newEstimate)/float64(ctxLimit) < c.Threshold {
+			c.latchCount = 0
+			c.latchedPromptTokens = 0
+			return true, nil
+		}
 	}
+
 	if ctxLimit == 0 || float64(promptTokens)/float64(ctxLimit) < c.Threshold {
+		c.latchCount = 0
+		c.latchedPromptTokens = 0
 		return false, nil
 	}
-	frozen := tx.Frozen()
 
-	// Emergency: above EmergencyThreshold, compact whatever we can even if
-	// the session is shorter than ChunkSize (e.g. few messages but enormous
-	// tool outputs consumed the context).
+	// Anti-loop latch: if prompt stayed above threshold after two
+	// consecutive folds, pause auto-compaction until it drops below.
+	if c.latchCount >= 2 && promptTokens >= c.latchedPromptTokens {
+		return false, nil
+	}
+
+	tailBudget := c.TailBudgetTokens
+	if tailBudget <= 0 {
+		tailBudget = 16384
+	}
+	if ctxLimit > 0 {
+		halfLimit := ctxLimit / 2
+		if tailBudget > halfLimit {
+			tailBudget = halfLimit
+		}
+	}
+
+	frozen := tx.Frozen()
+	boundary := c.foldTail(frozen, tailBudget)
+	if boundary == 0 {
+		// Even without a tail, we have nothing meaningful to fold.
+		// If emergency, try harder: fold everything except KeepTail.
+		emergency := c.EmergencyThreshold > 0 && float64(promptTokens)/float64(ctxLimit) >= c.EmergencyThreshold
+		if emergency {
+			rawBoundary := len(frozen) - c.KeepTail
+			if rawBoundary <= 0 {
+				return false, nil
+			}
+			boundary = rawBoundary
+		} else {
+			return false, nil
+		}
+	}
+
+	foldRegion := frozen[:boundary]
+	pinned, toSummarize := c.pinMessages(foldRegion)
+
 	emergency := c.EmergencyThreshold > 0 && float64(promptTokens)/float64(ctxLimit) >= c.EmergencyThreshold
 
-	if !emergency && len(frozen) <= c.ChunkSize {
+	foldMin := c.FoldMinTokens
+	if foldMin <= 0 {
+		foldMin = 400
+	}
+	foldableTokens := estimateTokens(toSummarize)
+	if !emergency && foldableTokens < foldMin {
+		// Not worth the summarization call for such a small region.
 		return false, nil
 	}
-	chunk := c.alignedChunk(frozen)
-	if len(chunk) == 0 {
-		return false, nil
-	}
-	if _, err := c.compactChunk(ctx, tx, chunk, ""); err != nil {
+
+	_, err := c.performFold(ctx, tx, foldRegion, toSummarize, pinned, frozen[boundary:])
+	if err != nil {
 		return false, err
 	}
+
+	// Update latch: if still above threshold, increment.
+	if float64(promptTokens)/float64(ctxLimit) >= c.Threshold {
+		c.latchCount++
+		c.latchedPromptTokens = promptTokens
+	} else {
+		c.latchCount = 0
+		c.latchedPromptTokens = 0
+	}
+
 	return true, nil
 }
 
-// CompactNow forces compaction of the oldest chunk immediately, regardless of
-// context usage. If focus is non-empty it guides the summarizer to preserve
-// information related to the focus topic. Returns the summary text, or an error.
+// CompactNow forces a fold immediately, regardless of context usage.
+// If focus is non-empty it guides the summarizer.
 func (c *Compactor) CompactNow(ctx context.Context, tx *Transcript, focus string) (string, error) {
-	if c.ChunkSize == 0 {
-		c.ChunkSize = 20
-	}
 	frozen := tx.Frozen()
 	if len(frozen) == 0 {
 		return "", nil
 	}
-	chunk := c.alignedChunk(frozen)
-	if len(chunk) == 0 {
+
+	// Manual /compact folds the entire transcript as a single fold.
+	boundary := len(frozen) - c.KeepTail
+	if boundary <= 0 {
 		return "", nil
 	}
-	return c.compactChunk(ctx, tx, chunk, focus)
+	foldRegion := frozen[:boundary]
+	pinned, toSummarize := c.pinMessages(foldRegion)
+
+	if focus != "" {
+		origSummarizer := c.Summarizer
+		c.Summarizer = c.Summarizer.WithFocus(focus)
+		defer func() { c.Summarizer = origSummarizer }()
+	}
+
+	return c.performFold(ctx, tx, foldRegion, toSummarize, pinned, frozen[boundary:])
 }

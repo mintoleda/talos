@@ -213,7 +213,7 @@ func (b *Builder) usage(bl builtLoop) protocol.SubagentUsage {
 		OutputTokens:  st.OutputTokens,
 		ContextTokens: ctxTokens,
 		ContextLimit:  ctxLimit,
-		Cost:          b.prices.Cost(bl.model, st.InputTokens, st.OutputTokens),
+		Cost:          b.prices.CostDetailed(bl.model, st.InputTokens, st.CachedTokens, 0, st.OutputTokens),
 	}
 }
 

@@ -30,9 +30,11 @@ var embedded []byte
 
 // Price holds the per-million-token rates and context window for one model.
 type Price struct {
-	Input   float64 // USD per 1,000,000 input tokens
-	Output  float64 // USD per 1,000,000 output tokens
-	Context int     // context window in tokens (0 = unknown)
+	Input      float64 // USD per 1,000,000 input tokens
+	Output     float64 // USD per 1,000,000 output tokens
+	CacheRead  float64 // USD per 1,000,000 cached input tokens (0 = assume 0.1×Input)
+	CacheWrite float64 // USD per 1,000,000 cache-creation tokens (0 = assume 1.25×Input)
+	Context    int     // context window in tokens (0 = unknown)
 }
 
 // rawPrice mirrors the compact embedded JSON shape: {"i":, "o":, "c":}.
@@ -81,6 +83,7 @@ const (
 //	[models."deepseek-chat"]
 //	input = 0.14
 //	output = 0.28
+//	cache_read = 0.014
 //	context = 1000000
 func Load(baseDir string) *Table {
 	t := &Table{m: make(map[string]Price, len(Default.m))}
@@ -123,16 +126,18 @@ func applyTOMLOverrides(baseDir string, t *Table) {
 	}
 	var override struct {
 		Models map[string]struct {
-			Input   float64 `toml:"input"`
-			Output  float64 `toml:"output"`
-			Context int     `toml:"context"`
+			Input      float64 `toml:"input"`
+			Output     float64 `toml:"output"`
+			CacheRead  float64 `toml:"cache_read"`
+			CacheWrite float64 `toml:"cache_write"`
+			Context    int     `toml:"context"`
 		} `toml:"models"`
 	}
 	if toml.Unmarshal(data, &override) != nil {
 		return
 	}
 	for id, p := range override.Models {
-		t.m[id] = Price{Input: p.Input, Output: p.Output, Context: p.Context}
+		t.m[id] = Price{Input: p.Input, Output: p.Output, CacheRead: p.CacheRead, CacheWrite: p.CacheWrite, Context: p.Context}
 	}
 }
 
@@ -171,11 +176,43 @@ func (t *Table) Lookup(model string) (Price, bool) {
 // Cost returns the dollar cost of a run with the given token counts. It returns
 // 0 when the model's price is unknown.
 func (t *Table) Cost(model string, inputTokens, outputTokens int) float64 {
+	return t.CostDetailed(model, inputTokens, 0, 0, outputTokens)
+}
+
+// CostDetailed prices a run whose prompt was partially served from cache.
+// promptTokens is the total prompt size including cachedTokens (reads) and
+// cacheCreationTokens (writes). Models without explicit cache rates fall back
+// to the common 0.1× read / 1.25× write multiples of the input rate.
+func (t *Table) CostDetailed(model string, promptTokens, cachedTokens, cacheCreationTokens, outputTokens int) float64 {
+	uncachedCost, cachedCost, creationCost, outputCost := t.CostBreakdown(model, promptTokens, cachedTokens, cacheCreationTokens, outputTokens)
+	return uncachedCost + cachedCost + creationCost + outputCost
+}
+
+// CostBreakdown is CostDetailed split by row, matching how providers bill and
+// itemize a run: uncached ("miss") input, cached ("hit") input, cache-creation
+// writes, and output. Used by /stats to show a per-row dollar breakdown.
+func (t *Table) CostBreakdown(model string, promptTokens, cachedTokens, cacheCreationTokens, outputTokens int) (uncachedCost, cachedCost, creationCost, outputCost float64) {
 	p, ok := t.Lookup(model)
 	if !ok {
-		return 0
+		return 0, 0, 0, 0
 	}
-	return float64(inputTokens)/1e6*p.Input + float64(outputTokens)/1e6*p.Output
+	uncached := promptTokens - cachedTokens - cacheCreationTokens
+	if uncached < 0 {
+		uncached = 0
+	}
+	readRate := p.CacheRead
+	if readRate == 0 {
+		readRate = p.Input * 0.1
+	}
+	writeRate := p.CacheWrite
+	if writeRate == 0 {
+		writeRate = p.Input * 1.25
+	}
+	uncachedCost = float64(uncached) * p.Input / 1e6
+	cachedCost = float64(cachedTokens) * readRate / 1e6
+	creationCost = float64(cacheCreationTokens) * writeRate / 1e6
+	outputCost = float64(outputTokens) * p.Output / 1e6
+	return
 }
 
 // ContextWindow returns the model's context window in tokens, or 0 if unknown.

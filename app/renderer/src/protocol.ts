@@ -1,9 +1,3 @@
-// Protocol types for the Talos WebSocket client.
-// Mirrors internal/protocol/event.go, message.go, request.go, and transport/types.go.
-// All event structs use snake_case JSON keys matching the Go side.
-
-// ── Transport layer ──────────────────────────────────────────────────────
-
 export interface ClientMsg {
   type: "auth" | "input" | "steer" | "interrupt" | "approve" | "request" | "subscribe" | "unsubscribe";
   text?: string;
@@ -27,7 +21,7 @@ export interface ServerMsg {
   err?: string;
 }
 
-// ── Daemon RPC types (mirrors internal/client/rpc) ────────────────────────
+// ── Daemon RPC types ──────────────────────────────────────
 
 export interface SessionInfo {
   id: string;
@@ -236,6 +230,7 @@ export interface StatsResult {
   input: number;
   output: number;
   cache_miss: number;
+  cached: number;
   cost: number;
 }
 
@@ -243,7 +238,7 @@ export interface LevelResult {
   level: string;
 }
 
-// ── Content blocks (message.go) ──────────────────────────────────────────
+// ── Content blocks ──────────────────────────────────────────
 
 export type Role = "system" | "user" | "assistant" | "tool";
 export type BlockType = "text" | "tool_use" | "tool_result" | "image";
@@ -292,7 +287,7 @@ export interface SubagentUsage {
   cost: number;
 }
 
-// ── Request types (request.go) ──────────────────────────────────────────
+// ── Request types ──────────────────────────────────────────
 
 export interface FrozenMessage {
   msg: Message;
@@ -314,9 +309,7 @@ export interface Request {
   thinking_level?: string;
 }
 
-// ── Event types (event.go) ───────────────────────────────────────────────
-// Every event type has a snake_case etype on the wire.  Use the
-// Event union type and the discriminator field `etype` to narrow.
+// ── Event types ────────────────────────────────────────────
 
 export interface BatchStartedEvent {
   etype: "batch_started";
@@ -361,7 +354,6 @@ export interface PermissionRequestedEvent {
   tool_name: string;
   command: string;
   reason: string;
-  // note: reply_ch is stripped from the wire (chan<- bool, never serialised)
 }
 export interface SubagentStartedEvent {
   etype: "subagent_started";
@@ -459,7 +451,7 @@ export interface ToolSnapshot {
   args: Record<string, unknown>;
 }
 
-// SubagentEvent wraps a nested event tagged with {"etype": …, "event": …}.
+// SubagentEvent — nested event with {"etype": …, "event": …}.
 export interface SubagentEventEvent {
   etype: "subagent_event";
   id: string;
@@ -467,15 +459,13 @@ export interface SubagentEventEvent {
   inner: TaggedEvent;
 }
 
-// TaggedEvent is the recursive wrapper for SubagentEvent.inner.
+// TaggedEvent — recursive wrapper for SubagentEvent.inner.
 export interface TaggedEvent {
   etype: string;
   event: unknown;
 }
 
-// ── Event union ─────────────────────────────────────────────────────────
-// Discriminated on etype.  Use a type guard or switch on etype to narrow.
-
+// ── Event union ────────────────────────────────────────────
 export type Event =
   | BatchStartedEvent
   | BatchFinishedEvent
@@ -502,9 +492,8 @@ export type Event =
   | SessionStatusEvent
   | SubagentEventEvent;
 
-// ── Helpers ──────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────
 
-/** Parse a ServerMsg whose type is "event" into a typed Event union member. */
 export function decodeEvent(sm: ServerMsg): Event {
   const raw = sm.event as Record<string, unknown>;
   if (!raw) throw new Error("event body is empty");
@@ -512,7 +501,6 @@ export function decodeEvent(sm: ServerMsg): Event {
   return raw as unknown as Event;
 }
 
-/** Convert an Event union value back into wire form for display / logging. */
 export function eventLabel(e: Event): string {
   return e.etype;
 }

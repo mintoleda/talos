@@ -28,6 +28,28 @@ func TestLookupAndCost(t *testing.T) {
 	}
 }
 
+func TestCostDetailed(t *testing.T) {
+	tbl := &Table{m: map[string]Price{
+		"x/m": {Input: 1, Output: 4, CacheRead: 0.2, CacheWrite: 2},
+	}}
+	got := tbl.CostDetailed("x/m", 1_000_000, 500_000, 100_000, 1_000_000)
+	want := 0.4 + 0.1 + 0.2 + 4.0
+	if diff := got - want; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("cost = %v, want %v", got, want)
+	}
+
+	tbl.m["x/d"] = Price{Input: 1, Output: 4}
+	got = tbl.CostDetailed("x/d", 1_000_000, 500_000, 0, 0)
+	want = 0.5 + 0.05
+	if diff := got - want; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("default cache rate cost = %v, want %v", got, want)
+	}
+
+	if tbl.CostDetailed("x/m", 100, 300, 0, 0) < 0 {
+		t.Error("cost went negative when cached exceeds prompt")
+	}
+}
+
 func TestLookupProviderPrefix(t *testing.T) {
 	// Provider-namespaced IDs should resolve to the bare model entry.
 	if _, ok := Default.Lookup("opencode-go/deepseek-chat"); !ok {

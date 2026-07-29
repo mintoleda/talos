@@ -15,7 +15,7 @@ import (
 )
 
 type fakeEngine struct {
-	stats       func() (int, int, int, float64, error)
+	stats       func() (int, int, int, int, int, float64, error)
 	listModels  func() ([]models.Entry, error)
 	cycle       func() (string, error)
 	events      chan protocol.Event
@@ -66,11 +66,11 @@ func (e *fakeEngine) CyclePermissionMode() (string, error) { return "ask", nil }
 func (e *fakeEngine) PermissionMode() string               { return "auto" }
 func (e *fakeEngine) TogglePanic() (string, error)         { return "panic", nil }
 func (e *fakeEngine) Compact(string) error         { return nil }
-func (e *fakeEngine) Stats() (int, int, int, float64, error) {
+func (e *fakeEngine) Stats() (int, int, int, int, int, float64, error) {
 	if e.stats != nil {
 		return e.stats()
 	}
-	return 0, 0, 0, 0, nil
+	return 0, 0, 0, 0, 0, 0.0, nil
 }
 func (e *fakeEngine) LoginProviders() ([]dialogs.LoginProvider, error) { return nil, nil }
 func (e *fakeEngine) Login(string, string) error                       { return nil }
@@ -82,7 +82,6 @@ func (e *fakeEngine) ListFiles(string) ([]string, error)               { return 
 func (e *fakeEngine) ResolveInput(text string) ([]protocol.ContentBlock, string, error) {
 	return protocol.TextBlocks(text), text, nil
 }
-func (e *fakeEngine) PushInstruction() (string, string, error) { return "", "", nil }
 func (e *fakeEngine) Events() <-chan protocol.Event {
 	if e.events == nil {
 		e.events = make(chan protocol.Event)
@@ -620,8 +619,8 @@ func TestModelReseedStats(t *testing.T) {
 	m := NewModel(Config{
 		SessionID: "test",
 		Mode:      ModeSingleAgent,
-		Engine: &fakeEngine{stats: func() (int, int, int, float64, error) {
-			return 100, 50, 80, 0.005, nil
+		Engine: &fakeEngine{stats: func() (int, int, int, int, int, float64, error) {
+			return 100, 50, 80, 0, 0, 0.005, nil
 		}},
 	})
 	m.reseedStats()

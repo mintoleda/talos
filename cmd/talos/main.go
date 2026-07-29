@@ -173,7 +173,7 @@ func run() error {
 	default:
 		tuiCtx := context.Background()
 		localEng := built.NewEngine(tuiCtx)
-		inputTokens, outputTokens, cacheMiss, seedCost, _ := localEng.Stats()
+		inputTokens, outputTokens, cacheMiss, _, _, seedCost, _ := localEng.Stats()
 
 		initialCfg := tui.Config{
 			SessionID: built.Session.ID,
@@ -442,7 +442,7 @@ func runAttach(ctx context.Context, cfg *config.Config, sessionID string) error 
 	eng := client.NewRemoteEngine(clientConn, events)
 	eng.Session = sessionID
 	initialHistory, _ := eng.History()
-	inputTokens, outputTokens, cacheMiss, seedCost, _ := eng.Stats()
+	inputTokens, outputTokens, cacheMiss, _, _, seedCost, _ := eng.Stats()
 
 	provider, model := cfg.Provider, cfg.Model
 	if listed, err := listSessionsRPC(ctx, clientConn); err == nil {
@@ -553,7 +553,7 @@ func attachNewTab(ctx context.Context, cfg *config.Config, sessionID string, pri
 		eng := client.NewRemoteEngine(conn, evs)
 		eng.Session = sessionID
 		history, _ := eng.History()
-		in, out, miss, cost, _ := eng.Stats()
+		in, out, miss, _, _, cost, _ := eng.Stats()
 		return tui.Config{
 			SessionID:      sessionID,
 			Mode:           tui.ModeSingleAgent,

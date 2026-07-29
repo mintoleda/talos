@@ -60,7 +60,7 @@ func lastUserMessage(path string) string {
 
 	var last string
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	sc.Buffer(make([]byte, 50*1024*1024), 50*1024*1024)
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {

@@ -91,12 +91,12 @@ func TestEngineStats(t *testing.T) {
 	eng := engineHarness(t)
 	defer eng.Close()
 
-	in, out, miss, cost, err := eng.Stats()
+	in, out, miss, cached, cc, cost, err := eng.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
-	if in != 0 || out != 0 || miss != 0 || cost != 0 {
-		t.Fatalf("expected zero stats, got input=%d output=%d miss=%d cost=%.4f", in, out, miss, cost)
+	if in != 0 || out != 0 || miss != 0 || cached != 0 || cc != 0 || cost != 0 {
+		t.Fatalf("expected zero stats, got input=%d output=%d miss=%d cached=%d cc=%d cost=%.4f", in, out, miss, cached, cc, cost)
 	}
 }
 

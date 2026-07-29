@@ -1,10 +1,3 @@
-/**
- * daemon.ts — discover / spawn / health-check the talos multi-session daemon.
- *
- * Pure helpers (parseDiscovery, versionsMismatch) are unit-tested under vitest.
- * Spawn / probe paths are exercised manually via the Electron app.
- */
-
 import { spawn, execFile } from 'node:child_process'
 import { promises as fs, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -176,7 +169,6 @@ export async function probeDaemon(
           finish({ version: msg.version ?? '' })
         }
       } catch {
-        // ignore non-json
       }
     })
 

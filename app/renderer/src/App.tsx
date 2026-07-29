@@ -1,7 +1,3 @@
-/**
- * App — multi-session shell: sidebar + focused chat.
- */
-
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { Engine } from './engine'
 import type { Event, SessionInfo } from './protocol'

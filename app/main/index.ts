@@ -26,7 +26,6 @@ if (!gotLock) {
 let mainWindow: BrowserWindow | null = null
 
 function preloadPath(): string {
-  // electron-vite places preload next to main under out/preload/
   return join(__dirname, '../preload/preload.js')
 }
 
@@ -158,7 +157,7 @@ app.whenReady().then(() => {
   })
 })
 
-// Close windows only — daemon keeps running.
+// Close windows only — daemon keeps running
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit()

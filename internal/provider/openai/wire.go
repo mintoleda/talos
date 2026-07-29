@@ -66,5 +66,8 @@ type streamChunk struct {
 		CompletionTokens      int `json:"completion_tokens"`
 		PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
 		PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+		PromptTokensDetails   *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
 	} `json:"usage"`
 }

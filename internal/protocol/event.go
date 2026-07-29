@@ -37,7 +37,12 @@ type Notice struct {
 }
 type TurnEnded struct {
 	StopReason string `json:"stop_reason"`
-	Usage      Usage  `json:"usage"`
+	// Usage is the sum across every API call in the turn (tool-loop
+	// iterations included), not just the final call.
+	Usage Usage `json:"usage"`
+	// ContextTokens is the final call's total prompt size — the current
+	// context occupancy. Distinct from Usage.PromptTokens, which sums calls.
+	ContextTokens int `json:"context_tokens,omitempty"`
 }
 
 // PermissionRequested is emitted by the executor when a tool needs human
@@ -78,7 +83,7 @@ type SubagentUsage struct {
 	OutputTokens  int     `json:"output_tokens"`
 	ContextTokens int     `json:"context_tokens"` // current context size of the subagent
 	ContextLimit  int     `json:"context_limit"`  // subagent model's context window (0 = unknown)
-	Cost          float64 `json:"cost"`            // USD, 0 when the model's price is unknown
+	Cost          float64 `json:"cost"`           // USD, 0 when the model's price is unknown
 }
 
 // PromptEstimate is emitted before each streaming iteration to communicate
@@ -94,16 +99,17 @@ type PromptEstimate struct {
 // broadcast to all attached clients so they can render the user's message
 // in the chat pane, not just the submitting client.
 type UserInput struct {
-	Text string `json:"text"`
+	Text   string         `json:"text"`
+	Blocks []ContentBlock `json:"blocks,omitempty"`
 }
 
 // SubagentFinished is emitted when a subagent run completes. Result is the
 // subagent's final message — the only thing the calling agent sees.
 type SubagentFinished struct {
-	ID      string         `json:"id"`
-	Agent   string         `json:"agent"`
-	Result  string         `json:"result"`
-	IsError bool           `json:"is_error"`
+	ID      string        `json:"id"`
+	Agent   string        `json:"agent"`
+	Result  string        `json:"result"`
+	IsError bool          `json:"is_error"`
 	Usage   SubagentUsage `json:"usage"`
 }
 
@@ -204,23 +210,23 @@ type ToolSnapshot struct {
 	Args map[string]any `json:"args"`
 }
 
-func (ThinkingBlock) isEvent()        {}
-func (ThinkingDelta) isEvent()       {}
-func (UserInput) isEvent()           {}
-func (ModelChanged) isEvent()        {}
-func (BatchStarted) isEvent()        {}
-func (BatchFinished) isEvent()       {}
-func (TextDelta) isEvent()           {}
-func (ToolStarted) isEvent()         {}
-func (ToolFinished) isEvent()        {}
-func (ToolOutputDelta) isEvent()     {}
-func (Notice) isEvent()              {}
-func (TurnEnded) isEvent()           {}
-func (PermissionRequested) isEvent() {}
-func (SubagentStarted) isEvent()     {}
-func (SubagentEvent) isEvent()       {}
-func (PromptEstimate) isEvent()      {}
-func (SubagentFinished) isEvent()    {}
+func (ThinkingBlock) isEvent()         {}
+func (ThinkingDelta) isEvent()         {}
+func (UserInput) isEvent()             {}
+func (ModelChanged) isEvent()          {}
+func (BatchStarted) isEvent()          {}
+func (BatchFinished) isEvent()         {}
+func (TextDelta) isEvent()             {}
+func (ToolStarted) isEvent()           {}
+func (ToolFinished) isEvent()          {}
+func (ToolOutputDelta) isEvent()       {}
+func (Notice) isEvent()                {}
+func (TurnEnded) isEvent()             {}
+func (PermissionRequested) isEvent()   {}
+func (SubagentStarted) isEvent()       {}
+func (SubagentEvent) isEvent()         {}
+func (PromptEstimate) isEvent()        {}
+func (SubagentFinished) isEvent()      {}
 func (SessionStatus) isEvent()         {}
 func (EngineSnapshot) isEvent()        {}
 func (ApprovalResolved) isEvent()      {}
@@ -229,10 +235,15 @@ func (BgStarted) isEvent()             {}
 func (BgOutput) isEvent()              {}
 func (BgExited) isEvent()              {}
 
+// Usage is normalized across providers: PromptTokens is the total prompt size
+// including cached reads and cache writes, CachedPromptTokens is the portion
+// read from cache, and CacheCreationTokens is the portion written to cache
+// (Anthropic only; billed at a premium).
 type Usage struct {
-	PromptTokens       int `json:"prompt_tokens"`
-	CompletionTokens   int `json:"completion_tokens"`
-	CachedPromptTokens int `json:"cached_prompt_tokens"`
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	CachedPromptTokens  int `json:"cached_prompt_tokens"`
+	CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
 }
 
 type EmitFunc func(Event)

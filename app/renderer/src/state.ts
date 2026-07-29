@@ -1,10 +1,3 @@
-/**
- * state.ts — Pure reducer that accumulates protocol events into chat state.
- *
- * Same accumulation the TUI model does; kept as a pure reducer so it's
- * testable against Go fixtures.
- */
-
 import type {
   Event,
   TextDeltaEvent,
@@ -31,13 +24,13 @@ import type {
   BgSnapshot,
 } from './protocol';
 
-// ── Types ────────────────────────────────────────────────────────────────
+// ── Types ────────────────────────────────────────────────
 
 export interface ToolCallState {
   id: string;
   name: string;
   args: Record<string, unknown>;
-  output: string;        // accumulated ToolOutputDelta
+  output: string;
   finished: boolean;
   result?: string;
   isError?: boolean;
@@ -45,7 +38,7 @@ export interface ToolCallState {
 
 export interface MessageEntry {
   role: 'user' | 'assistant' | 'tool';
-  type?: 'thinking' | 'text'; // default 'text'; 'thinking' for model thinking blocks
+  type?: 'thinking' | 'text';
   text: string;
   toolCalls: ToolCallState[];
   usage?: { prompt_tokens: number; completion_tokens: number; cached_prompt_tokens: number };
@@ -63,30 +56,19 @@ export interface BgProcState {
 
 export interface ChatState {
   messages: MessageEntry[];
-  /** Streaming text for the assistant's current in-progress turn */
   streamedText: string;
-  /** Streaming thinking text (shown separately) */
   streamedThinking: string;
-  /** Active (running) tool calls */
   activeTools: ToolCallState[];
-  /** Whether the engine is currently processing a turn */
   busy: boolean;
-  /** When false, thinking content is collapsed (shown as a brief indicator); alt+t toggles */
   thinkExpanded: boolean;
-  /** Pending permission request (null = no prompt) */
   permissionRequest: PermissionRequestedEvent | null;
-  /** Model info */
   provider: string;
   model: string;
   thinkingLevel: string;
-  /** Permission mode */
   permissionMode: string;
-  /** Context estimate */
   promptTokens: number;
   contextLimit: number;
-  /** Current batch nesting (0 = no batch) */
   batchDepth: number;
-  /** Background shell sessions for this engine */
   bgProcs: BgProcState[];
   bgExpanded: boolean;
   bgLogID: string | null;
@@ -155,7 +137,6 @@ export function reduceState(s: ChatState, ev: Event): ChatState {
     case 'batch_finished':
       return { ...s, batchDepth: Math.max(0, s.batchDepth - 1) };
     case 'subagent_started':
-      // For the minimal client, emit a notice-like message.
       return {
         ...s,
         messages: [
@@ -311,7 +292,7 @@ function handleToolFinished(s: ChatState, ev: ToolFinishedEvent): ChatState {
     isError: ev.result?.is_error,
   };
 
-  // Append a tool message entry.
+  // Append a tool message entry
   return {
     ...s,
     activeTools: others,
@@ -342,7 +323,7 @@ function handleTurnEnded(s: ChatState, ev: TurnEndedEvent): ChatState {
 
   const assyMsgs: MessageEntry[] = [];
 
-  // Flush thinking as a standalone message if non-empty.
+  // Flush thinking as a standalone message if non-empty
   if (currentThinking) {
     assyMsgs.push({ role: 'assistant', type: 'thinking', text: currentThinking, toolCalls: [] });
   }
@@ -371,7 +352,6 @@ function handleTurnEnded(s: ChatState, ev: TurnEndedEvent): ChatState {
 
 /** Merge a history of frozen messages into state (used on attach). */
 export function ingestHistory(s: ChatState, history: unknown[]): ChatState {
-  // Simple approach: convert frozen messages to text lines.
   for (const h of history) {
     const rec = h as { msg?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
     const role = rec.msg?.role ?? 'user';

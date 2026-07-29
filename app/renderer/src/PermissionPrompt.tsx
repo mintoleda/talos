@@ -1,7 +1,3 @@
-/**
- * PermissionPrompt — approve/deny for tool permission requests.
- */
-
 import React from 'react';
 import type { PermissionRequestedEvent } from './protocol';
 

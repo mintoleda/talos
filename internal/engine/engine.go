@@ -22,6 +22,7 @@ import (
 	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/provider"
+	"github.com/mintoleda/talos/internal/provider/anthropic"
 	"github.com/mintoleda/talos/internal/provider/openai"
 	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
@@ -666,23 +667,38 @@ func (e *Engine) ListModels() ([]models.Entry, error) {
 		return cached, nil
 	}
 
+	entries, err := ListModelsForBaseDir(e.baseDir)
+	if err != nil {
+		return nil, err
+	}
+	e.mu.Lock()
+	e.modelCache = entries
+	e.mu.Unlock()
+	return entries, nil
+}
+
+// ListModelsForBaseDir is the session-independent model catalogue used by
+// both Engine (for the TUI) and daemon RPCs before a session exists.
+func ListModelsForBaseDir(baseDir string) ([]models.Entry, error) {
 	type result struct {
 		entries []models.Entry
 	}
 	ch := make(chan result, len(provider.All))
 	var wg sync.WaitGroup
 	for _, kp := range provider.All {
-		if kp.Name == "anthropic" {
-			continue
-		}
-		key := config.ResolveKeyFor(e.baseDir, kp.Name, kp.EnvVar)
+		key := config.ResolveKeyFor(baseDir, kp.Name, kp.EnvVar)
 		if key == "" {
 			continue
 		}
 		wg.Add(1)
 		go func(kp provider.Known, key string) {
 			defer wg.Done()
-			lister := openai.New(kp.BaseURL, key)
+			var lister provider.Provider
+			if kp.Name == "anthropic" {
+				lister = anthropic.New(kp.BaseURL, key, anthropic.Config{})
+			} else {
+				lister = openai.New(kp.BaseURL, key)
+			}
 			ids, err := lister.ListModels(context.Background())
 			if err != nil {
 				return
@@ -696,7 +712,7 @@ func (e *Engine) ListModels() ([]models.Entry, error) {
 	}
 	go func() { wg.Wait(); close(ch) }()
 
-	var all []models.Entry
+	all := make([]models.Entry, 0)
 	for r := range ch {
 		all = append(all, r.entries...)
 	}
@@ -707,9 +723,6 @@ func (e *Engine) ListModels() ([]models.Entry, error) {
 		return all[i].ID < all[j].ID
 	})
 
-	e.mu.Lock()
-	e.modelCache = all
-	e.mu.Unlock()
 	return all, nil
 }
 
@@ -827,20 +840,26 @@ func (e *Engine) Compact(focus string) error {
 	}
 }
 
-func (e *Engine) Stats() (int, int, int, float64, error) {
+func (e *Engine) Stats() (int, int, int, int, int, float64, error) {
 	s := e.lp.Stats()
 	cm := s.InputTokens - s.CachedTokens
 	c := 0.0
 	if e.prices != nil && e.modelName != "" {
-		c = e.prices.Cost(e.modelName, s.InputTokens, s.OutputTokens)
+		c = e.prices.CostDetailed(e.modelName, s.InputTokens, s.CachedTokens, s.CacheCreationTokens, s.OutputTokens)
 	}
-	return s.InputTokens, s.OutputTokens, cm, c, nil
+	return s.InputTokens, s.OutputTokens, cm, s.CachedTokens, s.CacheCreationTokens, c, nil
 }
 
 func (e *Engine) LoginProviders() ([]dialogs.LoginProvider, error) {
+	return LoginProvidersForBaseDir(e.baseDir)
+}
+
+// LoginProvidersForBaseDir reports configured provider credentials without
+// constructing or resolving a session.
+func LoginProvidersForBaseDir(baseDir string) ([]dialogs.LoginProvider, error) {
 	var out []dialogs.LoginProvider
 	for _, kp := range provider.All {
-		key := config.ResolveKeyFor(e.baseDir, kp.Name, kp.EnvVar)
+		key := config.ResolveKeyFor(baseDir, kp.Name, kp.EnvVar)
 		out = append(out, dialogs.LoginProvider{
 			Name:     kp.Name,
 			Label:    kp.Label,
@@ -890,10 +909,6 @@ func (e *Engine) ListFiles(prefix string) ([]string, error) {
 
 func (e *Engine) ResolveInput(text string) ([]protocol.ContentBlock, string, error) {
 	return client.ResolveInput(e.cwd, text)
-}
-
-func (e *Engine) PushInstruction() (string, string, error) {
-	return client.PushInstruction(e.cwd)
 }
 
 func (e *Engine) Events() <-chan protocol.Event {

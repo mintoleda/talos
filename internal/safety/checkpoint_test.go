@@ -114,3 +114,27 @@ func TestCheckpointSessionNamespace(t *testing.T) {
 		t.Fatalf("listB = %v", listB)
 	}
 }
+
+func TestCheckpointSnapshotsDoNotCollideWithinOneSecond(t *testing.T) {
+	repo := initRepo(t)
+	cp := NewCheckpointer(repo, "fast")
+
+	first, err := cp.Snapshot("first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := cp.Snapshot("second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("checkpoint refs collided: %s", first)
+	}
+	refs, err := cp.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("expected two checkpoint refs, got %v", refs)
+	}
+}

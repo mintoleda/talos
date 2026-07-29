@@ -1,7 +1,3 @@
-/**
- * CreatePopover — new agent: project, isolation, optional model.
- */
-
 import React, { useEffect, useState } from 'react'
 import type { Engine } from './engine'
 import { DaemonRPC, type ProbeDirResult } from './protocol'
