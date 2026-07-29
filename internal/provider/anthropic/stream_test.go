@@ -1,7 +1,10 @@
 package anthropic
 
 import (
+	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -10,7 +13,7 @@ import (
 
 func TestParseSSETextOnly(t *testing.T) {
 	body := `event: message_start
-data: {"type":"message_start","message":{"id":"msg","model":"claude-3","content":[]}}
+data: {"type":"message_start","message":{"id":"msg","model":"claude-3","content":[],"usage":{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}
 
 event: content_block_start
 data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
@@ -25,7 +28,7 @@ event: content_block_stop
 data: {"type":"content_block_stop","index":0}
 
 event: message_delta
-data: {"type":"message_delta","delta":{"type":"stop_reason","stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":5}}
+data: {"type":"message_delta","delta":{"type":"stop_reason","stop_reason":"end_turn"},"usage":{"output_tokens":2}}
 
 event: message_stop
 data: {"type":"message_stop"}
@@ -51,11 +54,45 @@ data: {"type":"message_stop"}
 	if text != "Hello world" {
 		t.Fatalf("expected text 'Hello world', got %q", text)
 	}
-	if usage.PromptTokens != 10 || usage.CompletionTokens != 2 || usage.CachedPromptTokens != 5 {
+	if usage.PromptTokens != 18 || usage.CompletionTokens != 2 || usage.CachedPromptTokens != 5 || usage.CacheCreationTokens != 3 {
 		t.Fatalf("unexpected usage: %+v", usage)
 	}
 	if !done {
 		t.Fatal("expected PEDone")
+	}
+}
+
+func TestListModelsPaginates(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if got := r.Header.Get("X-Api-Key"); got != "test-key" {
+			t.Fatalf("X-Api-Key = %q", got)
+		}
+		if got := r.Header.Get("Anthropic-Version"); got != "2023-06-01" {
+			t.Fatalf("Anthropic-Version = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("after_id") == "" {
+			_, _ = w.Write([]byte(`{"data":[{"id":"claude-b"}],"has_more":true,"last_id":"claude-b"}`))
+			return
+		}
+		if got := r.URL.Query().Get("after_id"); got != "claude-b" {
+			t.Fatalf("after_id = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"claude-a"}],"has_more":false,"last_id":"claude-a"}`))
+	}))
+	defer server.Close()
+
+	models, err := New(server.URL, "test-key", Config{}).ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if got, want := strings.Join(models, ","), "claude-a,claude-b"; got != want {
+		t.Fatalf("models = %q, want %q", got, want)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
 	}
 }
 

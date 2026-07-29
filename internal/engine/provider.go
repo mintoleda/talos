@@ -60,9 +60,6 @@ func NewProvider(cfg *config.Config, noTools bool) (provider.Provider, *session.
 	if cfg.CompactEmergencyThreshold > 0 {
 		compactor.EmergencyThreshold = cfg.CompactEmergencyThreshold
 	}
-	if cfg.CompactChunkSize > 0 {
-		compactor.ChunkSize = cfg.CompactChunkSize
-	}
 	compactor.Clamp()
 	return prov, compactor, nil
 }

@@ -2,9 +2,13 @@ package gitutil
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // RepoRoot returns the git toplevel for dir (git rev-parse --show-toplevel).
@@ -146,6 +150,175 @@ func RevParse(dir, ref string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// LastCommitAt returns the committer timestamp of the repository's HEAD.
+func LastCommitAt(dir string) (time.Time, error) {
+	out, err := run(dir, "log", "-1", "--format=%cI")
+	if err != nil {
+		return time.Time{}, err
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(out))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse last commit time: %w", err)
+	}
+	return t, nil
+}
+
+// VisibleFiles returns tracked and non-ignored untracked files using Git's
+// own ignore rules. Paths are relative to dir and use slash separators.
+func VisibleFiles(dir string) ([]string, error) {
+	out, err := run(dir, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, path := range strings.Split(out, "\x00") {
+		if path != "" {
+			files = append(files, filepath.ToSlash(path))
+		}
+	}
+	return files, nil
+}
+
+// WorktreeStatus returns changes in the working tree relative to HEAD,
+// including untracked files.
+func WorktreeStatus(dir string) ([]FileStat, error) {
+	nameOut, err := run(dir, "status", "--porcelain=v1", "-z")
+	if err != nil {
+		return nil, err
+	}
+	var files []FileStat
+	for _, part := range strings.Split(nameOut, "\x00") {
+		if len(part) < 4 {
+			continue
+		}
+		status := strings.TrimSpace(part[:2])
+		path := strings.TrimSpace(part[3:])
+		if path == "" {
+			continue
+		}
+		code := "M"
+		switch {
+		case strings.Contains(status, "A") || strings.Contains(status, "?"):
+			code = "A"
+		case strings.Contains(status, "D"):
+			code = "D"
+		case strings.Contains(status, "R"):
+			code = "R"
+		}
+		files = append(files, FileStat{Path: filepath.ToSlash(path), Status: code})
+	}
+	if statOut, statErr := run(dir, "diff", "--no-ext-diff", "--numstat", "HEAD", "--"); statErr == nil {
+		for _, line := range strings.Split(strings.TrimSpace(statOut), "\n") {
+			fields := strings.SplitN(line, "\t", 3)
+			if len(fields) != 3 {
+				continue
+			}
+			add, _ := strconv.Atoi(fields[0])
+			remove, _ := strconv.Atoi(fields[1])
+			for i := range files {
+				if files[i].Path == filepath.ToSlash(fields[2]) {
+					files[i].Additions, files[i].Deletions = add, remove
+				}
+			}
+		}
+	}
+	return files, nil
+}
+
+// WorktreeStatusAt returns tracked changes relative to base plus untracked
+// files in dir. It is the status primitive used by Talos-owned worktrees:
+// their baseline is the session's default branch rather than the worktree's
+// current HEAD.
+func WorktreeStatusAt(dir, base string) ([]FileStat, error) {
+	if strings.TrimSpace(base) == "" || base == "HEAD" {
+		return WorktreeStatus(dir)
+	}
+
+	nameOut, err := run(dir, "diff", "--no-ext-diff", "--name-status", "-z", base, "--")
+	if err != nil {
+		return nil, err
+	}
+	filesByPath := make(map[string]FileStat)
+	parts := strings.Split(nameOut, "\x00")
+	for index := 0; index+1 < len(parts); index += 2 {
+		status := strings.TrimSpace(parts[index])
+		path := strings.TrimSpace(parts[index+1])
+		if path == "" {
+			continue
+		}
+		code := "M"
+		switch {
+		case strings.HasPrefix(status, "A"):
+			code = "A"
+		case strings.HasPrefix(status, "D"):
+			code = "D"
+		case strings.HasPrefix(status, "R"):
+			code = "R"
+		}
+		filesByPath[filepath.ToSlash(path)] = FileStat{Path: filepath.ToSlash(path), Status: code}
+	}
+
+	numstat, err := run(dir, "diff", "--no-ext-diff", "--numstat", base, "--")
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(numstat), "\n") {
+		fields := strings.SplitN(line, "\t", 3)
+		if len(fields) != 3 {
+			continue
+		}
+		path := filepath.ToSlash(fields[2])
+		file := filesByPath[path]
+		file.Path = path
+		file.Additions, _ = strconv.Atoi(fields[0])
+		file.Deletions, _ = strconv.Atoi(fields[1])
+		filesByPath[path] = file
+	}
+
+	// A worktree may contain new files that have not been committed yet. Add
+	// them using the same ignore-aware status path used by HEAD-relative mode.
+	working, err := WorktreeStatus(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range working {
+		if _, exists := filesByPath[file.Path]; !exists {
+			filesByPath[file.Path] = file
+		}
+	}
+
+	files := make([]FileStat, 0, len(filesByPath))
+	for _, file := range filesByPath {
+		files = append(files, file)
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	return files, nil
+}
+
+// WorktreeDiffAt returns a unified diff against a caller-selected ref.
+func WorktreeDiffAt(dir, path string, contextLines int, base string) (string, error) {
+	if contextLines < 0 || contextLines > 1000 {
+		contextLines = 3
+	}
+	if base == "" {
+		base = "HEAD"
+	}
+	text, err := run(dir, "diff", "--no-ext-diff", fmt.Sprintf("--unified=%d", contextLines), base, "--", path)
+	if err == nil && text != "" {
+		return text, nil
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, filepath.FromSlash(path))); statErr == nil {
+		untracked, noIndexErr := run(dir, "diff", "--no-ext-diff", "--no-index", fmt.Sprintf("--unified=%d", contextLines), "/dev/null", path)
+		if noIndexErr == nil || untracked != "" {
+			return untracked, nil
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+	return text, nil
 }
 
 func run(dir string, args ...string) (string, error) {

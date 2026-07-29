@@ -1,7 +1,3 @@
-/**
- * ConfirmDialog — simple modal for destructive actions.
- */
-
 import React, { useEffect, useRef } from 'react'
 
 export type ConfirmDialogProps = {

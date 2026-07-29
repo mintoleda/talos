@@ -31,25 +31,34 @@ const (
 	History             = "engine.history"
 	ListFiles           = "engine.listFiles"
 	ResolveInput        = "engine.resolveInput"
-	PushInstruction     = "engine.pushInstruction"
 	ListCommands        = "engine.listCommands"
 	SetPermissionMode   = "engine.setPermissionMode"
 	ListBg              = "engine.listBg"
 	KillBg              = "engine.killBg"
 	BgLog               = "engine.bgLog"
 	DismissBg           = "engine.dismissBg"
+	ListCheckpoints     = "engine.listCheckpoints"
+	RestoreCheckpoint   = "engine.restoreCheckpoint"
+	DiffCheckpoints     = "engine.diffCheckpoints"
 
-	DaemonCreateSession = "daemon.createSession"
-	DaemonListSessions  = "daemon.listSessions"
-	DaemonStopSession   = "daemon.stopSession"
-	DaemonDeleteSession = "daemon.deleteSession"
-	DaemonStatus        = "daemon.status"
-	DaemonGCWorktrees   = "daemon.gcWorktrees"
-	DaemonProbeDir      = "daemon.probeDir"
+	DaemonCreateSession  = "daemon.createSession"
+	DaemonListSessions   = "daemon.listSessions"
+	DaemonListModels     = "daemon.listModels"
+	DaemonLoginProviders = "daemon.loginProviders"
+	DaemonStopSession    = "daemon.stopSession"
+	DaemonDeleteSession  = "daemon.deleteSession"
+	DaemonStatus         = "daemon.status"
+	DaemonGCWorktrees    = "daemon.gcWorktrees"
+	DaemonProbeDir       = "daemon.probeDir"
+	DaemonListProjects   = "daemon.listProjects"
+	GitStatus            = "git.status"
+	GitDiff              = "git.diff"
+	FSTree               = "fs.tree"
+	FSRead               = "fs.read"
 
-	MergePreview       = "merge.preview"
-	MergeFileDiff      = "merge.fileDiff"
-	MergeExecute       = "merge.execute"
+	MergePreview        = "merge.preview"
+	MergeFileDiff       = "merge.fileDiff"
+	MergeExecute        = "merge.execute"
 	MergeCommitWorktree = "merge.commitWorktree"
 )
 
@@ -117,6 +126,63 @@ type ProbeDirResult struct {
 	ProjectDir string `json:"project_dir"`
 }
 
+type ProjectInfo struct {
+	ProjectDir    string    `json:"project_dir"`
+	Name          string    `json:"name"`
+	LastCommitAt  time.Time `json:"last_commit_at"`
+	SessionCount  int       `json:"session_count"`
+	DefaultBranch string    `json:"default_branch"`
+}
+
+type ListProjectsResult struct {
+	Projects []ProjectInfo `json:"projects"`
+}
+
+type GitStatusParams struct {
+	SessionID string `json:"sessionId"`
+}
+
+type GitStatusResult struct {
+	Files []MergeFileStat `json:"files"`
+	Base  string          `json:"base"`
+}
+
+type GitDiffParams struct {
+	SessionID string `json:"sessionId"`
+	Path      string `json:"path"`
+	Context   int    `json:"context,omitempty"`
+	Base      string `json:"base,omitempty"`
+}
+
+type GitDiffResult struct {
+	Unified string `json:"unified"`
+}
+
+type FSTreeParams struct {
+	Dir   string `json:"dir"`
+	Depth int    `json:"depth,omitempty"`
+}
+
+type FsEntry struct {
+	Path  string `json:"path"`
+	Name  string `json:"name"`
+	IsDir bool   `json:"is_dir"`
+	Size  int64  `json:"size"`
+}
+
+type FSTreeResult struct {
+	Entries []FsEntry `json:"entries"`
+}
+
+type FSReadParams struct {
+	Path string `json:"path"`
+}
+
+type FSReadResult struct {
+	Content   string `json:"content"`
+	Truncated bool   `json:"truncated"`
+}
+
 type ResumeParams struct {
 	ID string `json:"id"`
 }
@@ -147,11 +213,31 @@ type CompactParams struct {
 	Focus string `json:"focus"`
 }
 
+type RestoreCheckpointParams struct {
+	Ref string `json:"ref"`
+}
+
+type DiffCheckpointsParams struct {
+	From             string `json:"from,omitempty"`
+	To               string `json:"to,omitempty"`
+	IgnoreWhitespace bool   `json:"ignore_whitespace,omitempty"`
+}
+
+type DiffCheckpointsResult struct {
+	Unified string `json:"unified"`
+}
+
+type CheckpointsResult struct {
+	Refs []string `json:"refs"`
+}
+
 type StatsResult struct {
-	Input     int     `json:"input"`
-	Output    int     `json:"output"`
-	CacheMiss int     `json:"cache_miss"`
-	Cost      float64 `json:"cost"`
+	Input         int     `json:"input"`
+	Output        int     `json:"output"`
+	CacheMiss     int     `json:"cache_miss"`
+	Cached        int     `json:"cached"`
+	CacheCreation int     `json:"cache_creation"`
+	Cost          float64 `json:"cost"`
 }
 
 type LoginParams struct {
@@ -202,11 +288,6 @@ type ResolveInputParams struct {
 type ResolveInputResult struct {
 	Blocks  []protocol.ContentBlock `json:"blocks"`
 	Display string                  `json:"display"`
-}
-
-type PushInstructionResult struct {
-	Message string `json:"message"`
-	Notice  string `json:"notice"`
 }
 
 // CommandDesc describes a slash command for the composer palette.

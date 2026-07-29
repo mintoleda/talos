@@ -58,10 +58,16 @@ func parseSSE(body io.ReadCloser, out chan<- protocol.ProviderEvent) {
 					return
 				}
 				if chunk.Usage != nil {
+					// DeepSeek reports cache hits as prompt_cache_hit_tokens;
+					// OpenAI/OpenRouter as prompt_tokens_details.cached_tokens.
+					cached := chunk.Usage.PromptCacheHitTokens
+					if cached == 0 && chunk.Usage.PromptTokensDetails != nil {
+						cached = chunk.Usage.PromptTokensDetails.CachedTokens
+					}
 					out <- protocol.PEUsage{Usage: protocol.Usage{
 						PromptTokens:       chunk.Usage.PromptTokens,
 						CompletionTokens:   chunk.Usage.CompletionTokens,
-						CachedPromptTokens: chunk.Usage.PromptCacheHitTokens,
+						CachedPromptTokens: cached,
 					}}
 				}
 				for _, ch := range chunk.Choices {

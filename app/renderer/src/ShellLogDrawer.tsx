@@ -1,7 +1,3 @@
-/**
- * ShellLogDrawer — full log view for one background process.
- */
-
 import React, { useEffect, useRef, useState } from 'react'
 import type { BgProcState } from './state'
 

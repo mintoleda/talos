@@ -1,8 +1,4 @@
-/**
- * Sidebar — left rail: New Agent, session list, footer status.
- */
-
-import React, { forwardRef } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import type { SessionInfo } from './protocol'
 import { SessionList } from './SessionList'
 

@@ -25,6 +25,7 @@ func parseSSE(body io.ReadCloser, out chan<- protocol.ProviderEvent) {
 
 	r := bufio.NewReader(body)
 	blocks := map[int]*blockState{}
+	var agg sseUsage
 
 	var eventType string
 	var dataLines []string
@@ -64,7 +65,7 @@ func parseSSE(body io.ReadCloser, out chan<- protocol.ProviderEvent) {
 					out <- protocol.PEError{Err: fmt.Errorf("parse sse event: %w", je)}
 					return
 				}
-				processEvent(eventType, ev, blocks, out, flushBlock)
+				processEvent(eventType, ev, blocks, &agg, out, flushBlock)
 			}
 			eventType = ""
 			dataLines = dataLines[:0]
@@ -84,14 +85,40 @@ func parseSSE(body io.ReadCloser, out chan<- protocol.ProviderEvent) {
 	}
 }
 
+// mergeUsage folds nonzero fields of src into dst. Anthropic splits usage
+// across events — input and cache counts arrive on message_start, output on
+// message_delta — so the parser accumulates before emitting.
+func mergeUsage(dst *sseUsage, src *sseUsage) {
+	if src == nil {
+		return
+	}
+	if src.InputTokens > 0 {
+		dst.InputTokens = src.InputTokens
+	}
+	if src.OutputTokens > 0 {
+		dst.OutputTokens = src.OutputTokens
+	}
+	if src.CacheCreationInputTokens > 0 {
+		dst.CacheCreationInputTokens = src.CacheCreationInputTokens
+	}
+	if src.CacheReadInputTokens > 0 {
+		dst.CacheReadInputTokens = src.CacheReadInputTokens
+	}
+}
+
 func processEvent(
 	typ string,
 	ev sseEvent,
 	blocks map[int]*blockState,
+	agg *sseUsage,
 	out chan<- protocol.ProviderEvent,
 	flush func(int),
 ) {
 	switch typ {
+	case "message_start":
+		if ev.Message != nil {
+			mergeUsage(agg, ev.Message.Usage)
+		}
 	case "content_block_start":
 		if ev.ContentBlock == nil {
 			return
@@ -121,10 +148,14 @@ func processEvent(
 		flush(ev.Index)
 	case "message_delta":
 		if ev.Usage != nil {
+			mergeUsage(agg, ev.Usage)
+			// Anthropic's input_tokens excludes cached reads and cache
+			// writes; normalize to total prompt size like other providers.
 			out <- protocol.PEUsage{Usage: protocol.Usage{
-				PromptTokens:       ev.Usage.InputTokens,
-				CompletionTokens:   ev.Usage.OutputTokens,
-				CachedPromptTokens: ev.Usage.CacheReadInputTokens,
+				PromptTokens:        agg.InputTokens + agg.CacheReadInputTokens + agg.CacheCreationInputTokens,
+				CompletionTokens:    agg.OutputTokens,
+				CachedPromptTokens:  agg.CacheReadInputTokens,
+				CacheCreationTokens: agg.CacheCreationInputTokens,
 			}}
 		}
 		if ev.Delta != nil {

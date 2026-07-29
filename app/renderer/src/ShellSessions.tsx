@@ -1,7 +1,3 @@
-/**
- * ShellSessions — collapsed/expanded strip of background shell processes.
- */
-
 import React from 'react'
 import type { BgProcState } from './state'
 

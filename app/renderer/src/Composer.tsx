@@ -1,8 +1,3 @@
-/**
- * Composer — multiline input with @-mentions, slash palette, steer queue,
- * model / permission / thinking chips.
- */
-
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Engine } from './engine'
 import type { CommandDesc, ListCommandsResult, ListFilesResult, SessionInfo } from './protocol'

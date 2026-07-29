@@ -1,7 +1,3 @@
-/**
- * StatusBar — model, thinking level, context meter, permission mode, usage.
- */
-
 import React from 'react'
 
 interface StatusBarProps {

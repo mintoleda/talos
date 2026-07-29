@@ -21,6 +21,7 @@ import (
 	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/engine"
 	"github.com/mintoleda/talos/internal/gitutil"
+	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/transport"
 	"github.com/mintoleda/talos/internal/version"
@@ -45,6 +46,8 @@ type Daemon struct {
 	lastActivity  time.Time
 	conns         map[int]*daemonConn
 	connNext      int
+	modelCache    []models.Entry
+	modelCacheAt  time.Time
 }
 
 type daemonConn struct {
@@ -90,6 +93,26 @@ func NewDaemon(cfg *config.Config, idleTimeout time.Duration) *Daemon {
 }
 
 func (d *Daemon) Manager() *SessionManager { return d.manager }
+
+func (d *Daemon) listModels() ([]models.Entry, error) {
+	d.mu.Lock()
+	if d.modelCache != nil && time.Since(d.modelCacheAt) < time.Minute {
+		cached := append([]models.Entry(nil), d.modelCache...)
+		d.mu.Unlock()
+		return cached, nil
+	}
+	d.mu.Unlock()
+
+	entries, err := engine.ListModelsForBaseDir(d.baseDir)
+	if err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	d.modelCache = append([]models.Entry(nil), entries...)
+	d.modelCacheAt = time.Now()
+	d.mu.Unlock()
+	return entries, nil
+}
 
 func (d *Daemon) SetWebDir(dir string) { d.webDir = dir }
 
@@ -352,9 +375,18 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 			eng.Touch()
 			switch cm.Type {
 			case "input":
-				eng.SubmitText(cm.Text)
+				if len(cm.Blocks) > 0 {
+					eng.Emit(protocol.UserInput{Text: cm.Text, Blocks: cm.Blocks})
+					eng.Submit(cm.Blocks)
+				} else {
+					eng.SubmitText(cm.Text)
+				}
 			case "steer":
-				eng.SteerText(cm.Text)
+				if len(cm.Blocks) > 0 {
+					eng.Steer(cm.Blocks)
+				} else {
+					eng.SteerText(cm.Text)
+				}
 			case "interrupt":
 				eng.Interrupt()
 			case "approve":
@@ -437,7 +469,7 @@ func (d *Daemon) resolveEngine(ctx context.Context, dc *daemonConn, sessionHint 
 
 func (d *Daemon) handleRequest(ctx context.Context, dc *daemonConn, cm transport.ClientMsg) (json.RawMessage, string, error) {
 	method := cm.Method
-	if strings.HasPrefix(method, "daemon.") || strings.HasPrefix(method, "merge.") {
+	if strings.HasPrefix(method, "daemon.") || strings.HasPrefix(method, "merge.") || strings.HasPrefix(method, "git.") || strings.HasPrefix(method, "fs.") {
 		result, err := d.handleDaemonRPC(ctx, method, cm.Params)
 		return result, "", err
 	}
@@ -464,6 +496,18 @@ func (d *Daemon) handleDaemonRPC(ctx context.Context, method string, params json
 		return json.Marshal(rpc.CreateSessionResult{Session: info})
 	case rpc.DaemonListSessions:
 		return json.Marshal(rpc.ListSessionsResult{Sessions: d.manager.List()})
+	case rpc.DaemonListModels:
+		models, err := d.listModels()
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(rpc.ModelsResult{Models: models})
+	case rpc.DaemonLoginProviders:
+		providers, err := engine.LoginProvidersForBaseDir(d.baseDir)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(rpc.LoginProvidersResult{Providers: providers})
 	case rpc.DaemonStopSession:
 		p, err := decodeParams[rpc.StopSessionParams](params)
 		if err != nil {
@@ -508,6 +552,52 @@ func (d *Daemon) handleDaemonRPC(ctx context.Context, method string, params json
 			if root, err := gitutil.RepoRoot(abs); err == nil {
 				result.ProjectDir = root
 			}
+		}
+		return json.Marshal(result)
+	case rpc.DaemonListProjects:
+		result, err := d.listProjects()
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(result)
+	case rpc.GitStatus:
+		p, err := decodeParams[rpc.GitStatusParams](params)
+		if err != nil {
+			return nil, err
+		}
+		result, err := d.gitStatus(p)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(result)
+	case rpc.GitDiff:
+		p, err := decodeParams[rpc.GitDiffParams](params)
+		if err != nil {
+			return nil, err
+		}
+		result, err := d.gitDiff(p)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(result)
+	case rpc.FSTree:
+		p, err := decodeParams[rpc.FSTreeParams](params)
+		if err != nil {
+			return nil, err
+		}
+		result, err := fsTree(p)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(result)
+	case rpc.FSRead:
+		p, err := decodeParams[rpc.FSReadParams](params)
+		if err != nil {
+			return nil, err
+		}
+		result, err := fsRead(p)
+		if err != nil {
+			return nil, err
 		}
 		return json.Marshal(result)
 	case rpc.MergePreview:

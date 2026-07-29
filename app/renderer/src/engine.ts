@@ -1,20 +1,7 @@
-/**
- * engine.ts — WebSocket engine mirroring the Go RemoteEngine.
- *
- * Wraps one WebSocket connection, demuxes ServerMsg into:
- *   (a) an event stream (push-based protocol.Event)
- *   (b) request/response by id (Promise per in-flight request)
- *
- * Supports auto-reconnect with exponential backoff. On reconnect failure,
- * optionally re-ensures the daemon via window.talos?.getDaemon().
- */
-
 import type { ServerMsg, ClientMsg, Event } from './protocol'
 
 export type EngineOptions = {
-  /** Enable auto-reconnect (default true). */
   autoReconnect?: boolean
-  /** Called after a successful reconnect (new hello). */
   onReconnect?: (session: string) => void
   /**
    * Resolve fresh connection credentials before retrying.
@@ -34,13 +21,9 @@ export class Engine {
   private readonly autoReconnect: boolean
   private readonly resolveConnection?: EngineOptions['resolveConnection']
 
-  /** Callback for inbound events (TextDelta, ToolStarted, …) */
   onEvent: ((ev: Event, session?: string) => void) | null = null
-  /** Callback when the connection drops (and reconnect is not pending / disabled) */
   onClose: ((reason: string) => void) | null = null
-  /** Callback when the hello handshake completes (first connect or reconnect) */
   onReady: ((session: string, version?: string) => void) | null = null
-  /** Optional reconnect hook from options */
   onReconnect: ((session: string) => void) | null = null
 
   private pending = new Map<number, { resolve: (val: unknown) => void; reject: (err: Error) => void }>()
@@ -57,7 +40,6 @@ export class Engine {
     this.connect()
   }
 
-  /** Last hello.version seen from the server. */
   get serverVersion(): string {
     return this.helloVersion
   }
@@ -133,9 +115,7 @@ export class Engine {
       }
     }
 
-    this.ws.onerror = () => {
-      // onclose will follow; avoid double-handling
-    }
+    this.ws.onerror = () => {}
   }
 
   private rejectAllPending(reason: string) {
@@ -180,37 +160,30 @@ export class Engine {
     }, delay)
   }
 
-  /** Start receiving a session's full event stream (snapshot + history first). */
   subscribe(session: string) {
     this.sendRaw({ type: 'subscribe', session })
   }
 
-  /** Stop the full event stream for a session (SessionStatus still arrives). */
   unsubscribe(session: string) {
     this.sendRaw({ type: 'unsubscribe', session })
   }
 
-  /** Submit user text as a new turn. */
   submit(text: string, session?: string) {
     this.sendRaw({ type: 'input', text, session })
   }
 
-  /** Interrupt the current turn. */
   interrupt(session?: string) {
     this.sendRaw({ type: 'interrupt', session })
   }
 
-  /** Approve or deny a permission request. */
   approve(ok: boolean, session?: string) {
     this.sendRaw({ type: 'approve', approved: ok, session })
   }
 
-  /** Send a steer message (text typed while busy). */
   steer(text: string, session?: string) {
     this.sendRaw({ type: 'steer', text, session })
   }
 
-  /** Call an RPC method and await the result. */
   async request(method: string, params?: unknown, session?: string): Promise<unknown> {
     const id = this.nextID++
     return new Promise((resolve, reject) => {

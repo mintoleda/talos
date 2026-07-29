@@ -18,10 +18,11 @@ var exclusiveTools = map[string]bool{
 }
 
 type Stats struct {
-	Calls        int
-	InputTokens  int
-	CachedTokens int
-	OutputTokens int
+	Calls               int
+	InputTokens         int
+	CachedTokens        int
+	OutputTokens        int
+	CacheCreationTokens int
 }
 
 func (s Stats) CacheHitRate() float64 {
@@ -56,7 +57,8 @@ type Loop struct {
 	// pattern as pi's "steer" mechanism.
 	SteerFunc func() [][]protocol.ContentBlock
 
-	stats Stats
+	stats             Stats
+	lastPromptTokens  int
 }
 
 func New(p provider.Provider, e executor.Executor, tx *session.Transcript, pb *PromptBuilder) *Loop {
@@ -69,10 +71,11 @@ func New(p provider.Provider, e executor.Executor, tx *session.Transcript, pb *P
 	if tx != nil {
 		sr := tx.RestoreStats()
 		l.stats = Stats{
-			Calls:        sr.Calls,
-			InputTokens:  sr.InputTokens,
-			CachedTokens: sr.CachedTokens,
-			OutputTokens: sr.OutputTokens,
+			Calls:               sr.Calls,
+			InputTokens:         sr.InputTokens,
+			CachedTokens:        sr.CachedTokens,
+			OutputTokens:        sr.OutputTokens,
+			CacheCreationTokens: sr.CacheCreationTokens,
 		}
 	}
 	return l
@@ -92,10 +95,11 @@ func (l *Loop) History() []protocol.FrozenMessage {
 func (l *Loop) Close() {
 	if l.tx != nil {
 		_ = l.tx.WriteStats(session.StatsRecord{
-			Calls:        l.stats.Calls,
-			InputTokens:  l.stats.InputTokens,
-			CachedTokens: l.stats.CachedTokens,
-			OutputTokens: l.stats.OutputTokens,
+			Calls:               l.stats.Calls,
+			InputTokens:         l.stats.InputTokens,
+			CachedTokens:        l.stats.CachedTokens,
+			OutputTokens:        l.stats.OutputTokens,
+			CacheCreationTokens: l.stats.CacheCreationTokens,
 		})
 		_ = l.tx.Close()
 	}
@@ -133,19 +137,21 @@ func (l *Loop) SetProvider(p provider.Provider) {
 func (l *Loop) SetTranscript(tx *session.Transcript) {
 	if l.tx != nil {
 		_ = l.tx.WriteStats(session.StatsRecord{
-			Calls:        l.stats.Calls,
-			InputTokens:  l.stats.InputTokens,
-			CachedTokens: l.stats.CachedTokens,
-			OutputTokens: l.stats.OutputTokens,
+			Calls:               l.stats.Calls,
+			InputTokens:         l.stats.InputTokens,
+			CachedTokens:        l.stats.CachedTokens,
+			OutputTokens:        l.stats.OutputTokens,
+			CacheCreationTokens: l.stats.CacheCreationTokens,
 		})
 		_ = l.tx.Close()
 	}
 	sr := tx.RestoreStats()
 	l.stats = Stats{
-		Calls:        sr.Calls,
-		InputTokens:  sr.InputTokens,
-		CachedTokens: sr.CachedTokens,
-		OutputTokens: sr.OutputTokens,
+		Calls:               sr.Calls,
+		InputTokens:         sr.InputTokens,
+		CachedTokens:        sr.CachedTokens,
+		OutputTokens:        sr.OutputTokens,
+		CacheCreationTokens: sr.CacheCreationTokens,
 	}
 	l.tx = tx
 }
@@ -262,12 +268,20 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 		return fmt.Errorf("append user message: %w", err)
 	}
 
+	// Turn-boundary compaction check: use real prompt tokens from the
+	// previous turn's last API call, not an estimate. The active turn's
+	// messages are never inside the folded region — this runs before the
+	// first LLM call of the turn, after the user message is appended.
+	if l.compactor != nil && l.lastPromptTokens > 0 {
+		if compacted, err := l.compactor.MaybeCompact(ctx, l.tx, l.lastPromptTokens, l.promptB.ContextLimit()); err != nil {
+			emit(protocol.Notice{Level: "error", Text: fmt.Sprintf("compaction failed: %v", err)})
+		} else if compacted {
+			emit(protocol.Notice{Level: "info", Text: "compaction: folded earlier conversation"})
+		}
+	}
+
+	var turnUsage protocol.Usage
 	for iter := 0; l.MaxIterations == 0 || iter < l.MaxIterations; iter++ {
-		// Check for steering messages submitted while the agent was busy
-		// (e.g. during tool execution or streaming). They are injected
-		// into the transcript before the next LLM call, just like pi's
-		// "steer" mechanism — messages queued during a turn become
-		// additional user context on the next reasoning step.
 		if l.SteerFunc != nil && iter > 0 {
 			if steerMessages := l.SteerFunc(); len(steerMessages) > 0 {
 				for _, blocks := range steerMessages {
@@ -278,15 +292,7 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 				emit(protocol.Notice{Level: "info", Text: fmt.Sprintf("✎ steer: %d message(s) injected", len(steerMessages))})
 			}
 		}
-		if l.compactor != nil {
-			req := l.promptB.Build(l.tx)
-			tokens := l.promptB.EstimatedTokens(req)
-			if compacted, err := l.compactor.MaybeCompact(ctx, l.tx, tokens, l.promptB.ContextLimit()); err != nil {
-				emit(protocol.Notice{Level: "error", Text: fmt.Sprintf("compaction failed: %v", err)})
-			} else if compacted {
-				emit(protocol.Notice{Level: "info", Text: "compaction: summarized oldest chunk"})
-			}
-		}
+
 		req := l.promptB.Build(l.tx)
 		if l.DebugCache {
 			emit(protocol.Notice{Level: "debug", Text: fmt.Sprintf("cache prefix hash: %s", l.promptB.PrefixHash(req))})
@@ -295,20 +301,37 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 			emit(protocol.Notice{Level: "warn", Text: fmt.Sprintf("context %.0f%% full — consider /new", pct*100)})
 		}
 
+		estimated := l.promptB.EstimatedTokens(req)
 		emit(protocol.PromptEstimate{
-			PromptTokens: l.promptB.EstimatedTokens(req),
+			PromptTokens: estimated,
 			ContextLimit: l.promptB.ContextLimit(),
 		})
 
+		prevShape := l.promptB.Shape(req, l.tx)
+
 		assistant, usage, err := l.streamWithRetry(ctx, req, emit)
 		if err != nil {
-			// Includes ctx.Canceled on user interrupt; the caller distinguishes it.
 			return err
+		}
+		l.promptB.Calibrate(estimated, usage.PromptTokens)
+
+		// Miss attribution: if cache hit rate is unexpectedly low,
+		// compare prefix shapes from before/after this turn to guess why.
+		if l.DebugCache || (usage.PromptTokens > 0 && float64(usage.CachedPromptTokens)/float64(usage.PromptTokens) < 0.1) {
+			curShape := l.promptB.Shape(req, l.tx)
+			if cause := l.promptB.CacheMissCause(prevShape, curShape); cause != "" {
+				emit(protocol.Notice{Level: "debug", Text: fmt.Sprintf("cache miss cause: %s", cause)})
+			}
 		}
 		l.stats.Calls++
 		l.stats.InputTokens += usage.PromptTokens
 		l.stats.CachedTokens += usage.CachedPromptTokens
 		l.stats.OutputTokens += usage.CompletionTokens
+		l.stats.CacheCreationTokens += usage.CacheCreationTokens
+		turnUsage.PromptTokens += usage.PromptTokens
+		turnUsage.CompletionTokens += usage.CompletionTokens
+		turnUsage.CachedPromptTokens += usage.CachedPromptTokens
+		turnUsage.CacheCreationTokens += usage.CacheCreationTokens
 
 		if err := l.tx.Append(assistant); err != nil {
 			return fmt.Errorf("append assistant message: %w", err)
@@ -316,7 +339,8 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 
 		toolUses := assistant.ToolUses()
 		if len(toolUses) == 0 {
-			emit(protocol.TurnEnded{StopReason: "stop", Usage: usage})
+			l.lastPromptTokens = usage.PromptTokens
+			emit(protocol.TurnEnded{StopReason: "stop", Usage: turnUsage, ContextTokens: usage.PromptTokens})
 			return nil
 		}
 

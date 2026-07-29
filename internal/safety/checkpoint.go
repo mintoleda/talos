@@ -63,7 +63,11 @@ func (c *Checkpointer) Snapshot(label string) (string, error) {
 	}
 	commit = strings.TrimSpace(commit)
 
-	ref := c.refPrefix() + time.Now().UTC().Format("20060102T150405Z")
+	// Checkpoints can be created twice in one second (for example when a
+	// short turn ends while a second turn is queued). Include nanoseconds so
+	// each snapshot gets a distinct ref instead of silently replacing the
+	// previous turn's baseline.
+	ref := c.refPrefix() + time.Now().UTC().Format("20060102T150405.000000000Z")
 	if _, err = git("update-ref", ref, commit); err != nil {
 		return "", err
 	}
@@ -97,6 +101,25 @@ func (c *Checkpointer) List() ([]string, error) {
 		refs = append(refs, line)
 	}
 	return refs, nil
+}
+
+// Diff returns the patch between two checkpoint refs. An empty to ref means
+// the current working tree, which is what the latest turn needs because
+// checkpoints are captured at turn start.
+func (c *Checkpointer) Diff(from, to string, ignoreWhitespace bool) (string, error) {
+	if from == "" {
+		return "", fmt.Errorf("from checkpoint ref is required")
+	}
+	args := []string{"diff", "--no-ext-diff"}
+	if ignoreWhitespace {
+		args = append(args, "--ignore-all-space")
+	}
+	if to == "" {
+		args = append(args, from, "--")
+	} else {
+		args = append(args, from, to, "--")
+	}
+	return runGit(c.repo, os.Environ(), args...)
 }
 
 func runGit(dir string, env []string, args ...string) (string, error) {

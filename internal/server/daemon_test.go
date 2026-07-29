@@ -315,6 +315,37 @@ func TestDaemonProbeDir(t *testing.T) {
 	}
 }
 
+func TestDaemonSessionlessModelsAndLoginProviders(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg := &config.Config{BaseDir: filepath.Join(home, ".talos"), Provider: "test", Model: "m"}
+	d := NewDaemon(cfg, 0)
+
+	modelsRaw, err := d.handleDaemonRPC(context.Background(), rpc.DaemonListModels, nil)
+	if err != nil {
+		t.Fatalf("daemon.listModels: %v", err)
+	}
+	var models rpc.ModelsResult
+	if err := json.Unmarshal(modelsRaw, &models); err != nil {
+		t.Fatal(err)
+	}
+	if models.Models == nil {
+		t.Fatal("expected an empty model slice, not nil")
+	}
+
+	providersRaw, err := d.handleDaemonRPC(context.Background(), rpc.DaemonLoginProviders, nil)
+	if err != nil {
+		t.Fatalf("daemon.loginProviders: %v", err)
+	}
+	var providers rpc.LoginProvidersResult
+	if err := json.Unmarshal(providersRaw, &providers); err != nil {
+		t.Fatal(err)
+	}
+	if len(providers.Providers) == 0 {
+		t.Fatal("expected known providers without creating a session")
+	}
+}
+
 func mustJSON(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	b, err := json.Marshal(v)

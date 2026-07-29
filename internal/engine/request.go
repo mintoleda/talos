@@ -148,16 +148,46 @@ func (e *Engine) HandleRequest(ctx context.Context, method string, params json.R
 			}
 		}()
 		return rpcResult(nil)
+	case rpc.ListCheckpoints:
+		if e.cp == nil {
+			return rpcResult(rpc.CheckpointsResult{Refs: []string{}})
+		}
+		refs, err := e.cp.List()
+		return rpcResult(rpc.CheckpointsResult{Refs: refs}, err)
+	case rpc.RestoreCheckpoint:
+		p, err := decodeRPC[rpc.RestoreCheckpointParams](params)
+		if err != nil {
+			return nil, err
+		}
+		if p.Ref == "" {
+			return nil, fmt.Errorf("checkpoint ref is required")
+		}
+		if e.cp == nil {
+			return nil, fmt.Errorf("checkpoints are unavailable")
+		}
+		return rpcResult(nil, e.cp.Restore(p.Ref))
+	case rpc.DiffCheckpoints:
+		p, err := decodeRPC[rpc.DiffCheckpointsParams](params)
+		if err != nil {
+			return nil, err
+		}
+		if e.cp == nil {
+			return nil, fmt.Errorf("checkpoints are unavailable")
+		}
+		unified, err := e.cp.Diff(p.From, p.To, p.IgnoreWhitespace)
+		return rpcResult(rpc.DiffCheckpointsResult{Unified: unified}, err)
 	case rpc.Stats:
-		in, out, miss, cost, err := e.Stats()
+		in, out, miss, cached, cc, cost, err := e.Stats()
 		if err != nil {
 			return nil, err
 		}
 		return rpcResult(rpc.StatsResult{
-			Input:     in,
-			Output:    out,
-			CacheMiss: miss,
-			Cost:      cost,
+			Input:         in,
+			Output:        out,
+			CacheMiss:     miss,
+			Cached:        cached,
+			CacheCreation: cc,
+			Cost:          cost,
 		})
 	case rpc.LoginProviders:
 		providers, err := e.LoginProviders()
@@ -212,12 +242,6 @@ func (e *Engine) HandleRequest(ctx context.Context, method string, params json.R
 			return nil, err
 		}
 		return rpcResult(rpc.ResolveInputResult{Blocks: blocks, Display: display})
-	case rpc.PushInstruction:
-		msg, notice, err := e.PushInstruction()
-		if err != nil {
-			return nil, err
-		}
-		return rpcResult(rpc.PushInstructionResult{Message: msg, Notice: notice})
 	case rpc.ListBg:
 		return rpcResult(rpc.ListBgResult{Procs: e.listBg()})
 	case rpc.KillBg:

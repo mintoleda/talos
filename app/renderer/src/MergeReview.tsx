@@ -1,7 +1,3 @@
-/**
- * MergeReview — summary → file diff → execute flow for worktree sessions.
- */
-
 import React, { useCallback, useEffect, useState } from 'react'
 import type { Engine } from './engine'
 import type {

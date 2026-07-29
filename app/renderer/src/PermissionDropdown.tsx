@@ -1,7 +1,3 @@
-/**
- * PermissionDropdown — auto/ask + panic toggle via setPermissionMode / togglePanic.
- */
-
 import React from 'react'
 import type { Engine } from './engine'
 import { EngineRPC } from './protocol'

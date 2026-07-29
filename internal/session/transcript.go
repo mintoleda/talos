@@ -28,22 +28,24 @@ type CompactionRecord struct {
 // a transcript is loaded, the most recent stats record initializes the loop's
 // accumulator so /stats carries across restarts.
 type StatsRecord struct {
-	Type        string `json:"type"`
-	Calls       int    `json:"calls"`
-	InputTokens int    `json:"input_tokens"`
-	CachedTokens int   `json:"cached_tokens"`
-	OutputTokens int   `json:"output_tokens"`
+	Type               string `json:"type"`
+	Calls              int    `json:"calls"`
+	InputTokens        int    `json:"input_tokens"`
+	CachedTokens       int    `json:"cached_tokens"`
+	OutputTokens       int    `json:"output_tokens"`
+	CacheCreationTokens int   `json:"cache_creation_tokens,omitempty"`
 }
 
 type Transcript struct {
-	mu          sync.Mutex
-	f           *os.File
-	w           *bufio.Writer
-	frozen      []protocol.FrozenMessage
-	summaries   []protocol.FrozenMessage
-	path        string
-	lastStats   StatsRecord // most recent stats found during Load
-	repairCount int         // number of orphaned tool-call groups removed during Load
+	mu             sync.Mutex
+	f              *os.File
+	w              *bufio.Writer
+	frozen         []protocol.FrozenMessage
+	summaries      []protocol.FrozenMessage
+	path           string
+	lastStats      StatsRecord // most recent stats found during Load
+	repairCount    int         // number of orphaned tool-call groups removed during Load
+	rewriteVersion int         // bumped by every compaction/snip/prune
 }
 
 // Create returns a new Transcript for the given path. The file is not created
@@ -84,7 +86,7 @@ func Load(path string) (*Transcript, error) {
 	defer readF.Close()
 
 	scanner := bufio.NewScanner(readF)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 50*1024*1024), 50*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -274,6 +276,66 @@ func (t *Transcript) PrependSummary(summary string) error {
 	}
 	t.summaries = append(t.summaries, protocol.FrozenMessage{Msg: m, Raw: raw})
 	return nil
+}
+
+// Path returns the file path backing this transcript.
+func (t *Transcript) Path() string {
+	return t.path
+}
+
+// PrependFrozenMessage adds a frozen message to the summaries prefix
+// without touching the on-disk JSONL. Used during fold to preserve pinned
+// messages (small user turns) verbatim in the summary prefix.
+func (t *Transcript) PrependFrozenMessage(fm protocol.FrozenMessage) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.summaries = append(t.summaries, fm)
+	return nil
+}
+
+// BumpRewrite increments the rewrite version counter, used by cache-miss
+// attribution to distinguish compactions/snips/prunes from other changes.
+func (t *Transcript) BumpRewrite() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.rewriteVersion++
+}
+
+// RewriteVersion returns the current rewrite version.
+func (t *Transcript) RewriteVersion() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.rewriteVersion
+}
+
+// SnipAt replaces the frozen message at index i with the given one. Used
+// by the snip/prune pass to rewrite stale tool results without moving
+// messages around.
+func (t *Transcript) SnipAt(i int, fm protocol.FrozenMessage) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if i >= 0 && i < len(t.frozen) {
+		t.frozen[i] = fm
+	}
+}
+
+// FrozenLen returns the count of frozen messages without copying.
+func (t *Transcript) FrozenLen() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.frozen)
+}
+
+// FrozenAt returns a single frozen message by index without copying the
+// entire slice. Used by snip/prune to read and then conditionally
+// replace individual tool-result messages.
+func (t *Transcript) FrozenAt(i int) protocol.FrozenMessage {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if i >= 0 && i < len(t.frozen) {
+		return t.frozen[i]
+	}
+	return protocol.FrozenMessage{}
 }
 
 // repair removes orphaned assistant tool_calls from the in-memory frozen

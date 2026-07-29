@@ -1,7 +1,3 @@
-/**
- * appState.ts — Multi-session app state on top of per-session ChatState.
- */
-
 import type { Event, SessionInfo, SessionStatusEvent } from './protocol'
 import { type ChatState, initialState, reduceState, ingestHistory } from './state'
 
@@ -13,7 +9,6 @@ export type AppState = {
   sessions: Map<string, SessionInfo>
   focusedID: string | null
   transcripts: Map<string, ChatState>
-  /** Access order for LRU (oldest first). */
   transcriptOrder: string[]
   connected: boolean
   error: string
@@ -34,7 +29,6 @@ export function initialAppState(): AppState {
   }
 }
 
-/** Per-session chat reducer (alias of reduceState). */
 export const reduceChat = reduceState
 
 export function focusedChat(app: AppState): ChatState {
@@ -203,7 +197,6 @@ export function applySessionStatus(app: AppState, ev: SessionStatusEvent): AppSt
 
 export function applyHistory(app: AppState, sessionID: string, history: unknown[]): AppState {
   const prev = app.transcripts.get(sessionID) ?? initialState()
-  // Avoid double-ingest if we already have messages from a prior focus.
   if (prev.messages.length > 0) return app
   return setTranscript(app, sessionID, ingestHistory(prev, history))
 }
@@ -221,7 +214,6 @@ export function writeFocusedSession(id: string | null) {
     if (id) localStorage.setItem(FOCUSED_SESSION_KEY, id)
     else localStorage.removeItem(FOCUSED_SESSION_KEY)
   } catch {
-    /* ignore */
   }
 }
 
@@ -248,7 +240,6 @@ export function writeRecentProject(dir: string) {
     localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(next))
     localStorage.setItem('talos.recentProject', dir)
   } catch {
-    /* ignore */
   }
 }
 

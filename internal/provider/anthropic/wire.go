@@ -65,6 +65,9 @@ type sseEvent struct {
 	Delta        *sseDelta `json:"delta,omitempty"`
 	Usage        *sseUsage `json:"usage,omitempty"`
 	ContentBlock *apiBlock `json:"content_block,omitempty"`
+	Message      *struct {
+		Usage *sseUsage `json:"usage"`
+	} `json:"message,omitempty"`
 }
 
 type sseDelta struct {

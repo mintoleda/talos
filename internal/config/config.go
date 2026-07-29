@@ -71,6 +71,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		home = "."
 	}
+	baseDir := filepath.Join(home, ".talos")
+	if configuredBaseDir := strings.TrimSpace(os.Getenv("TALOS_HOME")); configuredBaseDir != "" {
+		baseDir = configuredBaseDir
+	}
 	cfg := &Config{
 		BaseURL:                   "https://api.deepseek.com",
 		Model:                     "deepseek-chat",
@@ -80,7 +84,7 @@ func Load() (*Config, error) {
 		BashMaxTimeout:            600 * time.Second,
 		BashMaxOutput:             30 * 1024,
 		SystemPrompt:              strings.TrimSpace(corePrompt),
-		BaseDir:                   filepath.Join(home, ".talos"),
+		BaseDir:                   baseDir,
 		ThinkingLevel:             "off",
 		CompactThreshold:          0.85,
 		CompactEmergencyThreshold: 0.95,
@@ -174,9 +178,9 @@ type fileConfig struct {
 	DreamerModel              string  `toml:"dreamer_model"`
 	DreamerBaseURL            string  `toml:"dreamer_base_url"`
 	DreamerAPIKey             string  `toml:"dreamer_api_key"`
-	ServerListen      string `toml:"server_listen"`
-	ServerToken       string `toml:"server_token"`
-	ServerIdleTimeout string `toml:"server_idle_timeout"` // duration string, e.g. "30m"
+	ServerListen              string  `toml:"server_listen"`
+	ServerToken               string  `toml:"server_token"`
+	ServerIdleTimeout         string  `toml:"server_idle_timeout"` // duration string, e.g. "30m"
 
 	Notifications *notifyFileConfig `toml:"notifications"`
 

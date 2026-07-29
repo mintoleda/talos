@@ -1,7 +1,3 @@
-/**
- * ChatView — renders the message history with streaming text/thinking/tools.
- */
-
 import React, { useRef, useEffect } from 'react';
 import type { MessageEntry, ToolCallState } from './state';
 import { Markdown } from './Markdown';

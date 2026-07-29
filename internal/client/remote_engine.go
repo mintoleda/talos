@@ -154,12 +154,12 @@ func (e *RemoteEngine) Compact(focus string) error {
 	return e.request(rpc.Compact, rpc.CompactParams{Focus: focus}, nil)
 }
 
-func (e *RemoteEngine) Stats() (int, int, int, float64, error) {
+func (e *RemoteEngine) Stats() (int, int, int, int, int, float64, error) {
 	var out rpc.StatsResult
 	if err := e.request(rpc.Stats, nil, &out); err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, 0, 0.0, err
 	}
-	return out.Input, out.Output, out.CacheMiss, out.Cost, nil
+	return out.Input, out.Output, out.CacheMiss, out.Cached, out.CacheCreation, out.Cost, nil
 }
 
 func (e *RemoteEngine) LoginProviders() ([]dialogs.LoginProvider, error) {
@@ -216,14 +216,6 @@ func (e *RemoteEngine) ResolveInput(text string) ([]protocol.ContentBlock, strin
 		return nil, text, err
 	}
 	return out.Blocks, out.Display, nil
-}
-
-func (e *RemoteEngine) PushInstruction() (string, string, error) {
-	var out rpc.PushInstructionResult
-	if err := e.request(rpc.PushInstruction, nil, &out); err != nil {
-		return "", "", err
-	}
-	return out.Message, out.Notice, nil
 }
 
 func (e *RemoteEngine) Events() <-chan protocol.Event {
