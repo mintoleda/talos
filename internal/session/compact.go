@@ -186,7 +186,21 @@ type Compactor struct {
 	// prompt stays above threshold, pause auto-compaction.
 	latchCount          int
 	latchedPromptTokens int
+
+	lastAction CompactAction
 }
+
+// CompactAction reports which tier of context reclamation last ran, so callers
+// can tell a free snip/prune pass apart from a real summarizing fold.
+type CompactAction int
+
+const (
+	ActionNone CompactAction = iota
+	ActionReclaim
+	ActionFold
+)
+
+func (c *Compactor) LastAction() CompactAction { return c.lastAction }
 
 func NewCompactor(s Summarizer) *Compactor {
 	return &Compactor{
@@ -495,6 +509,7 @@ func (c *Compactor) MaybeCompact(ctx context.Context, tx *Transcript, promptToke
 	if c.Threshold == 0 {
 		c.Threshold = 0.85
 	}
+	c.lastAction = ActionNone
 
 	// Phase 2 — Snip/prune tier: free context reclamation before paying
 	// for a summarization. Runs at SnipRatio (~60%) and above.
@@ -506,6 +521,7 @@ func (c *Compactor) MaybeCompact(ctx context.Context, tx *Transcript, promptToke
 		if ctxLimit > 0 && float64(newEstimate)/float64(ctxLimit) < c.Threshold {
 			c.latchCount = 0
 			c.latchedPromptTokens = 0
+			c.lastAction = ActionReclaim
 			return true, nil
 		}
 	}
@@ -569,6 +585,7 @@ func (c *Compactor) MaybeCompact(ctx context.Context, tx *Transcript, promptToke
 	if err != nil {
 		return false, err
 	}
+	c.lastAction = ActionFold
 
 	// Update latch: if still above threshold, increment.
 	if float64(promptTokens)/float64(ctxLimit) >= c.Threshold {
@@ -604,5 +621,6 @@ func (c *Compactor) CompactNow(ctx context.Context, tx *Transcript, focus string
 		defer func() { c.Summarizer = origSummarizer }()
 	}
 
+	c.lastAction = ActionFold
 	return c.performFold(ctx, tx, foldRegion, toSummarize, pinned, frozen[boundary:])
 }

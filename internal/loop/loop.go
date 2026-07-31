@@ -276,7 +276,12 @@ func (l *Loop) RunTurn(ctx context.Context, userInput []protocol.ContentBlock, e
 		if compacted, err := l.compactor.MaybeCompact(ctx, l.tx, l.lastPromptTokens, l.promptB.ContextLimit()); err != nil {
 			emit(protocol.Notice{Level: "error", Text: fmt.Sprintf("compaction failed: %v", err)})
 		} else if compacted {
-			emit(protocol.Notice{Level: "info", Text: "compaction: folded earlier conversation"})
+			switch l.compactor.LastAction() {
+			case session.ActionReclaim:
+				emit(protocol.Notice{Level: "info", Text: "context: reclaimed space by snipping stale tool results"})
+			default:
+				emit(protocol.Notice{Level: "info", Text: "compaction: folded earlier conversation into a summary"})
+			}
 		}
 	}
 
