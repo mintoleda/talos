@@ -754,7 +754,7 @@ func (e *Engine) SwitchModel(pName, pModel string) error {
 	if comp != nil && e.cfg.Historian && e.memStore != nil {
 		hist, err := NewHistorian(e.cfg, e.memStore)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[warning] historian disabled: %v\n", err)
+			e.Emit(protocol.Notice{Level: "warn", Text: "historian disabled: " + err.Error()})
 		} else {
 			comp.Historian = hist
 		}
@@ -780,7 +780,7 @@ func (e *Engine) CycleThinking() (string, error) {
 			next := caps[(i+1)%len(caps)]
 			e.pb.SetThinkingLevel(next)
 			if err := config.SaveThinkingLevel(e.baseDir, next); err != nil {
-				fmt.Fprintf(os.Stderr, "[warning] save thinking level: %v\n", err)
+				return next, fmt.Errorf("save thinking level: %w", err)
 			}
 			return next, nil
 		}
