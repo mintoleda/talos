@@ -481,11 +481,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.busy {
 				if m.cfg.Engine != nil {
 					newLevel, err := m.cfg.Engine.CycleThinking()
+					if newLevel != "" {
+						m.thinkingLevel = newLevel
+					}
 					if err != nil {
 						m.chat = m.chat.AppendNotice("error", err.Error())
 						return m, nil
 					}
-					m.thinkingLevel = newLevel
 					m.chat = m.chat.AppendNotice("info", "thinking level: "+newLevel)
 				}
 			}
@@ -573,6 +575,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				}
 				if text != "" {
+					if strings.HasPrefix(text, "/") {
+						parts0 := strings.Fields(text)
+						slashName := parts0[0]
+						for _, sc := range allSlashCommands() {
+							if sc.isSkill && sc.Name == slashName {
+								text = strings.TrimPrefix(slashName, "/") + text[len(slashName):]
+								break
+							}
+						}
+					}
 					handled, err := m.handleSlash(text)
 					if err != nil {
 						m.chat = m.chat.AppendNotice("error", err.Error())
