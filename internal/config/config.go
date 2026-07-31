@@ -1,7 +1,6 @@
 package config
 
 import (
-	"bytes"
 	_ "embed"
 	"fmt"
 	"os"
@@ -569,44 +568,9 @@ func (c *Config) Validate() error {
 }
 
 func SaveProviderModel(baseDir, provider, model string) error {
-	path := filepath.Join(baseDir, "config.toml")
-
-	var fc fileConfig
-	if data, err := os.ReadFile(path); err == nil {
-		if err := toml.Unmarshal(data, &fc); err != nil {
-			return fmt.Errorf("parse config: %w", err)
-		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-
-	fc.Provider = provider
-	fc.Model = model
-
-	var buf bytes.Buffer
-	if err := toml.NewEncoder(&buf).Encode(fc); err != nil {
-		return fmt.Errorf("encode config: %w", err)
-	}
-	return os.WriteFile(path, buf.Bytes(), 0644)
+	return saveProviderKeys(baseDir, []configKV{{"provider", provider}, {"model", model}})
 }
 
 func SaveThinkingLevel(baseDir, level string) error {
-	path := filepath.Join(baseDir, "config.toml")
-
-	var fc fileConfig
-	if data, err := os.ReadFile(path); err == nil {
-		if err := toml.Unmarshal(data, &fc); err != nil {
-			return fmt.Errorf("parse config: %w", err)
-		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-
-	fc.ThinkingLevel = level
-
-	var buf bytes.Buffer
-	if err := toml.NewEncoder(&buf).Encode(fc); err != nil {
-		return fmt.Errorf("encode config: %w", err)
-	}
-	return os.WriteFile(path, buf.Bytes(), 0644)
+	return saveProviderKeys(baseDir, []configKV{{"thinking_level", level}})
 }
