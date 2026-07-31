@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/mintoleda/talos/internal/protocol"
 )
@@ -62,6 +63,42 @@ func intArg(args map[string]any, key string) (int, bool, error) {
 	default:
 		return 0, false, fmt.Errorf("arg %q must be an integer", key)
 	}
+}
+
+// MaxResultBytes is the ceiling applied to every tool result before it enters
+// the transcript. Snip/prune only runs once context is already over 60%, so an
+// oversized single result would otherwise be billed in full at least once — and
+// one larger than the context window would wedge the session outright.
+const MaxResultBytes = 100 << 10
+
+// CapResultContent truncates content to max bytes, keeping the head and tail
+// on line boundaries and prefixing a marker that says what was dropped.
+func CapResultContent(content string, max int) string {
+	if max <= 0 {
+		max = MaxResultBytes
+	}
+	if len(content) <= max {
+		return content
+	}
+	headLen := max * 3 / 4
+	tailLen := max - headLen
+
+	head := content[:headLen]
+	if i := strings.LastIndexByte(head, '\n'); i > headLen/2 {
+		head = head[:i]
+	}
+	tail := content[len(content)-tailLen:]
+	if i := strings.IndexByte(tail, '\n'); i >= 0 && i < tailLen/2 {
+		tail = tail[i+1:]
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[truncated tool result — %d bytes total, showing first %d and last %d; narrow the query or path and re-run if you need the rest]\n",
+		len(content), len(head), len(tail))
+	b.WriteString(strings.ToValidUTF8(head, ""))
+	b.WriteString("\n\n…\n\n")
+	b.WriteString(strings.ToValidUTF8(tail, ""))
+	return b.String()
 }
 
 func okResult(content string) protocol.ToolResult {

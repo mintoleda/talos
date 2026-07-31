@@ -113,6 +113,7 @@ func (e *InProcExecutor) Run(ctx context.Context, tu protocol.ToolUse, emit prot
 		return protocol.ToolResult{ToolUseID: tu.ID, IsError: true, Content: err.Error()}
 	}
 	res.ToolUseID = tu.ID
+	res.Content = tools.CapResultContent(res.Content, tools.MaxResultBytes)
 	return res
 }
 
