@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/mintoleda/talos/internal/fff"
@@ -68,14 +70,27 @@ func isRegex(s string) bool {
 	return false
 }
 
+// Guards against a single match in a build artifact or minified blob
+// swallowing the whole context window.
+const (
+	grepMaxColumns   = 400
+	grepMaxFileSize  = "2M"
+	grepMaxOutput    = 96 << 10
+	grepMaxFileBytes = 2 << 20
+)
+
 func (t *searchTool) grep(ctx context.Context, pattern, root string) (protocol.ToolResult, error) {
 	if _, err := exec.LookPath("rg"); err == nil {
-		cmd := exec.CommandContext(ctx, "rg", "--line-number", "--no-heading", "--color=never", pattern, root)
+		cmd := exec.CommandContext(ctx, "rg",
+			"--line-number", "--no-heading", "--color=never",
+			"--max-columns", strconv.Itoa(grepMaxColumns), "--max-columns-preview",
+			"--max-filesize", grepMaxFileSize,
+			pattern, root)
 		out, err := cmd.CombinedOutput()
 		if err != nil && len(out) == 0 {
 			return okResult("(no matches)"), nil
 		}
-		return okResult(string(out)), nil
+		return okResult(CapResultContent(string(out), grepMaxOutput)), nil
 	}
 
 	re, err := regexp.Compile(pattern)
@@ -89,16 +104,28 @@ func (t *searchTool) grep(ctx context.Context, pattern, root string) (protocol.T
 	}
 	var hits []hit
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if skipWalkDir(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info, err := d.Info(); err != nil || info.Size() > grepMaxFileBytes || !info.Mode().IsRegular() {
 			return nil
 		}
 		data, err := os.ReadFile(p)
-		if err != nil {
+		if err != nil || looksBinary(data) {
 			return nil
 		}
 		lines := strings.Split(string(data), "\n")
 		for i, line := range lines {
 			if re.MatchString(line) {
+				if len(line) > grepMaxColumns {
+					line = line[:grepMaxColumns] + " […omitted long matching line]"
+				}
 				hits = append(hits, hit{path: p, line: i + 1, text: line})
 			}
 		}
@@ -117,7 +144,23 @@ func (t *searchTool) grep(ctx context.Context, pattern, root string) (protocol.T
 	if len(hits) == 0 {
 		return okResult("(no matches)"), nil
 	}
-	return okResult(out.String()), nil
+	return okResult(CapResultContent(out.String(), grepMaxOutput)), nil
+}
+
+func skipWalkDir(name string) bool {
+	switch name {
+	case ".git", "node_modules", "vendor", ".direnv":
+		return true
+	}
+	return false
+}
+
+func looksBinary(data []byte) bool {
+	head := data
+	if len(head) > 8192 {
+		head = head[:8192]
+	}
+	return bytes.IndexByte(head, 0) >= 0
 }
 
 func (t *searchTool) fzgrep(query, root string, args map[string]any) (protocol.ToolResult, error) {
