@@ -198,14 +198,12 @@ The same principle applies to any Codex subscription or other harness-specific a
 
 ## Branch plan
 
-Preserve the current standalone application and create a slim integration branch:
+All work happens on `main`. The original plan kept a `talos-full` snapshot and a
+slim `talos` integration branch; that was dropped once the headless ACP path and
+the Rust desktop moved into this repository alongside the existing TUI, daemon
+and Electron app. The pre-ACP standalone state is `aaccca2` in `main`'s history.
 
-- `talos-full`: current standalone Talos, including TUI, Electron app, daemon, and worktree/merge UX.
-- `talos`: headless primary runtime intended to sit beneath Paseo.
-
-The Rust desktop is developed on the `talos` branch under `desktop/`.
-
-Do not delete UI code before the headless path works. First add `talos acp`, connect it to Paseo, and verify sessions, tools, permissions, cancellation, compaction, and resume. Then remove redundant product layers from the `talos` branch.
+Do not delete UI code before the headless path works. First add `talos acp`, connect it to the desktop, and verify sessions, tools, permissions, cancellation, compaction, and resume. Then retire redundant product layers (starting with the Electron app) on `main`.
 
 Avoid maintaining two independent copies of the agent loop. Runtime fixes should have one clear source of truth.
 
@@ -228,8 +226,8 @@ Paseo can retain its broader provider ecosystem. The simplification comes from m
 
 ## Migration sequence
 
-1. Preserve the current commit as `talos-full`.
-2. Create the slim `talos` branch.
+1. Preserve the standalone commit (`aaccca2`).
+2. Develop the integration on a branch (later merged into `main`).
 3. Add a headless ACP entrypoint while retaining existing code temporarily.
 4. Separate the reusable runtime constructor from Talos UI/daemon wiring.
 5. Register Talos in Paseo.
@@ -245,7 +243,7 @@ The project succeeds when normal work feels like using one product—Paseo—wit
 
 ## Implementation status
 
-Steps 1–5 and 7 are implemented on the `talos` branch. Step 6 is covered by `internal/acp` end-to-end tests (streaming, tools, permissions, cancellation, session load) and a live Paseo run; it still needs real-model use. Steps 8–10 are operational decisions.
+Steps 1–5 and 7 are implemented on `main`. Step 6 is covered by `internal/acp` end-to-end tests (streaming, tools, permissions, cancellation, session load) and a live Paseo run; it still needs real-model use. Steps 8–10 are operational decisions.
 
 ### `talos acp`
 
