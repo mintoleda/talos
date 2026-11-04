@@ -18,6 +18,7 @@ import (
 	"github.com/mintoleda/talos/internal/provider"
 	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
+	"github.com/mintoleda/talos/internal/stack"
 	"github.com/mintoleda/talos/internal/tui"
 )
 
@@ -57,7 +58,7 @@ func (a *app) makeNewTabFn(ctx context.Context, cp *safety.Checkpointer, prices 
 		}
 		comp.Clamp()
 		if a.cfg.Historian && a.memStore != nil {
-			hist, err := engine.NewHistorian(a.cfg, a.memStore)
+			hist, err := stack.NewHistorian(a.cfg, a.memStore)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "[warning] historian disabled: %v\n", err)
 			} else {

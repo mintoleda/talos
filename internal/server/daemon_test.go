@@ -15,6 +15,7 @@ import (
 	"github.com/mintoleda/talos/internal/engine"
 	"github.com/mintoleda/talos/internal/loop"
 	"github.com/mintoleda/talos/internal/session"
+	"github.com/mintoleda/talos/internal/stack"
 	"github.com/mintoleda/talos/internal/testutil"
 	"github.com/mintoleda/talos/internal/transport"
 )
@@ -29,7 +30,7 @@ func TestDaemonHandleConnSubscribeAndRoute(t *testing.T) {
 
 	dir := t.TempDir()
 	var builtID string
-	d.manager.buildFn = func(_ context.Context, o engine.BuildOpts) (*engine.Built, error) {
+	d.manager.buildFn = func(_ context.Context, o stack.BuildOpts) (*stack.Built, error) {
 		id := o.SessionID
 		if id == "" {
 			id = "pipe-sess"
@@ -46,13 +47,13 @@ func TestDaemonHandleConnSubscribeAndRoute(t *testing.T) {
 		if err := os.WriteFile(txPath, nil, 0o600); err != nil {
 			return nil, err
 		}
-		return &engine.Built{
+		return &stack.Built{
 			Cfg:     &config.Config{BaseDir: baseDir, Provider: "test", Model: "m"},
 			Dir:     o.Dir,
 			Session: session.Session{ID: id, ProjectID: pid, Path: txPath},
 		}, nil
 	}
-	d.manager.newEng = func(b *engine.Built, ctx context.Context) *engine.Engine {
+	d.manager.newEng = func(b *stack.Built, ctx context.Context) *engine.Engine {
 		tx := testutil.NewTestTranscript(t)
 		pb := loop.NewPromptBuilder("sys", nil, "m")
 		lp := loop.New(&testutil.FakeProvider{}, &testutil.FakeExecutor{}, tx, pb)
