@@ -17,16 +17,16 @@ Implement one ACP client/runtime shared by Talos and Claude Code. Make `talos` t
 Suggested crate seams (consistent with the wider workspace proposal):
 
 ```text
-paseo-application/
+talos-application/
   provider_port.rs   provider/session use cases and provider-neutral events
   agent_manager.rs   provider instances, sessions, routing, persistence, recovery
-paseo-acp/
+talos-acp/
   process.rs         ACP child transport, stdio framing, stderr capture
   rpc.rs             bidirectional JSON-RPC, pending calls, server requests
   client.rs          initialize and ACP method wrappers / capability checks
   session.rs         native session state, per-session serialization
   translate.rs       ACP session updates -> Paseo domain events
-paseo-process/       shared child supervision and process-tree shutdown
+talos-process/       shared child supervision and process-tree shutdown
 ```
 
 Define an async provider-neutral `Provider`/`AgentSession` port (for example `capabilities`, `list_models`, `start_session`, `prompt`, mode/config update, cancel, and event stream) for the application layer. The ACP implementation owns protocol details; the UI should not branch on raw JSON. A provider configuration entry selects `{provider_id, kind, command, args, env, host, enabled, default}`. Talos uses `talos acp`; Claude Code uses the official `@agentclientprotocol/claude-agent-acp` adapter. Keep raw provider/model identifiers separate: `provider_id = "talos"` is not the same thing as Talos' ACP model ID such as `openai/deepseek-chat`. Treat `provider_id = "claude"` similarly.

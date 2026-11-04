@@ -1,8 +1,8 @@
-use paseo_ipc::{
+use serde_json::{Value, json};
+use talos_ipc::{
     Client, Command, EventNotification, IpcError, MAX_FRAME_SIZE, PROTOCOL_VERSION, RpcError,
     ServerFrame, WireEvent, serve_connection, serve_connection_with_events,
 };
-use serde_json::{Value, json};
 use tokio::{
     io::{AsyncWriteExt, duplex},
     sync::broadcast,
@@ -65,7 +65,7 @@ async fn malformed_and_oversized_frames_fail_closed() {
     let (mut writer, reader) = duplex(1024);
     writer.write_all(b"{not json}\n").await.unwrap();
     let mut buffered = tokio::io::BufReader::new(reader);
-    let bytes = paseo_ipc::read_frame(&mut buffered).await.unwrap();
+    let bytes = talos_ipc::read_frame(&mut buffered).await.unwrap();
     assert!(serde_json::from_slice::<Value>(&bytes).is_err());
 
     let (mut writer, reader) = duplex(MAX_FRAME_SIZE + 16);
@@ -75,7 +75,7 @@ async fn malformed_and_oversized_frames_fail_closed() {
         .unwrap();
     let mut buffered = tokio::io::BufReader::new(reader);
     assert!(matches!(
-        paseo_ipc::read_frame(&mut buffered).await,
+        talos_ipc::read_frame(&mut buffered).await,
         Err(IpcError::FrameTooLarge)
     ));
 }

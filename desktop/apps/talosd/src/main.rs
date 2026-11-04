@@ -6,16 +6,16 @@ use std::{
     time::Duration,
 };
 
-use paseo_core::{AppService, CoreError, HomePaths, ProviderDiagnostic, ProviderError};
-use paseo_domain::{
+use serde_json::{Value, json};
+use talos_core::{AppService, CoreError, HomePaths, ProviderDiagnostic, ProviderError};
+use talos_domain::{
     AgentId, EventCursor, PermissionRequestId, ProviderId, RunLifecycle, Session, SessionId,
     TimelineEvent, TimelineEventKind, WorkspaceId, WorkspaceKind,
 };
-use paseo_ipc::{
+use talos_ipc::{
     Command, EventNotification, PROTOCOL_VERSION, PermissionDecision, RpcError, WireEvent,
     serve_connection_with_events,
 };
-use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, net::UnixListener, sync::Notify, sync::broadcast};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -1135,17 +1135,17 @@ mod tests {
     use std::{path::Path, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
-    use paseo_acp::{ConfigOption, ConfigOptionValue};
-    use paseo_core::{
+    use talos_acp::{ConfigOption, ConfigOptionValue};
+    use talos_core::{
         AgentProvider, PermissionHandler, ProviderDiagnostic, ProviderError, ProviderEvent,
         ProviderModel, ProviderPermissionDecision, ProviderPermissionOption,
         ProviderPermissionRequest, ProviderPromptResult, ProviderSession, ProviderThinkingOption,
     };
-    use paseo_domain::{
+    use talos_domain::{
         Capabilities, ModelRef, ProviderDescriptor, ProviderId, ProviderMode, RunId, RunLifecycle,
         Workspace,
     };
-    use paseo_ipc::{Client, Command, ServerFrame};
+    use talos_ipc::{Client, Command, ServerFrame};
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
 
@@ -1318,7 +1318,7 @@ mod tests {
                 "usage" => {
                     return Ok(ProviderPromptResult {
                         stop_reason: "end_turn".into(),
-                        usage: Some(paseo_acp::PromptUsage {
+                        usage: Some(talos_acp::PromptUsage {
                             input_tokens: 10,
                             output_tokens: 20,
                             cached_read_tokens: Some(5),
@@ -1366,7 +1366,7 @@ mod tests {
                 }
                 _ => {
                     self.event_tx
-                        .send(ProviderEvent::Acp(paseo_acp::AcpEvent::Diagnostic {
+                        .send(ProviderEvent::Acp(talos_acp::AcpEvent::Diagnostic {
                             message: format!("fixture received prompt ({})", text.len()),
                         }))
                         .map_err(|error| ProviderError::Other(error.to_string()))?;

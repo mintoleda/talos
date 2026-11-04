@@ -12,8 +12,8 @@ Talos is launched as `talos acp`. Claude Code is the only secondary provider, la
 talos-desktop (egui) ─┐
                       ├─ local versioned IPC ─ talosd
 talosdctl ────────────┘                         │
-                                               ├─ paseo-core (use cases/provider registry)
-                                               ├─ paseo-store (SQLite + migrations)
+                                               ├─ talos-core (use cases/provider registry)
+                                               ├─ talos-store (SQLite + migrations)
                                                └─ providers
                                                    ├─ Talos ACP (default)
                                                     └─ Claude Code ACP

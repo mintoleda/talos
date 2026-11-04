@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use paseo_ipc::{
+use serde_json::json;
+use talos_ipc::{
     Client, Command, EventNotification, PROTOCOL_VERSION, Request, Response, RpcOutcome,
     ServerFrame, serve_connection_with_events, write_frame,
 };
-use serde_json::json;
 use tokio::{
     io::{AsyncWriteExt, BufReader, duplex},
     sync::broadcast,
@@ -33,14 +33,14 @@ async fn events_between_request_fragments_do_not_corrupt_the_request() {
     )
     .await
     .unwrap();
-    let _ = paseo_ipc::read_frame(&mut read).await.unwrap();
+    let _ = talos_ipc::read_frame(&mut read).await.unwrap();
     write.write_all(b"{\"version\":1,\"id\":2,").await.unwrap();
     // Let the request reader consume the prefix and await the rest.
     tokio::time::sleep(Duration::from_millis(20)).await;
     sender
         .send(EventNotification::replay_required("test", 1))
         .unwrap();
-    let bytes = paseo_ipc::read_frame(&mut read).await.unwrap();
+    let bytes = talos_ipc::read_frame(&mut read).await.unwrap();
     assert!(matches!(
         serde_json::from_slice::<ServerFrame>(&bytes).unwrap(),
         ServerFrame::Event(_)
@@ -49,7 +49,7 @@ async fn events_between_request_fragments_do_not_corrupt_the_request() {
         .write_all(b"\"command\":{\"method\":\"health\"}}\n")
         .await
         .unwrap();
-    let bytes = tokio::time::timeout(Duration::from_secs(2), paseo_ipc::read_frame(&mut read))
+    let bytes = tokio::time::timeout(Duration::from_secs(2), talos_ipc::read_frame(&mut read))
         .await
         .unwrap()
         .unwrap();
@@ -106,7 +106,7 @@ async fn authentication_and_protocol_are_checked_on_every_command() {
     let count = calls.clone();
     let (client_io, server_io) = duplex(4096);
     let server = tokio::spawn(async move {
-        paseo_ipc::serve_connection(server_io, Some("secret".into()), move |_| {
+        talos_ipc::serve_connection(server_io, Some("secret".into()), move |_| {
             count.fetch_add(1, Ordering::SeqCst);
             async { Ok(json!("ok")) }
         })
@@ -153,7 +153,7 @@ async fn authentication_and_protocol_are_checked_on_every_command() {
         )
         .await
         .unwrap();
-        let bytes = paseo_ipc::read_frame(&mut read).await.unwrap();
+        let bytes = talos_ipc::read_frame(&mut read).await.unwrap();
         let ServerFrame::Response(response) = serde_json::from_slice(&bytes).unwrap() else {
             panic!("expected a response");
         };
@@ -176,7 +176,7 @@ async fn overflowing_client_queue_requires_replay_instead_of_silent_loss() {
     let server = tokio::spawn(async move {
         let (read, mut write) = tokio::io::split(server_io);
         let mut read = BufReader::new(read);
-        let _ = paseo_ipc::read_frame(&mut read).await.unwrap();
+        let _ = talos_ipc::read_frame(&mut read).await.unwrap();
         write_frame(
             &mut write,
             &ServerFrame::Response(Response {
@@ -189,7 +189,7 @@ async fn overflowing_client_queue_requires_replay_instead_of_silent_loss() {
         )
         .await
         .unwrap();
-        let _ = paseo_ipc::read_frame(&mut read).await.unwrap();
+        let _ = talos_ipc::read_frame(&mut read).await.unwrap();
         for cursor in 1..=1100 {
             let mut event = EventNotification::replay_required("fixture", 0);
             event.event.kind = "timeline".into();

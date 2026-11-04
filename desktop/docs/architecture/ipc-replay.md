@@ -3,7 +3,7 @@
 Protocol version remains **1**. `replay_sessions` is an additive command. Older
 servers may reject it; clients must report incompatibility rather than silently
 substitute an unsafe global cursor. Wire types live in
-`crates/paseo-ipc/src/lib.rs`; handlers live in `apps/talosd/src/main.rs`.
+`crates/talos-ipc/src/lib.rs`; handlers live in `apps/talosd/src/main.rs`.
 
 ## Identity and ordering
 

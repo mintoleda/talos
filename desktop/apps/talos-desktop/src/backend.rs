@@ -14,8 +14,8 @@ use std::{
 };
 
 use eframe::egui;
-use paseo_ipc::{Command, EventNotification, ServerFrame, WireEvent};
 use serde_json::Value;
+use talos_ipc::{Command, EventNotification, ServerFrame, WireEvent};
 use tokio::sync::mpsc;
 
 use crate::state::{
@@ -91,9 +91,9 @@ impl Action {
             Self::Decision { id, allow, .. } => Command::PermissionDecision {
                 permission_id: id.clone(),
                 decision: if *allow {
-                    paseo_ipc::PermissionDecision::Allow
+                    talos_ipc::PermissionDecision::Allow
                 } else {
-                    paseo_ipc::PermissionDecision::Deny
+                    talos_ipc::PermissionDecision::Deny
                 },
             },
             Self::CreateAgent {
@@ -612,7 +612,7 @@ fn entries_from_snapshot(value: &Value) -> Vec<Entry> {
             "kind": kind,
         });
         view.apply_event(&EventNotification {
-            version: paseo_ipc::PROTOCOL_VERSION,
+            version: talos_ipc::PROTOCOL_VERSION,
             cursor,
             event_id: event
                 .get("id")
@@ -672,7 +672,7 @@ async fn connect_and_run(
     ensure_daemon(updates, ctx).await;
     let socket = socket_path();
     let token = auth_token();
-    let mut client = paseo_ipc::unix::connect(&socket, token)
+    let mut client = talos_ipc::unix::connect(&socket, token)
         .await
         .map_err(|error| format!("Connect to talosd: {error}"))?;
     client
