@@ -7,14 +7,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use paseo_acp::{
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use talos_acp::{
     AcpClient, AcpError, AcpEvent, ConfigOption, PermissionDecision, PermissionFuture,
     PermissionHandler as AcpPermissionHandler, PermissionRequest as AcpPermissionRequest,
     ProcessConfig, SessionLoadState, SessionState,
 };
-use paseo_domain::{Capabilities, ModelRef, ProviderDescriptor, ProviderId, ProviderMode};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use talos_domain::{Capabilities, ModelRef, ProviderDescriptor, ProviderId, ProviderMode};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -88,7 +88,7 @@ pub enum ProviderEvent {
 #[derive(Clone, Debug)]
 pub struct ProviderPromptResult {
     pub stop_reason: String,
-    pub usage: Option<paseo_acp::PromptUsage>,
+    pub usage: Option<talos_acp::PromptUsage>,
 }
 
 /// A provider model with enough metadata for the UI to render a picker.
@@ -347,7 +347,7 @@ struct AcpSession {
     capabilities: Capabilities,
     modes: Vec<ProviderMode>,
     models: Vec<ModelRef>,
-    model_catalog: Vec<paseo_acp::ModelInfo>,
+    model_catalog: Vec<talos_acp::ModelInfo>,
     config_options: Vec<ConfigOption>,
 }
 
@@ -377,7 +377,7 @@ impl AcpSession {
                     .collect()
             })
             .unwrap_or_default();
-        let model_catalog: Vec<paseo_acp::ModelInfo> = state
+        let model_catalog: Vec<talos_acp::ModelInfo> = state
             .models
             .as_ref()
             .map(|set| set.available_models.clone())
@@ -417,8 +417,8 @@ impl AcpSession {
 
 struct AcpSessionState {
     native_id: String,
-    modes: Option<paseo_acp::SessionModes>,
-    models: Option<paseo_acp::SessionModels>,
+    modes: Option<talos_acp::SessionModes>,
+    models: Option<talos_acp::SessionModels>,
     config_options: Vec<ConfigOption>,
 }
 
@@ -498,7 +498,7 @@ impl ProviderSession for AcpSession {
         text: &str,
         cancellation: &CancellationToken,
     ) -> Result<ProviderPromptResult, ProviderError> {
-        let block = paseo_acp::ContentBlock::Text {
+        let block = talos_acp::ContentBlock::Text {
             text: text.to_owned(),
             extra: serde_json::Map::new(),
         };

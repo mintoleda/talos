@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-paseo-ipc = { path = "../../crates/paseo-ipc" }
+talos-ipc = { path = "../../crates/talos-ipc" }
 serde_json.workspace = true
 tokio.workspace = true
 

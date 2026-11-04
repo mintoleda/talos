@@ -1,14 +1,14 @@
-//! SQLite persistence for Paseo domain aggregates and ordered event streams.
+//! SQLite persistence for Talos desktop domain aggregates and ordered event streams.
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Utc};
-use paseo_domain::{
-    Agent, AgentId, EventCursor, ProviderId, RunId, RunLifecycle, Session, SessionId,
-    TimelineEvent, TimelineEventKind, ValidationError, Workspace, WorkspaceId,
-};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{path::Path, str::FromStr, time::Duration};
+use talos_domain::{
+    Agent, AgentId, EventCursor, ProviderId, RunId, RunLifecycle, Session, SessionId,
+    TimelineEvent, TimelineEventKind, ValidationError, Workspace, WorkspaceId,
+};
 use thiserror::Error;
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
@@ -446,7 +446,7 @@ fn to_sql_conversion(error: impl std::fmt::Display) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paseo_domain::{TimelineEventKind, WorkspaceKind};
+    use talos_domain::{TimelineEventKind, WorkspaceKind};
     fn fixture() -> (Workspace, Agent, Session) {
         let w = Workspace::new("project", "/tmp/project", WorkspaceKind::Directory).unwrap();
         let a = Agent::new(w.id, ProviderId::new("talos").unwrap(), "agent").unwrap();

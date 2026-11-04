@@ -8,7 +8,7 @@
 //! Prerequisites:
 //!
 //! ```text
-//! cargo build -p talosd -p talosdctl -p paseo-acp --bins
+//! cargo build -p talosd -p talosdctl -p talos-acp --bins
 //! cargo test -p talosdctl --test daemon_smoke -- --ignored --nocapture
 //! ```
 //!

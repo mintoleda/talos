@@ -2,8 +2,6 @@
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Utc};
-use paseo_domain::{Workspace, WorkspaceId, WorkspaceKind, WorkspaceLifecycle};
-use paseo_store::SqliteStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -12,10 +10,12 @@ use std::{
     io::Write,
     path::{Component, Path, PathBuf},
 };
+use talos_domain::{Workspace, WorkspaceId, WorkspaceKind, WorkspaceLifecycle};
+use talos_store::SqliteStore;
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Database filename used by `paseo-core::HomePaths`.
+/// Database filename used by `talos-core::HomePaths`.
 pub const DATABASE_FILE_NAME: &str = "state.sqlite3";
 /// Filename used by the first importer revision. It is never opened or modified.
 const LEGACY_DATABASE_FILE_NAME: &str = "state.sqlite";
@@ -29,7 +29,7 @@ pub enum MigrationError {
     #[error("I/O error while accessing migration data")]
     Io(#[from] std::io::Error),
     #[error("destination store error")]
-    Store(#[from] paseo_store::StoreError),
+    Store(#[from] talos_store::StoreError),
     #[error("migration journal is invalid; refusing to modify the destination")]
     JournalCorrupt,
     #[error("migration journal could not be written")]

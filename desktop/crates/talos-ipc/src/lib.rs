@@ -1,6 +1,6 @@
 //! Typed, versioned local daemon IPC protocol.
 //!
-//! Wire types are deliberately independent of Paseo domain crates. Adapters can
+//! Wire types are deliberately independent of the domain crates. Adapters can
 //! implement [`TryFrom`] conversions at the daemon/UI boundary.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

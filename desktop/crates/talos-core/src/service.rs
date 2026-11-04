@@ -11,18 +11,18 @@ use std::{
 };
 
 use chrono::Utc;
-use paseo_acp::{AcpEvent, SessionUpdateNotification};
-use paseo_domain::{
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use talos_acp::{AcpEvent, SessionUpdateNotification};
+use talos_domain::{
     Agent, AgentId, AgentLifecycle, DomainError, EventCursor, ModelRef, Notice, PermissionOutcome,
     PermissionRequest, PermissionRequestId, PermissionRisk, ProviderDescriptor, ProviderId,
     ProviderMode, RunId, RunLifecycle, Session, SessionId, SessionLifecycle, TimelineEvent,
     TimelineEventKind, ToolCall, ToolStatus, Usage, Workspace, WorkspaceId, WorkspaceKind,
     WorkspaceLifecycle,
 };
-use paseo_store::{PromptRequestAcceptance, PromptRequestRecord, SessionSnapshot};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use talos_store::{PromptRequestAcceptance, PromptRequestRecord, SessionSnapshot};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -2400,7 +2400,7 @@ async fn publish_acp_update(
     let kind = match update.session_update.as_str() {
         "agent_message_chunk" => Some(TimelineEventKind::AssistantText { text: text() }),
         "agent_thought_chunk" => Some(TimelineEventKind::Thought { text: text() }),
-        // Paseo already records the live submitted user message; ACP replay must not duplicate it.
+        // The daemon already records the live submitted user message; ACP replay must not duplicate it.
         "user_message_chunk" => None,
         "tool_call" | "tool_call_update" => {
             let status = match update.status.as_deref() {
@@ -2532,8 +2532,8 @@ async fn set_private_directory_permissions(_path: &Path) -> Result<(), std::io::
 mod tests {
     use super::*;
     use crate::provider::ProviderPermissionOption;
-    use paseo_domain::{Capabilities, ProviderDescriptor, WorkspaceKind};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use talos_domain::{Capabilities, ProviderDescriptor, WorkspaceKind};
     use uuid::Uuid;
 
     struct TestHome {
@@ -2543,7 +2543,7 @@ mod tests {
     impl TestHome {
         fn new() -> Self {
             Self {
-                root: std::env::temp_dir().join(format!("paseo-core-test-{}", Uuid::now_v7())),
+                root: std::env::temp_dir().join(format!("talos-core-test-{}", Uuid::now_v7())),
             }
         }
 
@@ -2654,7 +2654,7 @@ mod tests {
             &self.native_id
         }
 
-        fn capabilities(&self) -> paseo_domain::Capabilities {
+        fn capabilities(&self) -> talos_domain::Capabilities {
             fixture_capabilities()
         }
 
@@ -2666,7 +2666,7 @@ mod tests {
             fixture_models(&self.id)
         }
 
-        fn config_options(&self) -> Vec<paseo_acp::ConfigOption> {
+        fn config_options(&self) -> Vec<talos_acp::ConfigOption> {
             fixture_config_options()
         }
 
@@ -2759,7 +2759,7 @@ mod tests {
         vec![ModelRef::new(provider.clone(), "fixture-model").unwrap()]
     }
 
-    fn fixture_config_options() -> Vec<paseo_acp::ConfigOption> {
+    fn fixture_config_options() -> Vec<talos_acp::ConfigOption> {
         vec![
             serde_json::from_value(json!({
                 "id": "thought_level",
@@ -2874,7 +2874,7 @@ mod tests {
             &self.native_id
         }
 
-        fn capabilities(&self) -> paseo_domain::Capabilities {
+        fn capabilities(&self) -> talos_domain::Capabilities {
             fixture_capabilities()
         }
 
@@ -2886,7 +2886,7 @@ mod tests {
             Vec::new()
         }
 
-        fn config_options(&self) -> Vec<paseo_acp::ConfigOption> {
+        fn config_options(&self) -> Vec<talos_acp::ConfigOption> {
             Vec::new()
         }
 
@@ -3185,7 +3185,7 @@ mod tests {
             )
             .unwrap(),
         ];
-        let mut store = paseo_store::SqliteStore::open(home.home().join("state.sqlite3")).unwrap();
+        let mut store = talos_store::SqliteStore::open(home.home().join("state.sqlite3")).unwrap();
         assert!(matches!(
             store.accept_prompt_request(&record, &events).unwrap(),
             PromptRequestAcceptance::Accepted(_)
@@ -3620,7 +3620,7 @@ mod tests {
                 TimelineEvent::new(session_id, Some(run_id), index as u64 + 1, kind).unwrap()
             })
             .collect::<Vec<_>>();
-        let mut store = paseo_store::SqliteStore::open(home.home().join("state.sqlite3")).unwrap();
+        let mut store = talos_store::SqliteStore::open(home.home().join("state.sqlite3")).unwrap();
         let mut agent = store.agent(agent_id).unwrap().unwrap();
         agent.lifecycle = AgentLifecycle::Busy;
         store.save_agent(&agent).unwrap();

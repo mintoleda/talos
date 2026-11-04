@@ -49,7 +49,7 @@ is no FFI, shared database or shared session store. Consequences:
 - Runtime behavior is fixed once, in Go. The Rust side must not reimplement
   loop, tool, compaction or safety logic.
 - Changes to the ACP surface land in `internal/acp` and
-  `desktop/crates/paseo-acp` together, with tests on both sides
+  `desktop/crates/talos-acp` together, with tests on both sides
   (`go test ./internal/acp/...`, the `acp-fixture` process tests and
   `desktop/scripts/talosd-smoke.py`).
 - CI (`.github/workflows/ci.yml`) runs the Go build/vet/test job and the desktop
