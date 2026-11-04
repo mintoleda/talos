@@ -7,7 +7,7 @@ in [workstreams.md](architecture/workstreams.md).
 ## Baseline and status rules
 
 Evidence snapshot: the standalone `paseo-rs` working tree over `f56b32a`,
-imported unchanged into the Talos monorepo under `desktop/` (branch `talos`).
+imported unchanged into the Talos monorepo under `desktop/` (`main`).
 Commands below run from `desktop/`. This is not a release certification.
 
 - **Implemented**: a source path exists; this does not establish acceptance.
