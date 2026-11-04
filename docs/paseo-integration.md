@@ -2,8 +2,8 @@
 
 > **Monorepo update.** The Paseo interface layer is now the Rust workspace in
 > [`desktop/`](../desktop/README.md) inside this repository, not a separate
-> product. In this document "Paseo" means that desktop (egui app `paseo`, daemon
-> `paseod`, CLI `paseoctl`); the installed JavaScript Paseo remains a supported
+> product. In this document "Paseo" means that desktop (egui app `talos-desktop`, daemon
+> `talosd`, CLI `talosdctl`); the installed JavaScript Paseo remains a supported
 > ACP client but is no longer the target. See [Monorepo layout](#monorepo-layout).
 
 ## The actual goal
@@ -34,7 +34,7 @@ talos/
 │   ├── acp/          ACP v1 server used by the desktop
 │   └── stack/        runtime constructor shared by TUI, daemon and ACP
 ├── app/              Electron app (legacy; to be replaced by desktop/)
-├── desktop/          Rust workspace: egui app, paseod, paseoctl, store, ACP client
+├── desktop/          Rust workspace: egui app, talosd, talosdctl, store, ACP client
 ├── docs/
 └── Makefile          `talos`, `app*`, `desktop*` targets
 ```
@@ -45,13 +45,13 @@ is no FFI, shared database or shared session store. Consequences:
 
 - Talos owns the model transcript under its own home (`~/.talos` or
   `TALOS_HOME`); the desktop owns the UI timeline in its SQLite store under
-  `~/.paseo-rs`.
+  `~/.talosd`.
 - Runtime behavior is fixed once, in Go. The Rust side must not reimplement
   loop, tool, compaction or safety logic.
 - Changes to the ACP surface land in `internal/acp` and
   `desktop/crates/paseo-acp` together, with tests on both sides
   (`go test ./internal/acp/...`, the `acp-fixture` process tests and
-  `desktop/scripts/paseo-smoke.py`).
+  `desktop/scripts/talosd-smoke.py`).
 - CI (`.github/workflows/ci.yml`) runs the Go build/vet/test job and the desktop
   backend acceptance job on every push; full-workspace desktop UI gates are
   non-blocking until `desktop/docs/STATUS.md` closes them.
@@ -269,7 +269,7 @@ Paseo's platform tools arrive through `mcpServers` on `session/new`/`session/loa
 ### Desktop registration
 
 The Rust desktop registers Talos by default as `talos acp` from `PATH`. To use a
-local build, set the provider command in `~/.paseo-rs/config.toml`:
+local build, set the provider command in `~/.talosd/config.toml`:
 
 ```toml
 [[providers]]
@@ -286,7 +286,7 @@ args = ["acp"]
 ```
 
 Provider environment is injected into the spawned process and redacted from
-daemon diagnostics. See `desktop/apps/paseo-cli/README.md` for the full schema.
+daemon diagnostics. See `desktop/apps/talosdctl/README.md` for the full schema.
 
 ### Legacy Paseo registration
 

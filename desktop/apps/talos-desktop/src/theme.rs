@@ -1,4 +1,4 @@
-//! Design tokens and egui styling for the Paseo desktop shell.
+//! Design tokens and egui styling for the Talos desktop shell.
 //!
 //! Every color, radius, spacing step and motion duration used by the UI lives
 //! here so the visual language stays consistent across views. The palette is a
@@ -100,7 +100,7 @@ pub fn install(ctx: &egui::Context, high_contrast: bool) {
 }
 
 fn install_fonts(ctx: &egui::Context) {
-    if ctx.data(|data| data.get_temp::<bool>(egui::Id::new("paseo-fonts"))) == Some(true) {
+    if ctx.data(|data| data.get_temp::<bool>(egui::Id::new("talos-fonts"))) == Some(true) {
         return;
     }
     let mut fonts = FontDefinitions::default();
@@ -153,7 +153,7 @@ fn install_fonts(ctx: &egui::Context) {
     );
     fonts.families.insert(FontFamily::Monospace, mono);
     ctx.set_fonts(fonts);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("paseo-fonts"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("talos-fonts"), true));
 }
 
 fn family(name: &str) -> FontFamily {

@@ -260,7 +260,7 @@ impl Desktop {
             return;
         }
         if self.preview {
-            self.warn("Preview mode · start paseod to run prompts.");
+            self.warn("Preview mode · start talosd to run prompts.");
             return;
         }
         if !self.view().online {
@@ -355,7 +355,7 @@ impl Desktop {
                     let (rect, response) =
                         ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
                     paint_logo(ui, rect);
-                    response.on_hover_text("Paseo · Rust");
+                    response.on_hover_text("Talos Desktop");
                     ui.add_space(26.0);
                 });
                 let attention = self.view().attention_count();
@@ -1022,7 +1022,7 @@ impl Desktop {
                 egui::Label::new(
                     RichText::new(match self.session() {
                         Some(session) if !session.workspace.is_empty() => {
-                            "Talos runs the coding loop; Paseo keeps the workspace, history and decisions in one place."
+                            "Talos runs the coding loop; Talos Desktop keeps the workspace, history and decisions in one place."
                         }
                         _ => "Add a workspace to give the agent a place to work.",
                     })
@@ -1053,7 +1053,7 @@ impl Desktop {
                 ui.add_space(22.0);
                 ui.label(
                     RichText::new(
-                        "Daemon offline. The shell is showing a preview; start paseod to go live.",
+                        "Daemon offline. The shell is showing a preview; start talosd to go live.",
                     )
                     .font(theme::ui(11.5))
                     .color(theme::AMBER),
@@ -1464,13 +1464,13 @@ impl Desktop {
             {
                 ui_copy(
                     self,
-                    self.backend.endpoint.replace("paseod.sock", "config.toml"),
+                    self.backend.endpoint.replace("talosd.sock", "config.toml"),
                 );
             }
         });
         ui.add_space(10.0);
         ui.label(
-            RichText::new("Configure Talos credentials in ~/.paseo-rs/config.toml under [providers.env]. Legacy ~/.paseo and ~/.talos are never modified.")
+            RichText::new("Configure Talos credentials in ~/.talosd/config.toml under [providers.env]. Legacy ~/.paseo and ~/.talos are never modified.")
                 .font(theme::ui(10.5))
                 .color(theme::FAINT),
         );
@@ -1570,12 +1570,12 @@ impl Desktop {
                     .fill(theme::SURFACE)
                     .corner_radius(8),
                 )
-                .on_hover_text("paseod.log lives next to the daemon socket")
+                .on_hover_text("talosd.log lives next to the daemon socket")
                 .clicked()
             {
                 ui_copy(
                     self,
-                    self.backend.endpoint.replace("paseod.sock", "paseod.log"),
+                    self.backend.endpoint.replace("talosd.sock", "talosd.log"),
                 );
             }
         });
@@ -1609,10 +1609,10 @@ impl Desktop {
     }
 
     fn settings_about(&mut self, ui: &mut egui::Ui) {
-        settings_heading(ui, "Paseo · Rust rebuild");
+        settings_heading(ui, "Talos Desktop");
         ui.label(
             RichText::new(
-                "A native cockpit for coding agents. Paseo owns the workspace, durable timeline, permissions and history; Talos owns the default agent loop, with Claude Code as the only secondary provider.",
+                "A native cockpit for coding agents. Talos Desktop owns the workspace, durable timeline, permissions and history; Talos owns the default agent loop, with Claude Code as the only secondary provider.",
             )
             .font(theme::ui(12.0))
             .color(theme::SECONDARY),
@@ -1620,7 +1620,7 @@ impl Desktop {
         ui.add_space(14.0);
         for (label, value) in [
             ("UI", "egui 0.37 · eframe · Inter"),
-            ("Daemon", "paseod · tokio · SQLite"),
+            ("Daemon", "talosd · tokio · SQLite"),
             ("Protocol", "ACP over stdio · versioned local IPC"),
             ("Privacy", "No legacy ~/.paseo data is read or written"),
         ] {
@@ -2108,7 +2108,7 @@ impl Desktop {
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_workspace.name)
-                        .hint_text("paseo-rs")
+                        .hint_text("my-project")
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(8.0);

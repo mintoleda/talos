@@ -1,6 +1,6 @@
 //! Ignored wrapper for the deterministic daemon + CLI process smoke harness.
 //!
-//! The real scenarios live in `scripts/paseo-smoke.py` so they can also be run
+//! The real scenarios live in `scripts/talosd-smoke.py` so they can also be run
 //! directly without cargo. This test only launches that script and enforces a
 //! bounded timeout with process cleanup on failure. It is ignored by default
 //! because the workspace does not build sibling binaries for integration tests.
@@ -8,8 +8,8 @@
 //! Prerequisites:
 //!
 //! ```text
-//! cargo build -p paseod -p paseo-cli -p paseo-acp --bins
-//! cargo test -p paseo-cli --test daemon_smoke -- --ignored --nocapture
+//! cargo build -p talosd -p talosdctl -p paseo-acp --bins
+//! cargo test -p talosdctl --test daemon_smoke -- --ignored --nocapture
 //! ```
 //!
 //! See `scripts/README.md` for binary path overrides and scenario coverage.
@@ -30,17 +30,17 @@ use std::{
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 #[test]
-#[ignore = "requires prebuilt paseod, paseoctl and acp-fixture; see scripts/README.md"]
+#[ignore = "requires prebuilt talosd, talosdctl and acp-fixture; see scripts/README.md"]
 fn daemon_cli_smoke_script_passes() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let script = root.join("scripts/paseo-smoke.py");
+    let script = root.join("scripts/talosd-smoke.py");
     assert!(
         script.is_file(),
         "smoke script is missing at {}",
         script.display()
     );
-    let python = std::env::var_os("PASEO_SMOKE_PYTHON").unwrap_or_else(|| "python3".into());
-    let timeout_secs = std::env::var("PASEO_SMOKE_TIMEOUT_SECS")
+    let python = std::env::var_os("TALOSD_SMOKE_PYTHON").unwrap_or_else(|| "python3".into());
+    let timeout_secs = std::env::var("TALOSD_SMOKE_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_TIMEOUT_SECS);

@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Deterministic process-level smoke harness for paseod and paseoctl.
+"""Deterministic process-level smoke harness for talosd and talosdctl.
 
 The harness launches the real binaries against the scripted ACP fixture in a
-temporary directory. It never reads or writes ``~/.paseo-rs``, ``~/.paseo`` or a
-real provider home. All child processes receive ``HOME`` and ``PASEO_RS_HOME``
+temporary directory. It never reads or writes ``~/.talosd``, ``~/.paseo`` or a
+real provider home. All child processes receive ``HOME`` and ``TALOSD_HOME``
 pointing inside the temporary root, and cleanup runs even after a failed check.
 
 Prerequisites (no cargo invocation happens here):
 
-    cargo build -p paseod -p paseo-cli -p paseo-acp --bins
-    python3 scripts/paseo-smoke.py --verbose
+    cargo build -p talosd -p talosdctl -p paseo-acp --bins
+    python3 scripts/talosd-smoke.py --verbose
 
-Binary paths can be overridden with ``PASEO_PASEOD_BIN``,
-``PASEO_PASEOCTL_BIN`` and ``PASEO_ACP_FIXTURE_BIN``.
+Binary paths can be overridden with ``TALOSD_SMOKE_DAEMON_BIN``,
+``TALOSD_SMOKE_CTL_BIN`` and ``TALOSD_ACP_FIXTURE_BIN``.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ class Daemon:
     def __init__(self, name: str, home: Path, token: str, proc, log_path: Path, log_file):
         self.name = name
         self.home = home
-        self.socket = home / "paseod.sock"
+        self.socket = home / "talosd.sock"
         self.token = token
         self.proc = proc
         self.log_path = log_path
@@ -73,10 +73,10 @@ class Harness:
         self.args = args
         # Validate prerequisites before creating the temp root so a missing
         # binary cannot leave an unreferenced directory behind.
-        self.paseod = self._binary("PASEO_PASEOD_BIN", "paseod")
-        self.paseoctl = self._binary("PASEO_PASEOCTL_BIN", "paseoctl")
-        self.fixture = self._binary("PASEO_ACP_FIXTURE_BIN", "acp-fixture")
-        self.root = Path(tempfile.mkdtemp(prefix="paseo-rs-smoke-")).resolve()
+        self.talosd = self._binary("TALOSD_SMOKE_DAEMON_BIN", "talosd")
+        self.talosdctl = self._binary("TALOSD_SMOKE_CTL_BIN", "talosdctl")
+        self.fixture = self._binary("TALOSD_ACP_FIXTURE_BIN", "acp-fixture")
+        self.root = Path(tempfile.mkdtemp(prefix="talosd-smoke-")).resolve()
         self.fake_home = self.root / "fake-home"
         self.fake_home.mkdir(parents=True)
         self.traces = self.root / "traces"
@@ -100,7 +100,7 @@ class Harness:
         if not path.is_file():
             raise SmokeFailure(
                 f"missing {name} binary at {path}; build it first with:\n"
-                "  cargo build -p paseod -p paseo-cli -p paseo-acp --bins\n"
+                "  cargo build -p talosd -p talosdctl -p paseo-acp --bins\n"
                 f"or set {env_name}"
             )
         return path
@@ -134,18 +134,18 @@ class Harness:
     def child_env(self, home: Path) -> dict[str, str]:
         env = os.environ.copy()
         for key in list(env):
-            if key.startswith("PASEO_RS_") or key.startswith("PASEO_ACP_FIXTURE_"):
+            if key.startswith("TALOSD_") or key.startswith("TALOSD_ACP_FIXTURE_"):
                 env.pop(key)
         env.pop("FIXTURE_SECRET", None)
-        env.pop("PASEO_RS_DEFAULT_PROVIDER", None)
+        env.pop("TALOSD_DEFAULT_PROVIDER", None)
         env["HOME"] = str(self.fake_home)
-        env["PASEO_RS_HOME"] = str(home)
+        env["TALOSD_HOME"] = str(home)
         env["TMPDIR"] = str(self.tmp)
         env["XDG_CONFIG_HOME"] = str(self.fake_home / ".config")
         env["XDG_DATA_HOME"] = str(self.fake_home / ".local/share")
         env["XDG_CACHE_HOME"] = str(self.fake_home / ".cache")
         env["XDG_RUNTIME_DIR"] = str(self.runtime)
-        env["RUST_LOG"] = env.get("RUST_LOG", "paseod=debug")
+        env["RUST_LOG"] = env.get("RUST_LOG", "talosd=debug")
         env["NO_COLOR"] = "1"
         return env
 
@@ -160,12 +160,12 @@ class Harness:
     ) -> None:
         trace = self.traces / f"{name}.jsonl"
         env = {
-            "PASEO_ACP_FIXTURE_MODE": mode,
-            "PASEO_ACP_FIXTURE_TRACE": str(trace),
+            "TALOSD_ACP_FIXTURE_MODE": mode,
+            "TALOSD_ACP_FIXTURE_TRACE": str(trace),
             "FIXTURE_SECRET": self.secret,
         }
         if echo_secret:
-            env["PASEO_ACP_FIXTURE_ECHO_SECRET"] = "1"
+            env["TALOSD_ACP_FIXTURE_ECHO_SECRET"] = "1"
         providers = [
             {
                 "id": "talos",
@@ -229,11 +229,11 @@ class Harness:
         token_path = home / "auth.token"
         token_path.write_text(token + "\n", encoding="utf-8")
         token_path.chmod(0o600)
-        log_path = self.traces / f"{name}-paseod.log"
+        log_path = self.traces / f"{name}-talosd.log"
         log_file = log_path.open("w", encoding="utf-8")
         try:
             proc = subprocess.Popen(  # noqa: S603 - all paths are harness-owned
-                [str(self.paseod)],
+                [str(self.talosd)],
                 cwd=self.work,
                 env=self.child_env(home),
                 stdout=log_file,
@@ -243,7 +243,7 @@ class Harness:
         except OSError as error:
             log_file.close()
             raise SmokeFailure(
-                f"cannot launch paseod at {self.paseod}: {error}"
+                f"cannot launch talosd at {self.talosd}: {error}"
             ) from error
         daemon = Daemon(name, home, token, proc, log_path, log_file)
         self.daemons.append(daemon)
@@ -329,7 +329,7 @@ class Harness:
         timeout: float = STEP_TIMEOUT,
     ):
         command = [
-            str(self.paseoctl),
+            str(self.talosdctl),
             "--json",
             "--home",
             str(home),
@@ -351,11 +351,11 @@ class Harness:
             )
         except subprocess.TimeoutExpired as error:
             raise SmokeFailure(
-                f"paseoctl timed out after {timeout:.0f}s: {' '.join(args)}"
+                f"talosdctl timed out after {timeout:.0f}s: {' '.join(args)}"
             ) from error
         except FileNotFoundError as error:
             raise SmokeFailure(
-                f"paseoctl disappeared during the smoke run ({self.paseoctl}); "
+                f"talosdctl disappeared during the smoke run ({self.talosdctl}); "
                 "do not rebuild while the harness is running"
             ) from error
 
@@ -363,14 +363,14 @@ class Harness:
         result = self.run_ctl(daemon, list(args), timeout=timeout)
         if result.returncode != 0:
             raise SmokeFailure(
-                f"paseoctl {' '.join(args)} failed ({result.returncode})\n"
+                f"talosdctl {' '.join(args)} failed ({result.returncode})\n"
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
             )
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as error:
             raise SmokeFailure(
-                f"paseoctl {' '.join(args)} returned invalid JSON: {error}\n"
+                f"talosdctl {' '.join(args)} returned invalid JSON: {error}\n"
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
             ) from error
 
@@ -378,7 +378,7 @@ class Harness:
         result = self.run_ctl(daemon, list(args))
         self.check(
             result.returncode != 0,
-            f"paseoctl {' '.join(args)} unexpectedly succeeded: {result.stdout}",
+            f"talosdctl {' '.join(args)} unexpectedly succeeded: {result.stdout}",
         )
         return result
 
@@ -930,7 +930,7 @@ class Harness:
         )
         self.check(not daemon.socket.exists(), "daemon socket survived shutdown")
         self.check(
-            not (daemon.home / "paseod.lock").exists(),
+            not (daemon.home / "talosd.lock").exists(),
             "daemon instance lock survived shutdown",
         )
         self.check_fixture_cleanup("main")
@@ -1077,7 +1077,7 @@ class Harness:
         with path.open("w", encoding="utf-8") as sink:
             tail = subprocess.Popen(  # noqa: S603 - harness-owned binary
                 [
-                    str(self.paseoctl),
+                    str(self.talosdctl),
                     "--json",
                     "--home",
                     str(daemon.home),
@@ -1143,7 +1143,7 @@ class Harness:
         before = self.event_page(daemon)
         tail = subprocess.Popen(  # noqa: S603 - harness-owned binary
             [
-                str(self.paseoctl),
+                str(self.talosdctl),
                 "--json",
                 "--home",
                 str(daemon.home),
@@ -1298,7 +1298,7 @@ class Harness:
             not daemon.socket.exists(), "daemon socket survived an interrupt shutdown"
         )
         self.check(
-            not (daemon.home / "paseod.lock").exists(),
+            not (daemon.home / "talosd.lock").exists(),
             "daemon instance lock survived an interrupt shutdown",
         )
         self.check_fixture_cleanup("interrupt")

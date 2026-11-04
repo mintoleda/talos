@@ -16,7 +16,7 @@ if [[ -z ${HOME:-} || $HOME != /* || $HOME == / || $HOME == *$'\n'* ]]; then
 fi
 
 bundle=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-for binary in paseod paseoctl paseo; do
+for binary in talosd talosdctl talos-desktop; do
   if [[ ! -f "$bundle/$binary" || ! -x "$bundle/$binary" ]]; then
     printf 'Missing executable: %s\n' "$bundle/$binary" >&2
     exit 1
@@ -24,12 +24,12 @@ for binary in paseod paseoctl paseo; do
 done
 
 bin="$HOME/.local/bin"
-service="$HOME/.config/systemd/user/paseod.service"
-desktop="$HOME/.local/share/applications/paseo.desktop"
+service="$HOME/.config/systemd/user/talosd.service"
+desktop="$HOME/.local/share/applications/talos-desktop.desktop"
 # Never write through a symlink to an unexpected location.
 for path in "$HOME/.local" "$bin" "$HOME/.local/share" "$(dirname -- "$desktop")" \
   "$HOME/.config" "$HOME/.config/systemd" "$(dirname -- "$service")" \
-  "$bin/paseod" "$bin/paseoctl" "$bin/paseo" "$service" "$desktop"; do
+  "$bin/talosd" "$bin/talosdctl" "$bin/talos-desktop" "$service" "$desktop"; do
   if [[ -L "$path" ]]; then
     printf 'Refusing symlink destination: %s\n' "$path" >&2
     exit 1
@@ -37,12 +37,12 @@ for path in "$HOME/.local" "$bin" "$HOME/.local/share" "$(dirname -- "$desktop")
 done
 
 install -d -m 755 -- "$bin" "$(dirname -- "$desktop")" "$(dirname -- "$service")"
-for binary in paseod paseoctl paseo; do
+for binary in talosd talosdctl talos-desktop; do
   install -m 755 -- "$bundle/$binary" "$bin/$binary"
 done
-install -m 644 -- "$bundle/packaging/systemd/paseod.service" "$service"
-install -m 644 -- "$bundle/packaging/desktop/paseo.desktop" "$desktop"
+install -m 644 -- "$bundle/packaging/systemd/talosd.service" "$service"
+install -m 644 -- "$bundle/packaging/desktop/talos-desktop.desktop" "$desktop"
 
 printf 'Installed in %s. Add it to your desktop session PATH for the launcher.\n' "$bin"
-printf 'Run: systemctl --user daemon-reload && systemctl --user enable --now paseod.service\n'
-printf 'Check: %s/paseoctl health; launch desktop: %s/paseo\n' "$bin" "$bin"
+printf 'Run: systemctl --user daemon-reload && systemctl --user enable --now talosd.service\n'
+printf 'Check: %s/talosdctl health; launch desktop: %s/talos-desktop\n' "$bin" "$bin"

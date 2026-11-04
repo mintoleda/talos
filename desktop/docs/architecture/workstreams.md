@@ -23,8 +23,8 @@ or UI-only lint cleanup during P0–P3. Backend acceptance must not depend on th
 unfinished desktop. Broader M3 work remains separately deferred.
 
 Owner roles below are assignments for execution, not completion statuses. For
-P0–P3 regression checks use `cargo test --workspace --exclude paseo` and
-`cargo clippy --workspace --all-targets --exclude paseo -- -D warnings`; the
+P0–P3 regression checks use `cargo test --workspace --exclude talos-desktop` and
+`cargo clippy --workspace --all-targets --exclude talos-desktop -- -D warnings`; the
 full workspace checks remain mandatory before release.
 
 ## Architecture contract
@@ -34,9 +34,9 @@ full workspace checks remain mandatory before release.
 - `paseo-store` — SQLite persistence and migrations.
 - `paseo-core` — provider registry, agent/session orchestration, configuration.
 - `paseo-ipc` — versioned newline-JSON IPC between daemon and clients.
-- `apps/paseod` — daemon.
-- `apps/paseo-cli` (`paseoctl`) — operator CLI.
-- `apps/paseo` — egui desktop client.
+- `apps/talosd` — daemon.
+- `apps/talosdctl` (`talosdctl`) — operator CLI.
+- `apps/talos-desktop` — egui desktop client.
 - `apps/paseo-migrate`, `crates/paseo-migrate` — read-only legacy inventory.
 
 Talos (`talos acp`) is the default provider. Claude Code is the only secondary
@@ -44,8 +44,8 @@ provider and never silently replaces the provider that owns an existing session.
 
 ## Workstream A — daemon, IPC, CLI (P0–P2)
 
-Owner files: `crates/paseo-ipc/**`, `crates/paseo-core/**`, `apps/paseod/**`,
-`apps/paseo-cli/**`, `docs/architecture/*.md` (IPC sections only).
+Owner files: `crates/paseo-ipc/**`, `crates/paseo-core/**`, `apps/talosd/**`,
+`apps/talosdctl/**`, `docs/architecture/*.md` (IPC sections only).
 
 Deliverables:
 
@@ -62,7 +62,7 @@ Deliverables:
 3. CLI: `session new <workspace> --provider --title`, `session archive|rename`,
    `agent list|show`, `permission list|allow|deny`, `events tail --follow`,
    `model list --provider`, `shutdown`. Remove "not available in IPC v1" stubs.
-4. Provider configuration: `~/.paseo-rs/config.toml` supports `default_provider`
+4. Provider configuration: `~/.talosd/config.toml` supports `default_provider`
    and per-provider `command`, `args`, `env`; document a Talos setup that passes
    model/auth via env into `talos acp` (e.g. `TALOS_HOME`, `OPENAI_API_KEY`) and
    never reads or writes legacy `~/.paseo` or `~/.talos`.
@@ -72,7 +72,7 @@ Deliverables:
 
 ## Workstream B — egui shell and composer (deferred to P4)
 
-Owner files: `apps/paseo/src/main.rs`, `app.rs`, `backend.rs`, `state.rs`,
+Owner files: `apps/talos-desktop/src/main.rs`, `app.rs`, `backend.rs`, `state.rs`,
 `theme.rs`, `ui/mod.rs`, `ui/composer.rs`, `ui/sidebar.rs`, `ui/overlays.rs`.
 
 Deliverables: 60 px rail, resizable 286 px history, centered timeline, inspector,
@@ -81,7 +81,7 @@ breakpoints, keyboard map, reduced motion and high contrast.
 
 ## Workstream C — icon and widget kit (deferred to P4)
 
-Owner files: `apps/paseo/src/ui/icons.rs`, `apps/paseo/src/ui/widgets.rs`.
+Owner files: `apps/talos-desktop/src/ui/icons.rs`, `apps/talos-desktop/src/ui/widgets.rs`.
 
 Deliverables: hand-painted 24-grid vector icons for every `Icon` variant, square
 icon buttons with hover wash, tooltips, presence dots, chips, section labels,
@@ -89,7 +89,7 @@ keyboard hints, dividers. No emoji glyphs in the shell.
 
 ## Workstream D — timeline and markdown (deferred to P4)
 
-Owner files: `apps/paseo/src/ui/timeline.rs`, `apps/paseo/src/ui/markdown.rs`.
+Owner files: `apps/talos-desktop/src/ui/timeline.rs`, `apps/talos-desktop/src/ui/markdown.rs`.
 
 Deliverables: markdown rendering with code blocks and copy affordances; user
 turns; streamed assistant blocks with a caret; collapsible reasoning; tool cards

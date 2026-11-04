@@ -206,7 +206,7 @@ pub struct AppService {
 }
 
 impl AppService {
-    /// Open the new Rust-owned home (`PASEO_RS_HOME` or `~/.paseo-rs`).
+    /// Open the new Rust-owned home (`TALOSD_HOME` or `~/.talosd`).
     pub async fn open() -> CoreResult<Self> {
         let paths = HomePaths::discover()?;
         Self::open_at(paths.home).await

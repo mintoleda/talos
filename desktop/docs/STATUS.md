@@ -88,8 +88,8 @@ when recorded below):
 | `cargo fmt --all -- --check` | Fail | Existing desktop formatting debt; no broad formatting applied |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Fail | Desktop warnings/lints block the workspace gate |
 | `cargo test --workspace` | Fail | Desktop `state::tests::permissions_are_scoped_and_resolved_by_run` fails; 21 other desktop tests pass; run stops before establishing other packages |
-| `cargo clippy --workspace --all-targets --exclude paseo -- -D warnings` | Pass | Non-desktop lint baseline only |
-| `cargo test --workspace --exclude paseo` | Pass | Non-desktop automated baseline only |
+| `cargo clippy --workspace --all-targets --exclude talos-desktop -- -D warnings` | Pass | Non-desktop lint baseline only |
+| `cargo test --workspace --exclude talos-desktop` | Pass | Non-desktop automated baseline only |
 
 The excluded-desktop commands are interim gates, never substitutes for the final
 workspace gates. Live Talos, real daemon restart recovery, fresh installation,
@@ -102,10 +102,10 @@ Run from `desktop/` after importing into the Talos monorepo; source unchanged.
 | Check | Result |
 |---|---|
 | `cargo fmt --all -- --check` | Pass |
-| `cargo clippy --workspace --all-targets --exclude paseo --locked -- -D warnings` | Pass |
+| `cargo clippy --workspace --all-targets --exclude talos-desktop --locked -- -D warnings` | Pass |
 | `cargo test --workspace --locked --no-fail-fast` | All backend crates pass; desktop `permissions_are_scoped_and_resolved_by_run` still fails (pre-existing) |
 | `go build ./... && go vet ./... && go test ./...` (repo root) | Pass |
-| `python3 scripts/paseo-smoke.py --timeout 300` | **Flaky**: 1 of 4 runs passed (3 in `desktop/`, 1 in the original `paseo-rs` checkout). Failures: "tool lifecycle events were not attributed to the tool prompt run" (×2) and a cancel run stuck in `CancelRequested` (×1). Same behavior before the move; open race, see P1 |
+| `python3 scripts/talosd-smoke.py --timeout 300` | **Flaky**: 1 of 4 runs passed (3 in `desktop/`, 1 in the original `paseo-rs` checkout). Failures: "tool lifecycle events were not attributed to the tool prompt run" (×2) and a cancel run stuck in `CancelRequested` (×1). Same behavior before the move; open race, see P1 |
 
 ### Initial integrated implementation results
 
@@ -114,11 +114,11 @@ Before the follow-up DeepSeek work:
 | Check | Result |
 |---|---|
 | `cargo fmt --all -- --check` | Pass |
-| `cargo test --workspace --exclude paseo --locked` | 69 passed; 0 failed; 1 opt-in smoke wrapper ignored |
-| `cargo clippy --workspace --all-targets --exclude paseo --locked -- -D warnings` | Pass |
-| `cargo build --locked -p paseod -p paseo-cli -p paseo-acp --bins` | Pass |
-| `python3 scripts/paseo-smoke.py --verbose --timeout 90` | Entire initial process suite passed; tail delivered 88 unique events across two sessions at one-event page size |
-| `cargo test -p paseo-cli --test daemon_smoke -- --ignored --nocapture` | Opt-in wrapper passed the entire process suite |
+| `cargo test --workspace --exclude talos-desktop --locked` | 69 passed; 0 failed; 1 opt-in smoke wrapper ignored |
+| `cargo clippy --workspace --all-targets --exclude talos-desktop --locked -- -D warnings` | Pass |
+| `cargo build --locked -p talosd -p talosdctl -p paseo-acp --bins` | Pass |
+| `python3 scripts/talosd-smoke.py --verbose --timeout 90` | Entire initial process suite passed; tail delivered 88 unique events across two sessions at one-event page size |
+| `cargo test -p talosdctl --test daemon_smoke -- --ignored --nocapture` | Opt-in wrapper passed the entire process suite |
 | Forced Python `--timeout 1 --keep` using frozen binaries | Expected failure; all five traced fixture children gone after cleanup; retained debug home explicitly removed |
 | `cargo test --workspace --locked` | Existing desktop permission-state test still fails (21 desktop tests pass) |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Existing desktop lint debt still blocks full workspace |
@@ -133,8 +133,8 @@ Follow-up keyed prompt/tool coverage and migration preflight must be verified ag
 | Domain and SQLite | Fixture-verified foundation: `crates/paseo-domain`, `crates/paseo-store`; store tests `persistence_survives_reopen_and_replay_cursor`, `migrations_are_idempotent_and_events_ordered` | Crash/restart recovery across the complete daemon/provider stack |
 | Talos / Claude Code ACP | Fixture-verified transport: `crates/paseo-acp/tests/process.rs` covers streaming, permission RPC, cancellation, load replay, malformed/large frames, process exit and redaction | Authenticated live Talos and Claude Code workflows plus provider-native resume after daemon restart |
 | Core orchestration | Fixture-verified initial recovery/shutdown/permission pass: eight core tests plus the process harness prove durable cancellation, orphan reconciliation, concurrency and native fixture resume | Durable keyed prompt idempotency follow-up in progress; authenticated Talos and Claude Code acceptance remain open |
-| Daemon / IPC | Fixture-verified commands and delivery: `apps/paseod/src/main.rs`, `crates/paseo-ipc/tests/{protocol,reliability}.rs` cover scoped replay, truncation, clock rollback, fragmented input, lag and auth; `apps/paseod/tests/startup.rs` covers startup safety | Finish process-level lifecycle acceptance and real-provider restart/resume |
-| CLI / provider config | Partial: `apps/paseo-cli/src/main.rs` tests cover commands, typed session cursors, multi-page follow and stalled-page rejection; README documents recovery semantics | Complete process harness acceptance; durable idempotency, automatic reconnect and config reload boundary remain open |
+| Daemon / IPC | Fixture-verified commands and delivery: `apps/talosd/src/main.rs`, `crates/paseo-ipc/tests/{protocol,reliability}.rs` cover scoped replay, truncation, clock rollback, fragmented input, lag and auth; `apps/talosd/tests/startup.rs` covers startup safety | Finish process-level lifecycle acceptance and real-provider restart/resume |
+| CLI / provider config | Partial: `apps/talosdctl/src/main.rs` tests cover commands, typed session cursors, multi-page follow and stalled-page rejection; README documents recovery semantics | Complete process harness acceptance; durable idempotency, automatic reconnect and config reload boundary remain open |
 | Projects / workspaces | Partial: core and CLI register/list/get workspaces; domain retains workspace kinds | Project CRUD, workspace rename/archive/restore, safe managed-worktree creation/deletion and persisted branch/ownership links |
 | Permissions / trust | Partial: durable timeline plus pending request/decision handlers and scoped fixture tests | Restart/timeout behavior must fail closed; stale decisions must not approve another run |
 | Usage / diagnostics | Partial: summaries and provider diagnostics have daemon fixture tests | Unknown usage/prices versus zero, aggregation/replay deduplication and redaction acceptance |
@@ -142,12 +142,12 @@ Follow-up keyed prompt/tool coverage and migration preflight must be verified ag
 | Terminals / scripts | Open PTY backend; script management deferred | Owned PTY lifecycle/input/resize/capture/cleanup with two-workspace isolation |
 | Legacy migration | Partial: `crates/paseo-migrate/src/lib.rs`; read-only dry run and idempotent workspace-subset import tests | Backup/transactional recovery, source-path safety, sessions/history/attachments and interrupted-import coverage; current importer explicitly excludes these |
 | Packaging / settings | Partial: `.github/workflows/ci.yml`, `packaging/`, `docs/release/README.md` | Fresh-home install/upgrade/uninstall and config validation without modifying user data; no signed/cross-platform release claim |
-| Desktop | Deferred, existing code retained in `apps/paseo` | Fix failing test/lints/formatting, then connect verified backend contracts and perform visual/accessibility QA |
+| Desktop | Deferred, existing code retained in `apps/talos-desktop` | Fix failing test/lints/formatting, then connect verified backend contracts and perform visual/accessibility QA |
 | Remote / schedules / browser-MCP / voice / OS notifications / plugins / usage dashboards | Deferred broader parity | Separate acceptance work after the local release; see parity inventory |
 
 ## P0 — establish a reproducible non-UI baseline
 
-Owner: core/daemon/CLI maintainers; scope excludes `apps/paseo`.
+Owner: core/daemon/CLI maintainers; scope excludes `apps/talos-desktop`.
 
 - [x] Inventory the dirty tree without discarding or committing unrelated changes.
 - [x] Run non-desktop tests and strict Clippy; record the workspace blockers above.
@@ -166,14 +166,14 @@ IPC incompatibility. Do not mark the whole workspace green.
 Depends on P0. Owners: ACP, core, storage, daemon/IPC, CLI.
 
 - [x] Add a deterministic process-level daemon + CLI smoke harness using a fake
-  provider and temporary Rust-owned home: `scripts/paseo-smoke.py`, with an opt-in
-  Rust wrapper in `apps/paseo-cli/tests/daemon_smoke.rs` and a dedicated CI job.
+  provider and temporary Rust-owned home: `scripts/talosd-smoke.py`, with an opt-in
+  Rust wrapper in `apps/talosdctl/tests/daemon_smoke.rs` and a dedicated CI job.
   Individual workflow acceptance below still requires a passing execution.
 - [ ] Register workspace → create Talos-owned session → stream text/tools/usage →
   follow-up → permission allow/deny → cancel → rename/archive/history. Initial
   fixture flow passes text/usage/lifecycle; explicit streamed tool lifecycle
   coverage is being added before checking this whole item.
-- [ ] Make `scripts/paseo-smoke.py` deterministic: on 2026-11-03 it passed 1 of 4
+- [ ] Make `scripts/talosd-smoke.py` deterministic: on 2026-11-03 it passed 1 of 4
   runs, failing on tool-event run attribution and on a cancel that never left
   `CancelRequested`. Investigate the race before relying on the CI job as a gate.
 - [ ] Persist optional prompt request keys transactionally with run acceptance;
@@ -182,7 +182,7 @@ Depends on P0. Owners: ACP, core, storage, daemon/IPC, CLI.
   DeepSeek owns implementation and separate process-level regression coverage.
 - [x] Fixture acceptance: stop/restart the real daemon, replay ordered history and
   resume the same native fixture session without duplicate creation/replayed
-  output (`scripts/paseo-smoke.py`, initial suite passed). Live Talos is separate.
+  output (`scripts/talosd-smoke.py`, initial suite passed). Live Talos is separate.
 - [x] Fixture acceptance: two simultaneous agents with distinct pending requests;
   duplicate, stale and post-cancel decisions fail closed without cross-talk
   (core `concurrent_permission_decisions_are_run_scoped_and_stale_ids_fail_closed`

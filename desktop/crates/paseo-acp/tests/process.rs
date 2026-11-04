@@ -18,7 +18,7 @@ fn fixture(mode: &str) -> ProcessConfig {
     let mut config = ProcessConfig::new(env!("CARGO_BIN_EXE_acp-fixture"));
     config
         .env
-        .insert("PASEO_ACP_FIXTURE_MODE".to_owned(), mode.to_owned());
+        .insert("TALOSD_ACP_FIXTURE_MODE".to_owned(), mode.to_owned());
     config
 }
 
