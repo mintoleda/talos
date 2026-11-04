@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,10 +21,9 @@ import (
 	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/provider"
-	"github.com/mintoleda/talos/internal/provider/anthropic"
-	"github.com/mintoleda/talos/internal/provider/openai"
 	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
+	"github.com/mintoleda/talos/internal/stack"
 	"github.com/mintoleda/talos/internal/tui/dialogs"
 )
 
@@ -54,11 +52,12 @@ type Params struct {
 
 	// OwnStack, when set, is closed by Engine.Close (loop/MCP/registry/transcript).
 	// Leave nil for shared-stack tab engines that only own their loop.
-	OwnStack *Built
+	OwnStack *stack.Built
 }
 
 // pendingApproval holds a captured permission reply channel plus metadata for Snapshot.
 type pendingApproval struct {
+	ev       protocol.PermissionRequested // ReplyCh stripped; re-emitted when promoted
 	reply    func(bool, []byte)
 	toolName string
 	command  string
@@ -86,7 +85,7 @@ type Engine struct {
 	cp           *safety.Checkpointer
 	noTools      bool
 	notifyCfg    notify.Config
-	ownStack     *Built
+	ownStack     *stack.Built
 
 	sessionID string
 
@@ -108,7 +107,9 @@ type Engine struct {
 
 	subscribers map[int]func(protocol.Event)
 	subNext     int
-	pending     *pendingApproval
+	// pending queues permission requests: parallel subagents each have their
+	// own executor, so several can wait at once. The head is the one shown.
+	pending []pendingApproval
 
 	stateMu    sync.Mutex
 	stateBusy  bool
@@ -196,9 +197,9 @@ func NewEngine(p Params) *Engine {
 	return e
 }
 
-// NewEngine constructs a running Engine that owns the Built stack.
+// FromBuilt constructs a running Engine that owns the Built stack.
 // After this call, Built.Close is a no-op; use Engine.Close instead.
-func (b *Built) NewEngine(ctx context.Context) *Engine {
+func FromBuilt(ctx context.Context, b *stack.Built) *Engine {
 	if b == nil {
 		return nil
 	}
@@ -227,7 +228,7 @@ func (b *Built) NewEngine(ctx context.Context) *Engine {
 		Context:       ctx,
 		OwnStack:      b,
 	})
-	b.transferred = true
+	b.MarkTransferred()
 	return eng
 }
 
@@ -289,7 +290,10 @@ func (e *Engine) turnEmit() protocol.EmitFunc {
 		switch evt := ev.(type) {
 		case protocol.PermissionRequested:
 			replyCh := evt.ReplyCh
-			e.setPending(pendingApproval{
+			// Strip ReplyCh so subscribers cannot double-send.
+			evt.ReplyCh = nil
+			if e.enqueuePending(pendingApproval{
+				ev: evt,
 				reply: func(approved bool, _ []byte) {
 					if replyCh != nil {
 						replyCh <- approved
@@ -298,11 +302,10 @@ func (e *Engine) turnEmit() protocol.EmitFunc {
 				toolName: evt.ToolName,
 				command:  evt.Command,
 				reason:   evt.Reason,
-			})
-			// Strip ReplyCh so subscribers cannot double-send.
-			evt.ReplyCh = nil
-			e.emitSessionStatus("awaiting_approval")
-			e.Emit(evt)
+			}) {
+				e.emitSessionStatus("awaiting_approval")
+				e.Emit(evt)
+			}
 			return
 		}
 		e.Emit(ev)
@@ -311,10 +314,13 @@ func (e *Engine) turnEmit() protocol.EmitFunc {
 	return notify.Wrap(emit, e.notifyCfg)
 }
 
-func (e *Engine) setPending(p pendingApproval) {
+// enqueuePending queues p and reports whether it is now the head (and so
+// should be shown to clients).
+func (e *Engine) enqueuePending(p pendingApproval) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.pending = &p
+	e.pending = append(e.pending, p)
+	return len(e.pending) == 1
 }
 
 func (e *Engine) emitSessionStatus(state string) {
@@ -488,24 +494,31 @@ func (e *Engine) Interrupt() {
 	}
 }
 
-// Approve consumes a pending permission request (first-wins). Emits ApprovalResolved.
+// Approve answers the head pending permission request (first-wins), emits
+// ApprovalResolved, then surfaces the next queued request, if any.
 func (e *Engine) Approve(ok bool, plan []byte) {
 	e.Touch()
 	e.mu.Lock()
-	pending := e.pending
-	e.pending = nil
-	e.mu.Unlock()
-	if pending == nil {
+	if len(e.pending) == 0 {
+		e.mu.Unlock()
 		return
 	}
-	pending.reply(ok, plan)
-	e.Emit(protocol.ApprovalResolved{Approved: ok})
-	if ok {
-		e.emitSessionStatus("busy")
-	} else {
-		// Denial still leaves the turn running until the executor finishes.
-		e.emitSessionStatus("busy")
+	head := e.pending[0]
+	e.pending = e.pending[1:]
+	var next *pendingApproval
+	if len(e.pending) > 0 {
+		next = &e.pending[0]
 	}
+	e.mu.Unlock()
+	head.reply(ok, plan)
+	e.Emit(protocol.ApprovalResolved{Approved: ok})
+	if next != nil {
+		e.emitSessionStatus("awaiting_approval")
+		e.Emit(next.ev)
+		return
+	}
+	// Denial still leaves the turn running until the executor finishes.
+	e.emitSessionStatus("busy")
 }
 
 // Steer enqueues blocks for the next LLM call (client.Engine).
@@ -540,7 +553,11 @@ func (e *Engine) Snapshot() protocol.EngineSnapshot {
 	e.stateMu.Unlock()
 
 	e.mu.Lock()
-	pending := e.pending
+	var pending *pendingApproval
+	if len(e.pending) > 0 {
+		p := e.pending[0]
+		pending = &p
+	}
 	e.mu.Unlock()
 	if pending != nil {
 		snap.PendingPermission = &protocol.PendingPermission{
@@ -593,9 +610,15 @@ func (e *Engine) trackState(inner func(protocol.Event)) func(protocol.Event) {
 			e.stateText = ""
 			e.stateTools = nil
 			e.stateMu.Unlock()
+			// Anything still queued belongs to a finished turn; deny so no
+			// executor goroutine is left waiting.
 			e.mu.Lock()
+			stale := e.pending
 			e.pending = nil
 			e.mu.Unlock()
+			for _, p := range stale {
+				p.reply(false, nil)
+			}
 			e.emitSessionStatus("idle")
 		}
 		inner(ev)
@@ -680,50 +703,7 @@ func (e *Engine) ListModels() ([]models.Entry, error) {
 // ListModelsForBaseDir is the session-independent model catalogue used by
 // both Engine (for the TUI) and daemon RPCs before a session exists.
 func ListModelsForBaseDir(baseDir string) ([]models.Entry, error) {
-	type result struct {
-		entries []models.Entry
-	}
-	ch := make(chan result, len(provider.All))
-	var wg sync.WaitGroup
-	for _, kp := range provider.All {
-		key := config.ResolveKeyFor(baseDir, kp.Name, kp.EnvVar)
-		if key == "" {
-			continue
-		}
-		wg.Add(1)
-		go func(kp provider.Known, key string) {
-			defer wg.Done()
-			var lister provider.Provider
-			if kp.Name == "anthropic" {
-				lister = anthropic.New(kp.BaseURL, key, anthropic.Config{})
-			} else {
-				lister = openai.New(kp.BaseURL, key)
-			}
-			ids, err := lister.ListModels(context.Background())
-			if err != nil {
-				return
-			}
-			entries := make([]models.Entry, len(ids))
-			for i, id := range ids {
-				entries[i] = models.Entry{Provider: kp.Name, ID: id}
-			}
-			ch <- result{entries: entries}
-		}(kp, key)
-	}
-	go func() { wg.Wait(); close(ch) }()
-
-	all := make([]models.Entry, 0)
-	for r := range ch {
-		all = append(all, r.entries...)
-	}
-	sort.Slice(all, func(i, j int) bool {
-		if all[i].Provider != all[j].Provider {
-			return all[i].Provider < all[j].Provider
-		}
-		return all[i].ID < all[j].ID
-	})
-
-	return all, nil
+	return stack.ListModels(context.Background(), baseDir), nil
 }
 
 // SwitchModel recreates the LLM provider on this engine's cfg copy.
@@ -732,35 +712,13 @@ func (e *Engine) SwitchModel(pName, pModel string) error {
 	if e.cfg == nil {
 		return fmt.Errorf("switch provider not configured")
 	}
-	oldProv := e.cfg.Provider
-	oldModel := e.cfg.Model
-
-	e.cfg.Provider = pName
-	if pModel != "" {
-		e.cfg.Model = pModel
-	}
-	if pName != oldProv {
-		e.cfg.BaseURL = ""
-	}
-	e.cfg.ResolveAPIKey()
-
-	prov, comp, err := NewProvider(e.cfg, e.noTools)
+	warn, err := stack.SwitchModel(e.cfg, e.lp, e.pb, e.prices, e.memStore, e.noTools, pName, pModel)
 	if err != nil {
-		e.cfg.Provider = oldProv
-		e.cfg.Model = oldModel
 		return err
 	}
-	e.lp.SetProvider(prov)
-	if comp != nil && e.cfg.Historian && e.memStore != nil {
-		hist, err := NewHistorian(e.cfg, e.memStore)
-		if err != nil {
-			e.Emit(protocol.Notice{Level: "warn", Text: "historian disabled: " + err.Error()})
-		} else {
-			comp.Historian = hist
-		}
+	if warn != nil {
+		e.Emit(protocol.Notice{Level: "warn", Text: warn.Error()})
 	}
-	e.lp.SetCompactor(comp)
-	e.pb.SetModel(e.cfg.Model)
 	e.providerName = e.cfg.Provider
 	e.modelName = e.cfg.Model
 	e.mu.Lock()
@@ -937,7 +895,7 @@ func (e *Engine) Close() {
 		e.wg.Wait()
 		close(e.evCh)
 		if e.ownStack != nil {
-			e.ownStack.forceClose()
+			e.ownStack.ForceClose()
 		} else if e.lp != nil {
 			e.lp.Close()
 		}

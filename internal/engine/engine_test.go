@@ -19,6 +19,7 @@ import (
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
+	"github.com/mintoleda/talos/internal/stack"
 	"github.com/mintoleda/talos/internal/testutil"
 	"github.com/mintoleda/talos/internal/tools"
 )
@@ -363,7 +364,7 @@ func TestEngineApprovePending(t *testing.T) {
 	defer eng.Close()
 
 	reply := make(chan bool, 1)
-	eng.setPending(pendingApproval{
+	eng.enqueuePending(pendingApproval{
 		reply: func(ok bool, _ []byte) {
 			reply <- ok
 		},
@@ -393,6 +394,45 @@ func TestEngineApprovePending(t *testing.T) {
 	snap = eng.Snapshot()
 	if snap.PendingPermission != nil {
 		t.Fatal("expected pending cleared")
+	}
+}
+
+// Parallel subagents can each wait on a prompt; a second request must queue
+// behind the first rather than orphan it.
+func TestEngineApproveQueuesConcurrentRequests(t *testing.T) {
+	eng := engineHarness(t)
+	defer eng.Close()
+
+	var shown []string
+	cancel := eng.Subscribe(func(ev protocol.Event) {
+		if pr, ok := ev.(protocol.PermissionRequested); ok {
+			shown = append(shown, pr.Command)
+		}
+	})
+	defer cancel()
+
+	emit := eng.turnEmit()
+	r1, r2 := make(chan bool, 1), make(chan bool, 1)
+	emit(protocol.PermissionRequested{ToolName: "bash", Command: "one", ReplyCh: r1})
+	emit(protocol.PermissionRequested{ToolName: "bash", Command: "two", ReplyCh: r2})
+	if len(shown) != 1 || shown[0] != "one" {
+		t.Fatalf("shown = %v, want only the head", shown)
+	}
+
+	eng.Approve(true, nil)
+	if ok := <-r1; !ok {
+		t.Fatal("first request: want approved")
+	}
+	if len(shown) != 2 || shown[1] != "two" {
+		t.Fatalf("shown = %v, want second request surfaced", shown)
+	}
+	if snap := eng.Snapshot(); snap.PendingPermission == nil || snap.PendingPermission.Command != "two" {
+		t.Fatalf("snapshot pending = %+v", snap.PendingPermission)
+	}
+
+	eng.Approve(false, nil)
+	if ok := <-r2; ok {
+		t.Fatal("second request: want denied")
 	}
 }
 
@@ -589,7 +629,7 @@ func TestBgRPCs(t *testing.T) {
 	}
 
 	reg := tools.DefaultRegistry(tmpDir, tools.NewReadSet(), tools.BashConfig{}, "")
-	built := &Built{Registry: reg, Dir: tmpDir}
+	built := &stack.Built{Registry: reg, Dir: tmpDir}
 	eng := NewEngine(Params{
 		Loop:          lp,
 		PromptBuilder: pb,

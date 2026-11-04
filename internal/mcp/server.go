@@ -22,15 +22,9 @@ func Connect(ctx context.Context, cfg ServerConfig) (*ServerConn, error) {
 		return nil, fmt.Errorf("mcp server %q: must set command or url", cfg.Name)
 	}
 
-	var transport Transport
-	var err error
-	if cfg.URL != "" {
-		transport = newSSETransport(cfg.URL)
-	} else {
-		transport, err = newStdioTransport(cfg.Name, cfg.Command, cfg.Args, cfg.Env)
-		if err != nil {
-			return nil, fmt.Errorf("mcp server %q: stdio: %w", cfg.Name, err)
-		}
+	transport, err := newTransport(cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	s := &ServerConn{
@@ -50,7 +44,21 @@ func Connect(ctx context.Context, cfg ServerConfig) (*ServerConn, error) {
 		transport.Close()
 		return nil, fmt.Errorf("mcp server %q: initialize: %w", cfg.Name, err)
 	}
-	_ = initResult
+
+	// Streamable HTTP servers expect the negotiated version on later requests
+	// and an initialized notification. Other transports don't implement these.
+	if vt, ok := transport.(interface{ setProtocolVersion(string) }); ok {
+		var ir initializeResult
+		if json.Unmarshal(initResult, &ir) == nil && ir.ProtocolVersion != "" {
+			vt.setProtocolVersion(ir.ProtocolVersion)
+		}
+	}
+	if n, ok := transport.(notifier); ok {
+		if err := n.Notify(ctx, "notifications/initialized", nil); err != nil {
+			transport.Close()
+			return nil, fmt.Errorf("mcp server %q: initialized notification: %w", cfg.Name, err)
+		}
+	}
 
 	var ltr listToolsResult
 	if err := s.call(ctx, "tools/list", nil, &ltr); err != nil {
@@ -62,7 +70,23 @@ func Connect(ctx context.Context, cfg ServerConfig) (*ServerConn, error) {
 	return s, nil
 }
 
-func (s *ServerConn) Name() string    { return s.name }
+// newTransport picks a transport from cfg (already validated: exactly one of
+// Command/URL is set).
+func newTransport(cfg ServerConfig) (Transport, error) {
+	if cfg.Command != "" {
+		t, err := newStdioTransport(cfg.Name, cfg.Command, cfg.Args, cfg.Env)
+		if err != nil {
+			return nil, fmt.Errorf("mcp server %q: stdio: %w", cfg.Name, err)
+		}
+		return t, nil
+	}
+	if cfg.Transport == "sse" {
+		return newSSETransport(cfg.URL), nil
+	}
+	return newHTTPTransport(cfg.URL, cfg.Headers), nil
+}
+
+func (s *ServerConn) Name() string     { return s.name }
 func (s *ServerConn) Tools() []MCPTool { return s.tools }
 
 func (s *ServerConn) CallTool(ctx context.Context, name string, args map[string]any) (callToolResult, error) {

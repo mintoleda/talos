@@ -49,10 +49,12 @@ type TurnEnded struct {
 // confirmation. The handler must send exactly one value to ReplyCh: true to
 // allow, false to deny. The channel is owned by whoever creates the event.
 type PermissionRequested struct {
-	ToolName string      `json:"tool_name"`
-	Command  string      `json:"command"`
-	Reason   string      `json:"reason"`
-	ReplyCh  chan<- bool `json:"-"`
+	ToolUseID string         `json:"tool_use_id,omitempty"`
+	ToolName  string         `json:"tool_name"`
+	Args      map[string]any `json:"args,omitempty"`
+	Command   string         `json:"command"`
+	Reason    string         `json:"reason"`
+	ReplyCh   chan<- bool    `json:"-"`
 }
 
 // SubagentStarted is emitted when the primary agent (or a subagent) spawns a

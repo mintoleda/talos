@@ -16,6 +16,7 @@ import (
 	"github.com/mintoleda/talos/internal/loop"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/session"
+	"github.com/mintoleda/talos/internal/stack"
 	"github.com/mintoleda/talos/internal/testutil"
 )
 
@@ -35,7 +36,7 @@ func testManager(t *testing.T) (*SessionManager, string) {
 	m := NewSessionManager(cfg)
 
 	var seq int
-	m.buildFn = func(_ context.Context, o engine.BuildOpts) (*engine.Built, error) {
+	m.buildFn = func(_ context.Context, o stack.BuildOpts) (*stack.Built, error) {
 		seq++
 		id := o.SessionID
 		if id == "" {
@@ -57,7 +58,7 @@ func testManager(t *testing.T) (*SessionManager, string) {
 				return nil, err
 			}
 		}
-		return &engine.Built{
+		return &stack.Built{
 			Cfg: &config.Config{
 				BaseDir:  cfg.BaseDir,
 				Provider: firstNonEmpty(o.Provider, cfg.Provider),
@@ -68,7 +69,7 @@ func testManager(t *testing.T) (*SessionManager, string) {
 			Session:    session.Session{ID: id, ProjectID: pid, Path: txPath},
 		}, nil
 	}
-	m.newEng = func(b *engine.Built, ctx context.Context) *engine.Engine {
+	m.newEng = func(b *stack.Built, ctx context.Context) *engine.Engine {
 		tx := testutil.NewTestTranscript(t)
 		prov := &testutil.FakeProvider{}
 		exec := &testutil.FakeExecutor{}

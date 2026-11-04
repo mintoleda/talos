@@ -52,3 +52,78 @@ func TestExecutorRoutesToEmittingTool(t *testing.T) {
 		t.Errorf("forwarded event = %+v", got[0])
 	}
 }
+
+type fakeBash struct{ ran bool }
+
+func (f *fakeBash) Name() string            { return "bash" }
+func (f *fakeBash) Description() string     { return "test" }
+func (f *fakeBash) Schema() json.RawMessage { return tools.EmptySchema() }
+func (f *fakeBash) Execute(ctx context.Context, args map[string]any) (protocol.ToolResult, error) {
+	f.ran = true
+	return protocol.ToolResult{Content: "ran"}, nil
+}
+
+// Frontends (TUI dialog, daemon clients, ACP) answer permission prompts
+// asynchronously; the executor must wait for the reply rather than deny.
+func TestExecutorWaitsForAsyncApproval(t *testing.T) {
+	for _, approve := range []bool{true, false} {
+		reg := tools.EmptyRegistry()
+		fb := &fakeBash{}
+		reg.Add(fb)
+		pol := safety.NewPolicy(safety.ModeAsk, ".", safety.NewClassifier(), true)
+		e := New(reg, pol)
+
+		var req protocol.PermissionRequested
+		emit := func(ev protocol.Event) {
+			if pr, ok := ev.(protocol.PermissionRequested); ok {
+				req = pr
+				go func() { pr.ReplyCh <- approve }()
+			}
+		}
+		tu := protocol.ToolUse{ID: "t1", Name: "bash", Args: map[string]any{"command": "sudo true"}}
+		res := e.Run(context.Background(), tu, emit)
+		if req.ToolUseID != "t1" || req.Command != "sudo true" {
+			t.Fatalf("request = %+v", req)
+		}
+		if fb.ran != approve || res.IsError == approve {
+			t.Errorf("approve=%v: ran=%v res=%+v", approve, fb.ran, res)
+		}
+	}
+}
+
+func TestExecutorPromptCancelled(t *testing.T) {
+	reg := tools.EmptyRegistry()
+	reg.Add(&fakeBash{})
+	e := New(reg, safety.NewPolicy(safety.ModeAsk, ".", safety.NewClassifier(), true))
+	ctx, cancel := context.WithCancel(context.Background())
+	emit := func(ev protocol.Event) {
+		if _, ok := ev.(protocol.PermissionRequested); ok {
+			cancel()
+		}
+	}
+	res := e.Run(ctx, protocol.ToolUse{ID: "t1", Name: "bash", Args: map[string]any{"command": "sudo true"}}, emit)
+	if !res.IsError {
+		t.Fatalf("want cancelled error, got %+v", res)
+	}
+}
+
+// Relative paths resolve against the session's workdir, not the process cwd
+// (they differ under ACP and the multi-session daemon).
+func TestResolvePathsAgainstWorkDir(t *testing.T) {
+	args := map[string]any{"path": "sub/file.go", "content": "x"}
+	got := resolvePaths(protocol.ToolUse{Name: "write", Args: args}, "/work")
+	if got.Args["path"] != "/work/sub/file.go" {
+		t.Errorf("path = %v", got.Args["path"])
+	}
+	if args["path"] != "sub/file.go" {
+		t.Error("caller's args were mutated")
+	}
+	for _, tu := range []protocol.ToolUse{
+		{Name: "write", Args: map[string]any{"path": "/abs/f"}},
+		{Name: "bash", Args: map[string]any{"path": "rel"}},
+	} {
+		if got := resolvePaths(tu, "/work"); got.Args["path"] != tu.Args["path"] {
+			t.Errorf("%s: path rewritten to %v", tu.Name, got.Args["path"])
+		}
+	}
+}

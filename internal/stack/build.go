@@ -1,4 +1,4 @@
-package engine
+package stack
 
 import (
 	"context"
@@ -35,6 +35,10 @@ type BuildOpts struct {
 	Model      string // per-session override
 	PrintMode  bool   // f.Print != "" — affects Policy interactive flag
 	DebugCache bool
+
+	// MCPServers are connected in addition to cfg.MCPServers. ACP clients
+	// pass per-session servers (e.g. Paseo's platform tools) here.
+	MCPServers []mcp.ServerConfig
 }
 
 // Built is the assembled stack for one session.
@@ -59,7 +63,8 @@ type Built struct {
 	Reads           *tools.ReadSet
 	SubagentListing string
 
-	// transferred is set when NewEngine takes ownership; Close becomes a no-op.
+	// transferred is set when an owner (engine.FromBuilt) takes over; Close
+	// becomes a no-op.
 	transferred bool
 }
 
@@ -75,7 +80,10 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 
 	cfgCopy := *o.Cfg
 	cfg := &cfgCopy
-	if o.Provider != "" {
+	if o.Provider != "" && o.Provider != cfg.Provider {
+		// A configured base URL belongs to the configured provider; keep it
+		// and its key away from a different one (matches SwitchModel).
+		cfg.BaseURL = ""
 		cfg.OverrideProvider(o.Provider)
 	}
 	if o.Model != "" {
@@ -201,7 +209,11 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 	}
 	reads.SetSavePath(sess.Path + ".reads.json")
 
-	mcpManager, mcpErrs := mcp.NewManager(ctx, cfg.MCPServers)
+	mcpServers := cfg.MCPServers
+	if len(o.MCPServers) > 0 {
+		mcpServers = append(append([]mcp.ServerConfig(nil), cfg.MCPServers...), o.MCPServers...)
+	}
+	mcpManager, mcpErrs := mcp.NewManager(ctx, mcpServers)
 	for _, e := range mcpErrs {
 		fmt.Fprintf(os.Stderr, "[mcp] %v\n", e)
 	}
@@ -349,15 +361,19 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 }
 
 // Close releases transcript, loop, MCP, and registry resources.
-// No-op after NewEngine transfers ownership to Engine.Close.
+// No-op after MarkTransferred; the new owner calls ForceClose instead.
 func (b *Built) Close() {
 	if b == nil || b.transferred {
 		return
 	}
-	b.forceClose()
+	b.ForceClose()
 }
 
-func (b *Built) forceClose() {
+// MarkTransferred records that another owner now closes this stack.
+func (b *Built) MarkTransferred() { b.transferred = true }
+
+// ForceClose releases resources regardless of ownership transfer.
+func (b *Built) ForceClose() {
 	if b == nil {
 		return
 	}
