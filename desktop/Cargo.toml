@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/paseo-domain",
+    "crates/paseo-acp",
+    "crates/paseo-store",
+    "crates/paseo-core",
+    "crates/paseo-ipc",
+    "apps/paseod",
+    "apps/paseo",
+    "apps/paseo-cli",
+    "crates/paseo-migrate",
+    "apps/paseo-migrate",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "UNLICENSED"
+repository = "https://github.com/mintoleda/talos"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+bytes = "1.10"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+directories = "6.0"
+eframe = { version = "0.37", features = ["wgpu", "wayland", "x11", "persistence"] }
+egui = "0.37"
+egui_animation = "0.14"
+egui_commonmark = "0.26"
+egui_extras = { version = "0.37", features = ["all_loaders", "image", "svg"] }
+egui-lucide = "0.2"
+futures = "0.3"
+interprocess = { version = "2.4", features = ["tokio"] }
+parking_lot = "0.12"
+rand = "0.9"
+rusqlite = { version = "0.41", features = ["bundled", "chrono", "uuid"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1.18", features = ["v4", "v7", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

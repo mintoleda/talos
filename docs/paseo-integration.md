@@ -1,5 +1,11 @@
 # Paseo + Talos direction
 
+> **Monorepo update.** The Paseo interface layer is now the Rust workspace in
+> [`desktop/`](../desktop/README.md) inside this repository, not a separate
+> product. In this document "Paseo" means that desktop (egui app `paseo`, daemon
+> `paseod`, CLI `paseoctl`); the installed JavaScript Paseo remains a supported
+> ACP client but is no longer the target. See [Monorepo layout](#monorepo-layout).
+
 ## The actual goal
 
 The goal is not to replace Paseo's multi-harness support or turn Talos into another full desktop coding product.
@@ -18,6 +24,40 @@ Paseo
 - Other complete harnesses remain available only where they provide something Talos cannot obtain directly, especially subscription-backed usage.
 
 This preserves what is valuable about Paseo—session management, multiple agents, remote control, browser/voice/platform features, and the ability to connect other harnesses—without requiring Pi, Claude Code, Codex, and Talos to all be equal parts of the normal workflow.
+
+## Monorepo layout
+
+```text
+talos/
+├── cmd/talos/        Go CLI: TUI, `serve`, `attach`, `acp`
+├── internal/         Go runtime: loop, providers, tools, safety, sessions, MCP
+│   ├── acp/          ACP v1 server used by the desktop
+│   └── stack/        runtime constructor shared by TUI, daemon and ACP
+├── app/              Electron app (legacy; to be replaced by desktop/)
+├── desktop/          Rust workspace: egui app, paseod, paseoctl, store, ACP client
+├── docs/
+└── Makefile          `talos`, `app*`, `desktop*` targets
+```
+
+The only interface between the two languages is the `talos acp` process
+boundary: the Rust daemon spawns the Go binary and speaks ACP over stdio. There
+is no FFI, shared database or shared session store. Consequences:
+
+- Talos owns the model transcript under its own home (`~/.talos` or
+  `TALOS_HOME`); the desktop owns the UI timeline in its SQLite store under
+  `~/.paseo-rs`.
+- Runtime behavior is fixed once, in Go. The Rust side must not reimplement
+  loop, tool, compaction or safety logic.
+- Changes to the ACP surface land in `internal/acp` and
+  `desktop/crates/paseo-acp` together, with tests on both sides
+  (`go test ./internal/acp/...`, the `acp-fixture` process tests and
+  `desktop/scripts/paseo-smoke.py`).
+- CI (`.github/workflows/ci.yml`) runs the Go build/vet/test job and the desktop
+  backend acceptance job on every push; full-workspace desktop UI gates are
+  non-blocking until `desktop/docs/STATUS.md` closes them.
+
+`talos serve` and the Electron app keep working unchanged while the desktop
+reaches parity; they are not used by the desktop.
 
 ## Why
 
@@ -82,7 +122,7 @@ The Paseo-oriented Talos runtime is more than `internal/loop`. A reliable runtim
 Once Paseo integration is working, the slim Talos branch does not need its own:
 
 - Bubble Tea TUI
-- Electron application
+- Electron application (superseded by `desktop/`)
 - Project rail
 - Attach client
 - User-facing multi-session daemon
@@ -163,6 +203,8 @@ Preserve the current standalone application and create a slim integration branch
 - `talos-full`: current standalone Talos, including TUI, Electron app, daemon, and worktree/merge UX.
 - `talos`: headless primary runtime intended to sit beneath Paseo.
 
+The Rust desktop is developed on the `talos` branch under `desktop/`.
+
 Do not delete UI code before the headless path works. First add `talos acp`, connect it to Paseo, and verify sessions, tools, permissions, cancellation, compaction, and resume. Then remove redundant product layers from the `talos` branch.
 
 Avoid maintaining two independent copies of the agent loop. Runtime fixes should have one clear source of truth.
@@ -226,9 +268,31 @@ The runtime constructor now lives in `internal/stack` (`stack.Build`, `stack.Swi
 
 Paseo's platform tools arrive through `mcpServers` on `session/new`/`session/load` as a streamable-HTTP server with a bearer header; `internal/mcp/http.go` supports that transport. Permission prompts are now answered asynchronously by the frontend (`internal/executor`) instead of failing closed when no reply is immediately available; the engine queues concurrent prompts from parallel subagents. Relative `path` arguments to `read`/`write`/`edit`/`ls` resolve against the session cwd rather than the process cwd, which matters because Paseo spawns Talos from the daemon's directory.
 
-### Paseo registration
+### Desktop registration
 
-Add to `~/.paseo/config.json` under `agents.providers`, then `paseo reload`:
+The Rust desktop registers Talos by default as `talos acp` from `PATH`. To use a
+local build, set the provider command in `~/.paseo-rs/config.toml`:
+
+```toml
+[[providers]]
+id = "talos"
+display_name = "Talos"
+kind = "acp"
+enabled = true
+command = "/home/<you>/repos/talos/talos"
+args = ["acp"]
+
+[providers.env]
+# Optional; defaults to ~/.talos
+# TALOS_HOME = "/home/<you>/.talos"
+```
+
+Provider environment is injected into the spawned process and redacted from
+daemon diagnostics. See `desktop/apps/paseo-cli/README.md` for the full schema.
+
+### Legacy Paseo registration
+
+For the installed JavaScript Paseo, add to `~/.paseo/config.json` under `agents.providers`, then `paseo reload`:
 
 ```json
 "talos": {
