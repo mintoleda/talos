@@ -8,7 +8,7 @@ pointing inside the temporary root, and cleanup runs even after a failed check.
 
 Prerequisites (no cargo invocation happens here):
 
-    cargo build -p talosd -p talosdctl -p paseo-acp --bins
+    cargo build -p talosd -p talosdctl -p talos-acp --bins
     python3 scripts/talosd-smoke.py --verbose
 
 Binary paths can be overridden with ``TALOSD_SMOKE_DAEMON_BIN``,
@@ -100,7 +100,7 @@ class Harness:
         if not path.is_file():
             raise SmokeFailure(
                 f"missing {name} binary at {path}; build it first with:\n"
-                "  cargo build -p talosd -p talosdctl -p paseo-acp --bins\n"
+                "  cargo build -p talosd -p talosdctl -p talos-acp --bins\n"
                 f"or set {env_name}"
             )
         return path

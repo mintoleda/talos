@@ -1,4 +1,4 @@
-//! Provider-neutral Paseo domain types and validated lifecycle transitions.
+//! Provider-neutral Talos desktop domain types and validated lifecycle transitions.
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Utc};

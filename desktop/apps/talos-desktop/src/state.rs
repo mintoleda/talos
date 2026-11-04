@@ -254,7 +254,7 @@ impl ViewModel {
     // -- event application ---------------------------------------------------
 
     /// Apply one durable timeline event, coalescing streamed deltas.
-    pub fn apply_event(&mut self, event: &paseo_ipc::EventNotification) {
+    pub fn apply_event(&mut self, event: &talos_ipc::EventNotification) {
         let payload = &event.event.payload;
         let Some(session_id) = payload.get("session_id").and_then(Value::as_str) else {
             return;
@@ -1006,8 +1006,8 @@ pub fn draft_lines(text: &str, width: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paseo_ipc::{EventNotification, WireEvent};
     use serde_json::json;
+    use talos_ipc::{EventNotification, WireEvent};
 
     fn event(id: &str, run: &str, kind: Value) -> EventNotification {
         EventNotification {

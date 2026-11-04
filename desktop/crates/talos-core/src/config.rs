@@ -1,12 +1,12 @@
-//! Typed configuration and paths for the Rust-owned Paseo home.
+//! Typed configuration and paths for the talosd home.
 
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
 };
 
-use paseo_domain::ProviderId;
 use serde::{Deserialize, Serialize};
+use talos_domain::ProviderId;
 use thiserror::Error;
 
 const CONFIG_VERSION: u32 = 1;

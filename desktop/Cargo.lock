@@ -2910,69 +2910,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73072a9470554c8e794778acece2312661218aaabb635600957d952cf01c716e"
 
 [[package]]
-name = "paseo-acp"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "paseo-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "directories",
- "paseo-acp",
- "paseo-domain",
- "paseo-store",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "paseo-domain"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "uuid",
-]
-
-[[package]]
-name = "paseo-ipc"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
-]
-
-[[package]]
 name = "paseo-migrate"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "paseo-domain",
- "paseo-store",
  "serde",
  "serde_json",
  "sha2",
+ "talos-domain",
+ "talos-store",
  "tempfile",
  "thiserror 2.0.21",
  "uuid",
@@ -2986,20 +2932,6 @@ dependencies = [
  "directories",
  "paseo-migrate",
  "serde_json",
-]
-
-[[package]]
-name = "paseo-store"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "paseo-domain",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "uuid",
 ]
 
 [[package]]
@@ -4045,6 +3977,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-acp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "talos-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "directories",
+ "serde",
+ "serde_json",
+ "sha2",
+ "talos-acp",
+ "talos-domain",
+ "talos-store",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "talos-desktop"
 version = "0.1.0"
 dependencies = [
@@ -4054,9 +4019,44 @@ dependencies = [
  "egui",
  "egui_commonmark",
  "egui_extras",
- "paseo-ipc",
  "serde_json",
+ "talos-ipc",
  "tokio",
+]
+
+[[package]]
+name = "talos-domain"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "talos-ipc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "talos-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "talos-domain",
+ "tempfile",
+ "thiserror 2.0.21",
+ "uuid",
 ]
 
 [[package]]
@@ -4066,12 +4066,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "directories",
- "paseo-acp",
- "paseo-core",
- "paseo-domain",
- "paseo-ipc",
  "serde",
  "serde_json",
+ "talos-acp",
+ "talos-core",
+ "talos-domain",
+ "talos-ipc",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -4086,8 +4086,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "paseo-ipc",
  "serde_json",
+ "talos-ipc",
  "tokio",
 ]
 

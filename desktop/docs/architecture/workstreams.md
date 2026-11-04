@@ -29,11 +29,11 @@ full workspace checks remain mandatory before release.
 
 ## Architecture contract
 
-- `paseo-domain` — provider-neutral IDs, lifecycle, timeline events, permissions.
-- `paseo-acp` — ACP stdio client for Talos and Claude Code.
-- `paseo-store` — SQLite persistence and migrations.
-- `paseo-core` — provider registry, agent/session orchestration, configuration.
-- `paseo-ipc` — versioned newline-JSON IPC between daemon and clients.
+- `talos-domain` — provider-neutral IDs, lifecycle, timeline events, permissions.
+- `talos-acp` — ACP stdio client for Talos and Claude Code.
+- `talos-store` — SQLite persistence and migrations.
+- `talos-core` — provider registry, agent/session orchestration, configuration.
+- `talos-ipc` — versioned newline-JSON IPC between daemon and clients.
 - `apps/talosd` — daemon.
 - `apps/talosdctl` (`talosdctl`) — operator CLI.
 - `apps/talos-desktop` — egui desktop client.
@@ -44,7 +44,7 @@ provider and never silently replaces the provider that owns an existing session.
 
 ## Workstream A — daemon, IPC, CLI (P0–P2)
 
-Owner files: `crates/paseo-ipc/**`, `crates/paseo-core/**`, `apps/talosd/**`,
+Owner files: `crates/talos-ipc/**`, `crates/talos-core/**`, `apps/talosd/**`,
 `apps/talosdctl/**`, `docs/architecture/*.md` (IPC sections only).
 
 Deliverables:
@@ -116,12 +116,12 @@ These packages were missing from the original desktop-heavy owner map. Assign a
 named owner before concurrent implementation; do not let multiple streams edit
 them implicitly.
 
-- **Domain/storage:** `crates/paseo-domain/**`, `crates/paseo-store/**` — durable
+- **Domain/storage:** `crates/talos-domain/**`, `crates/talos-store/**` — durable
   lifecycle/recovery, project/workspace metadata, attachment references and
   transaction/replay integrity. Coordinate public type changes with A.
-- **Providers:** `crates/paseo-acp/**` — Talos/Claude Code transport and process
+- **Providers:** `crates/talos-acp/**` — Talos/Claude Code transport and process
   supervision, capabilities, live-provider smoke tests and native resume.
-  Provider integration in `crates/paseo-core/**` remains owned by A.
+  Provider integration in `crates/talos-core/**` remains owned by A.
 - **Migration:** `crates/paseo-migrate/**`, `apps/paseo-migrate/**` — path safety,
   dry-run/backup, recoverable import and source-preservation fixtures; coordinate
   storage API changes with the domain/storage owner.

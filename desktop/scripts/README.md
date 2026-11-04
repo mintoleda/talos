@@ -10,7 +10,7 @@ provider home.
 The script never invokes cargo. Build the binaries first:
 
 ```sh
-cargo build -p talosd -p talosdctl -p paseo-acp --bins
+cargo build -p talosd -p talosdctl -p talos-acp --bins
 python3 scripts/talosd-smoke.py --verbose --timeout 300
 ```
 

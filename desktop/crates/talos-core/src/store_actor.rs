@@ -6,7 +6,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use paseo_store::{Result as StoreResult, SqliteStore};
+use talos_store::{Result as StoreResult, SqliteStore};
 use tokio::sync::{mpsc, oneshot};
 
 const STORE_QUEUE_CAPACITY: usize = 128;

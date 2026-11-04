@@ -1,11 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/paseo-domain",
-    "crates/paseo-acp",
-    "crates/paseo-store",
-    "crates/paseo-core",
-    "crates/paseo-ipc",
+    "crates/talos-domain",
+    "crates/talos-acp",
+    "crates/talos-store",
+    "crates/talos-core",
+    "crates/talos-ipc",
     "apps/talosd",
     "apps/talos-desktop",
     "apps/talosdctl",

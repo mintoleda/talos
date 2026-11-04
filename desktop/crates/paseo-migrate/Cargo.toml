@@ -7,8 +7,8 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
-paseo-domain = { path = "../paseo-domain" }
-paseo-store = { path = "../paseo-store" }
+talos-domain = { path = "../talos-domain" }
+talos-store = { path = "../talos-store" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

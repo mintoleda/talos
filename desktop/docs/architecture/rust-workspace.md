@@ -31,17 +31,17 @@ Start as a Cargo workspace with these crates (some can begin as modules if the w
 
 | Crate | Responsibility | Must not depend on |
 |---|---|---|
-| `paseo-domain` | IDs, value types, state machines, domain events, validation, provider-neutral concepts | Tokio, database, UI, concrete providers |
-| `paseo-application` | Use cases/commands, authorization decisions, orchestration ports, transaction boundaries | UI toolkit, concrete database/transport/provider |
-| `paseo-store` | SQLite repositories, migrations, transaction/outbox implementation, legacy import readers | UI, provider SDKs |
-| `paseo-providers` | Provider registry and native/API adapters behind application ports | UI, direct database access |
-| `paseo-acp` | ACP JSON-RPC transport/session implementation over child-process stdio | Application policy, UI |
-| `paseo-process` | Child-process supervision, terminal/workspace process lifecycle, OS-specific process handling | Domain policy, UI |
-| `paseo-ipc` | Versioned daemon-client protocol, framing, local socket setup/authentication | Provider implementations, UI toolkit |
-| `paseo-daemon` | Composition root, Tokio runtime, IPC server, workers, shutdown | UI toolkit |
-| `paseo-ui` | Desktop shell, view state, IPC client, rendering/input | Store and provider implementations |
+| `talos-domain` | IDs, value types, state machines, domain events, validation, provider-neutral concepts | Tokio, database, UI, concrete providers |
+| `talos-application` | Use cases/commands, authorization decisions, orchestration ports, transaction boundaries | UI toolkit, concrete database/transport/provider |
+| `talos-store` | SQLite repositories, migrations, transaction/outbox implementation, legacy import readers | UI, provider SDKs |
+| `talos-providers` | Provider registry and native/API adapters behind application ports | UI, direct database access |
+| `talos-acp` | ACP JSON-RPC transport/session implementation over child-process stdio | Application policy, UI |
+| `talos-process` | Child-process supervision, terminal/workspace process lifecycle, OS-specific process handling | Domain policy, UI |
+| `talos-ipc` | Versioned daemon-client protocol, framing, local socket setup/authentication | Provider implementations, UI toolkit |
+| `talosd` | Composition root, Tokio runtime, IPC server, workers, shutdown | UI toolkit |
+| `talos-desktop` | Desktop shell, view state, IPC client, rendering/input | Store and provider implementations |
 | `talosdctl` | Headless client commands, diagnostics, import/export | Store internals (all mutations through daemon) |
-| `paseo-test-support` | Fake ports, fixtures, deterministic clocks/process harnesses | Production dependency graph |
+| `talos-test-support` | Fake ports, fixtures, deterministic clocks/process harnesses | Production dependency graph |
 
 Dependency direction: `domain <- application <- daemon`; `store`, `providers`, `acp`, `process`, and `ipc` implement/use ports at the edge. `ui` and `cli` speak only the public IPC protocol. Avoid a giant `common` crate and avoid passing database rows or provider SDK types into domain/UI code. Keep feature flags at edge crates, not as pervasive conditional compilation in the domain.
 
@@ -72,7 +72,7 @@ Use a transactional outbox (or atomically committed event rows) so state changes
 
 ## Persistence and migrations
 
-Use **SQLite** as the initial local store: it is embedded, portable, transactional, and fits a single-user daemon without another service. Use WAL mode, foreign keys, a busy timeout, and explicit transaction boundaries. Choose one async strategy and keep it behind `paseo-store`: `sqlx` with compile-time/runtime checked queries is suitable if its SQLite features are validated on supported targets; alternatively use `rusqlite` on a dedicated bounded blocking writer/connection pool if operational simplicity is preferred. Do not mix ad hoc database access across crates. Benchmark realistic event volume and retain bounded/rotatable logs and output blobs; large attachments should live as files addressed by metadata rows rather than huge SQLite blobs by default.
+Use **SQLite** as the initial local store: it is embedded, portable, transactional, and fits a single-user daemon without another service. Use WAL mode, foreign keys, a busy timeout, and explicit transaction boundaries. Choose one async strategy and keep it behind `talos-store`: `sqlx` with compile-time/runtime checked queries is suitable if its SQLite features are validated on supported targets; alternatively use `rusqlite` on a dedicated bounded blocking writer/connection pool if operational simplicity is preferred. Do not mix ad hoc database access across crates. Benchmark realistic event volume and retain bounded/rotatable logs and output blobs; large attachments should live as files addressed by metadata rows rather than huge SQLite blobs by default.
 
 Keep ordered SQL migration files embedded in the binary, each with a schema version/checksum. Migrations must be transactional when SQLite permits; for non-transactional steps, use a staged/restart-safe procedure. At startup: acquire a single-instance lock, make a verified backup before destructive migrations, migrate, then verify schema/integrity. Test upgrades from every released schema fixture, not just a fresh database. Separate durable core state from rebuildable caches and indexes.
 
@@ -91,7 +91,7 @@ Define an async object-safe application port, for example `Provider::capabilitie
 Provide two adapter families:
 
 1. **Native/API adapters** for providers that benefit from direct APIs or require Paseo-native lifecycle/permission semantics.
-2. **ACP adapters** for compatible external agent executables. Keep ACP protocol framing, JSON-RPC request correlation, initialization/capability negotiation, session setup, prompt streaming, cancellation, and stderr handling inside `paseo-acp`. Spawn with explicit executable/args/environment/cwd, pipe stdin/stdout separately from stderr, enforce startup/idle/shutdown timeouts, bound message sizes, validate JSON-RPC IDs, and treat malformed/unknown messages as protocol errors with diagnostics. Never parse human-readable stdout as a control protocol. Stop the child process tree on cancellation/shutdown, with graceful ACP cancellation followed by a bounded grace period and forced termination. Keep compatibility shims for protocol/version quirks in adapters, not application use cases.
+2. **ACP adapters** for compatible external agent executables. Keep ACP protocol framing, JSON-RPC request correlation, initialization/capability negotiation, session setup, prompt streaming, cancellation, and stderr handling inside `talos-acp`. Spawn with explicit executable/args/environment/cwd, pipe stdin/stdout separately from stderr, enforce startup/idle/shutdown timeouts, bound message sizes, validate JSON-RPC IDs, and treat malformed/unknown messages as protocol errors with diagnostics. Never parse human-readable stdout as a control protocol. Stop the child process tree on cancellation/shutdown, with graceful ACP cancellation followed by a bounded grace period and forced termination. Keep compatibility shims for protocol/version quirks in adapters, not application use cases.
 
 Provider availability is runtime discovery, not a compile-time guarantee. A missing binary, invalid credentials, or unsupported capability should be represented as a structured unavailable/degraded status. Provider implementation selection and aliases belong in a registry/config migration layer, not in domain logic.
 

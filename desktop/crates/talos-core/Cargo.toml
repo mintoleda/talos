@@ -1,5 +1,5 @@
 [package]
-name = "paseo-core"
+name = "talos-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,9 +9,9 @@ license.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 directories.workspace = true
-paseo-acp = { path = "../paseo-acp" }
-paseo-domain = { path = "../paseo-domain" }
-paseo-store = { path = "../paseo-store" }
+talos-acp = { path = "../talos-acp" }
+talos-domain = { path = "../talos-domain" }
+talos-store = { path = "../talos-store" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

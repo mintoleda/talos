@@ -116,7 +116,7 @@ Before the follow-up DeepSeek work:
 | `cargo fmt --all -- --check` | Pass |
 | `cargo test --workspace --exclude talos-desktop --locked` | 69 passed; 0 failed; 1 opt-in smoke wrapper ignored |
 | `cargo clippy --workspace --all-targets --exclude talos-desktop --locked -- -D warnings` | Pass |
-| `cargo build --locked -p talosd -p talosdctl -p paseo-acp --bins` | Pass |
+| `cargo build --locked -p talosd -p talosdctl -p talos-acp --bins` | Pass |
 | `python3 scripts/talosd-smoke.py --verbose --timeout 90` | Entire initial process suite passed; tail delivered 88 unique events across two sessions at one-event page size |
 | `cargo test -p talosdctl --test daemon_smoke -- --ignored --nocapture` | Opt-in wrapper passed the entire process suite |
 | Forced Python `--timeout 1 --keep` using frozen binaries | Expected failure; all five traced fixture children gone after cleanup; retained debug home explicitly removed |
@@ -130,10 +130,10 @@ Follow-up keyed prompt/tool coverage and migration preflight must be verified ag
 
 | Area | Status / evidence | Remaining acceptance |
 |---|---|---|
-| Domain and SQLite | Fixture-verified foundation: `crates/paseo-domain`, `crates/paseo-store`; store tests `persistence_survives_reopen_and_replay_cursor`, `migrations_are_idempotent_and_events_ordered` | Crash/restart recovery across the complete daemon/provider stack |
-| Talos / Claude Code ACP | Fixture-verified transport: `crates/paseo-acp/tests/process.rs` covers streaming, permission RPC, cancellation, load replay, malformed/large frames, process exit and redaction | Authenticated live Talos and Claude Code workflows plus provider-native resume after daemon restart |
+| Domain and SQLite | Fixture-verified foundation: `crates/talos-domain`, `crates/talos-store`; store tests `persistence_survives_reopen_and_replay_cursor`, `migrations_are_idempotent_and_events_ordered` | Crash/restart recovery across the complete daemon/provider stack |
+| Talos / Claude Code ACP | Fixture-verified transport: `crates/talos-acp/tests/process.rs` covers streaming, permission RPC, cancellation, load replay, malformed/large frames, process exit and redaction | Authenticated live Talos and Claude Code workflows plus provider-native resume after daemon restart |
 | Core orchestration | Fixture-verified initial recovery/shutdown/permission pass: eight core tests plus the process harness prove durable cancellation, orphan reconciliation, concurrency and native fixture resume | Durable keyed prompt idempotency follow-up in progress; authenticated Talos and Claude Code acceptance remain open |
-| Daemon / IPC | Fixture-verified commands and delivery: `apps/talosd/src/main.rs`, `crates/paseo-ipc/tests/{protocol,reliability}.rs` cover scoped replay, truncation, clock rollback, fragmented input, lag and auth; `apps/talosd/tests/startup.rs` covers startup safety | Finish process-level lifecycle acceptance and real-provider restart/resume |
+| Daemon / IPC | Fixture-verified commands and delivery: `apps/talosd/src/main.rs`, `crates/talos-ipc/tests/{protocol,reliability}.rs` cover scoped replay, truncation, clock rollback, fragmented input, lag and auth; `apps/talosd/tests/startup.rs` covers startup safety | Finish process-level lifecycle acceptance and real-provider restart/resume |
 | CLI / provider config | Partial: `apps/talosdctl/src/main.rs` tests cover commands, typed session cursors, multi-page follow and stalled-page rejection; README documents recovery semantics | Complete process harness acceptance; durable idempotency, automatic reconnect and config reload boundary remain open |
 | Projects / workspaces | Partial: core and CLI register/list/get workspaces; domain retains workspace kinds | Project CRUD, workspace rename/archive/restore, safe managed-worktree creation/deletion and persisted branch/ownership links |
 | Permissions / trust | Partial: durable timeline plus pending request/decision handlers and scoped fixture tests | Restart/timeout behavior must fail closed; stale decisions must not approve another run |

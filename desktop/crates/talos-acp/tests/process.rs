@@ -7,11 +7,11 @@ use std::{
     time::Duration,
 };
 
-use paseo_acp::{
+use serde_json::{Value, json};
+use talos_acp::{
     AcpClient, AcpError, AcpEvent, ContentBlock, HttpHeader, McpServer, McpTransport,
     PermissionDecision, PermissionFuture, PermissionHandler, ProcessConfig, RpcId,
 };
-use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 fn fixture(mode: &str) -> ProcessConfig {
@@ -128,7 +128,7 @@ struct AllowPermission(Arc<AtomicUsize>);
 impl PermissionHandler for AllowPermission {
     fn request_permission<'a>(
         &'a self,
-        request: paseo_acp::PermissionRequest,
+        request: talos_acp::PermissionRequest,
         _cancellation: CancellationToken,
     ) -> PermissionFuture<'a> {
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -423,7 +423,7 @@ async fn process_exit_fails_pending_prompt_and_shutdown_is_bounded() {
 
 #[tokio::test]
 async fn talos_provider_defaults_use_acp_subcommand() {
-    let defaults = paseo_acp::talos_provider_defaults("/opt/talos");
+    let defaults = talos_acp::talos_provider_defaults("/opt/talos");
     assert_eq!(defaults.provider_id, "talos");
     assert_eq!(defaults.command, "/opt/talos");
     assert_eq!(defaults.args, ["acp"]);

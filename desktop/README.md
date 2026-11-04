@@ -42,7 +42,7 @@ The first run uses a separate Rust-owned data directory (`~/.talosd`) and does n
 ## Backend process acceptance
 
 ```bash
-cargo build --locked -p talosd -p talosdctl -p paseo-acp --bins
+cargo build --locked -p talosd -p talosdctl -p talos-acp --bins
 python3 scripts/talosd-smoke.py --verbose --timeout 300
 ```
 

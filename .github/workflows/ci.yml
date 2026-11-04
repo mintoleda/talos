@@ -47,7 +47,7 @@ jobs:
       - name: Backend tests
         run: cargo test --workspace --exclude talos-desktop --locked
       - name: Build process acceptance binaries
-        run: cargo build --locked -p talosd -p talosdctl -p paseo-acp --bins
+        run: cargo build --locked -p talosd -p talosdctl -p talos-acp --bins
       - name: Isolated daemon and CLI acceptance
         run: python3 scripts/talosd-smoke.py --verbose --timeout 300
 

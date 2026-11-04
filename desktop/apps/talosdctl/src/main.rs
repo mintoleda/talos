@@ -1,12 +1,12 @@
-//! Native, daemon-only Paseo command-line client. Never opens legacy state.
+//! Native, daemon-only command-line client for talosd. Never opens legacy state.
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use paseo_ipc::{Command, IpcError, PermissionDecision, ServerFrame, unix};
 use serde_json::Value;
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
+use talos_ipc::{Command, IpcError, PermissionDecision, ServerFrame, unix};
 
 #[derive(Debug, Parser)]
-#[command(name = "talosdctl", version, about = "Control the local Paseo daemon")]
+#[command(name = "talosdctl", version, about = "Control the local talosd daemon")]
 struct Cli {
     /// Rust-owned home (default: ~/.talosd; never ~/.paseo).
     #[arg(long, env = "TALOSD_HOME", global = true)]
@@ -631,7 +631,7 @@ fn timeline_position(event: &Value) -> Result<(&str, u64)> {
 #[cfg(unix)]
 async fn replay_follow_events(
     cli: &Cli,
-    client: &mut paseo_ipc::Client<tokio::net::UnixStream>,
+    client: &mut talos_ipc::Client<tokio::net::UnixStream>,
     cursors: &mut BTreeMap<String, u64>,
     limit: Option<u32>,
 ) -> Result<()> {
@@ -967,7 +967,7 @@ mod tests {
         let (client_io, server_io) = tokio::net::UnixStream::pair().unwrap();
         let mut page = 0;
         let server = tokio::spawn(async move {
-            paseo_ipc::serve_connection(server_io, None, move |command| {
+            talos_ipc::serve_connection(server_io, None, move |command| {
                 let Command::ReplaySessions { after, limit } = command else {
                     panic!("expected replay")
                 };
@@ -987,7 +987,7 @@ mod tests {
             .unwrap();
         });
         let cli = Cli::try_parse_from(["talosdctl", "--json", "health"]).unwrap();
-        let mut client = paseo_ipc::Client::new(client_io, None);
+        let mut client = talos_ipc::Client::new(client_io, None);
         client.negotiate().await.unwrap();
         let mut cursors = [("s1".into(), 9), ("s2".into(), 1)].into();
         replay_follow_events(&cli, &mut client, &mut cursors, Some(1))
@@ -1003,14 +1003,14 @@ mod tests {
     async fn follow_replay_rejects_a_stalled_page_instead_of_spinning() {
         let (client_io, server_io) = tokio::net::UnixStream::pair().unwrap();
         let server = tokio::spawn(async move {
-            paseo_ipc::serve_connection(server_io, None, |_| async {
+            talos_ipc::serve_connection(server_io, None, |_| async {
                 Ok(json!({"events":[],"has_more":true}))
             })
             .await
             .unwrap();
         });
         let cli = Cli::try_parse_from(["talosdctl", "health"]).unwrap();
-        let mut client = paseo_ipc::Client::new(client_io, None);
+        let mut client = talos_ipc::Client::new(client_io, None);
         client.negotiate().await.unwrap();
         let error = replay_follow_events(&cli, &mut client, &mut BTreeMap::new(), Some(1))
             .await
@@ -1036,7 +1036,7 @@ mod tests {
         let path = root.join("talosd.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
-            paseo_ipc::unix::serve(listener, Some("expected".into()), |_| async {
+            talos_ipc::unix::serve(listener, Some("expected".into()), |_| async {
                 Ok(json!(null))
             })
             .await
@@ -1080,7 +1080,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         std::fs::write(root.join("auth.token"), "secret\n").unwrap();
         let server = tokio::spawn(async move {
-            paseo_ipc::unix::serve(listener, Some("secret".into()), |command| async move {
+            talos_ipc::unix::serve(listener, Some("secret".into()), |command| async move {
                 assert_eq!(command, Command::Health);
                 Ok(json!({"status":"ok"}))
             })
