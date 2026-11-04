@@ -24,7 +24,9 @@ import (
 	"github.com/mintoleda/talos/internal/provider"
 	"github.com/mintoleda/talos/internal/server"
 	"github.com/mintoleda/talos/internal/session"
+	"github.com/mintoleda/talos/internal/stack"
 	"github.com/mintoleda/talos/internal/tui"
+	"github.com/mintoleda/talos/internal/version"
 )
 
 type Flags struct {
@@ -38,6 +40,7 @@ type Flags struct {
 	NoTools      bool
 	SystemPrompt string
 	DebugCache   bool
+	Version      bool
 }
 
 func main() {
@@ -64,7 +67,13 @@ func run() error {
 	flag.BoolVar(&f.NoTools, "no-tools", false, "disable tools")
 	flag.StringVar(&f.SystemPrompt, "system-prompt", "", "system prompt override")
 	flag.BoolVar(&f.DebugCache, "debug-cache", false, "log cache prefix hashes")
+	flag.BoolVar(&f.Version, "version", false, "print version and exit")
 	flag.Parse()
+
+	if f.Version {
+		fmt.Println("talos " + version.VERSION)
+		return nil
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -76,6 +85,8 @@ func run() error {
 	args := flag.Args()
 	if len(args) > 0 {
 		switch args[0] {
+		case "acp":
+			return runACP(cfg)
 		case "dream":
 			return runDream(cfg, args[1:])
 		case "serve":
@@ -108,7 +119,7 @@ func run() error {
 		}
 	}
 
-	built, err := engine.Build(context.Background(), engine.BuildOpts{
+	built, err := stack.Build(context.Background(), stack.BuildOpts{
 		Cfg:        cfg,
 		Dir:        cwd,
 		SessionID:  sessionID,
@@ -172,7 +183,7 @@ func run() error {
 
 	default:
 		tuiCtx := context.Background()
-		localEng := built.NewEngine(tuiCtx)
+		localEng := engine.FromBuilt(tuiCtx, built)
 		inputTokens, outputTokens, cacheMiss, _, _, seedCost, _ := localEng.Stats()
 
 		initialCfg := tui.Config{
@@ -631,7 +642,7 @@ func runDream(cfg *config.Config, args []string) error {
 		return err
 	}
 	cwd, _ := os.Getwd()
-	repoRoot := engine.FindRepoRoot(cwd)
+	repoRoot := stack.FindRepoRoot(cwd)
 	store, err := memory.Open(cfg.BaseDir, memory.ProjectID(repoRoot))
 	if err != nil {
 		return err
@@ -639,7 +650,7 @@ func runDream(cfg *config.Config, args []string) error {
 	entries := store.All()
 	var downgraded int
 	for _, e := range entries {
-		if !engine.MemoryReferencesMissingPath(repoRoot, e) {
+		if !stack.MemoryReferencesMissingPath(repoRoot, e) {
 			continue
 		}
 		downgraded++
@@ -676,7 +687,7 @@ func runDream(cfg *config.Config, args []string) error {
 		}
 	}
 	var deleted int
-	prov, modelName, err := engine.DreamerProvider(cfg, *model)
+	prov, modelName, err := stack.DreamerProvider(cfg, *model)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[dream] curation skipped: %v\n", err)
 	} else if modelName != "" {

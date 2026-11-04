@@ -15,6 +15,7 @@ import (
 	"github.com/mintoleda/talos/internal/gitutil"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/session"
+	"github.com/mintoleda/talos/internal/stack"
 )
 
 // SessionMeta lives in internal/session so the engine (TUI path) can write
@@ -45,8 +46,8 @@ type SessionManager struct {
 	engines      map[string]*engine.Engine
 	states       map[string]string // last known SessionStatus state for live engines
 	statusFn     func(protocol.SessionStatus)
-	buildFn      func(ctx context.Context, o engine.BuildOpts) (*engine.Built, error)
-	newEng       func(b *engine.Built, ctx context.Context) *engine.Engine
+	buildFn      func(ctx context.Context, o stack.BuildOpts) (*stack.Built, error)
+	newEng       func(b *stack.Built, ctx context.Context) *engine.Engine
 	gitCache     map[string]gitEnrichment
 }
 
@@ -58,9 +59,9 @@ func NewSessionManager(cfg *config.Config) *SessionManager {
 		states:       make(map[string]string),
 		gitCache:     make(map[string]gitEnrichment),
 		projectLocks: make(map[string]*sync.Mutex),
-		buildFn:      engine.Build,
-		newEng: func(b *engine.Built, ctx context.Context) *engine.Engine {
-			return b.NewEngine(ctx)
+		buildFn:      stack.Build,
+		newEng: func(b *stack.Built, ctx context.Context) *engine.Engine {
+			return engine.FromBuilt(ctx, b)
 		},
 	}
 }
@@ -154,7 +155,7 @@ func (m *SessionManager) Create(ctx context.Context, params rpc.CreateSessionPar
 	cfg := m.cfg
 	m.mu.Unlock()
 
-	built, err := buildFn(ctx, engine.BuildOpts{
+	built, err := buildFn(ctx, stack.BuildOpts{
 		Cfg:        cfg,
 		Dir:        wtDir,
 		ProjectDir: projectDir,
@@ -392,7 +393,7 @@ func (m *SessionManager) Resume(ctx context.Context, id string) (*engine.Engine,
 		}
 	}
 
-	built, err := buildFn(ctx, engine.BuildOpts{
+	built, err := buildFn(ctx, stack.BuildOpts{
 		Cfg:        cfg,
 		Dir:        meta.Dir,
 		ProjectDir: meta.ProjectDir,

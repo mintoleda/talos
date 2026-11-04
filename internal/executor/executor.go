@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 
 	"github.com/mintoleda/talos/internal/protocol"
@@ -44,40 +45,13 @@ func (e *InProcExecutor) Close() {
 }
 
 func (e *InProcExecutor) Run(ctx context.Context, tu protocol.ToolUse, emit protocol.EmitFunc) protocol.ToolResult {
+	tu = resolvePaths(tu, e.policy.WorkDir())
 	switch d, reason := e.policy.Check(tu); d {
 	case safety.Block:
 		return protocol.ToolResult{ToolUseID: tu.ID, IsError: true, Content: "blocked: " + reason}
 	case safety.Prompt:
-		// Serialize permission prompts so parallel tools don't race on the
-		// single frontend dialog / headless stdin path.
-		e.permMu.Lock()
-		defer e.permMu.Unlock()
-
-		reply := make(chan bool, 1)
-		ev := protocol.PermissionRequested{
-			ToolName: tu.Name,
-			Reason:   reason,
-			ReplyCh:  reply,
-		}
-		if tu.Name == "bash" {
-			if cmd, ok := tu.Args["command"].(string); ok {
-				ev.Command = cmd
-			}
-		}
-		if emit != nil {
-			emit(ev)
-		}
-		select {
-		case allowed := <-reply:
-			if !allowed {
-				return protocol.ToolResult{ToolUseID: tu.ID, IsError: true, Content: "denied by user"}
-			}
-		case <-ctx.Done():
-			return protocol.ToolResult{ToolUseID: tu.ID, IsError: true, Content: "cancelled: " + ctx.Err().Error()}
-		default:
-			// No one sent a reply and context not done yet. In headless mode
-			// without a renderer this would deadlock, so fail closed.
-			return protocol.ToolResult{ToolUseID: tu.ID, IsError: true, Content: "denied by user"}
+		if denied, ok := e.approve(ctx, tu, reason, emit); !ok {
+			return denied
 		}
 	}
 
@@ -123,5 +97,71 @@ func InlineConfirm(ev protocol.PermissionRequested) {
 	fmt.Scanln(&ans)
 	if ev.ReplyCh != nil {
 		ev.ReplyCh <- ans == "y" || ans == "Y"
+	}
+}
+
+// pathTools take a filesystem "path" argument but no working directory of
+// their own.
+var pathTools = map[string]bool{"read": true, "write": true, "edit": true, "ls": true}
+
+// resolvePaths anchors a relative "path" argument at the session's working
+// directory. Without this those tools resolve against the process cwd, which
+// differs from the session cwd under ACP and the multi-session daemon. Args
+// are copied: the caller's map is shared with the transcript.
+func resolvePaths(tu protocol.ToolUse, dir string) protocol.ToolUse {
+	if dir == "" || !pathTools[tu.Name] {
+		return tu
+	}
+	p, ok := tu.Args["path"].(string)
+	if !ok || p == "" || filepath.IsAbs(p) {
+		return tu
+	}
+	args := make(map[string]any, len(tu.Args))
+	for k, v := range tu.Args {
+		args[k] = v
+	}
+	args["path"] = filepath.Join(dir, p)
+	tu.Args = args
+	return tu
+}
+
+// approve asks the frontend to confirm tu. ok is false when the call must not
+// run, with the error result to return.
+func (e *InProcExecutor) approve(ctx context.Context, tu protocol.ToolUse, reason string, emit protocol.EmitFunc) (denied protocol.ToolResult, ok bool) {
+	// Serialize permission prompts so parallel tools don't race on the single
+	// frontend dialog / headless stdin path. Held only while asking, not while
+	// the approved tool runs.
+	e.permMu.Lock()
+	defer e.permMu.Unlock()
+
+	if emit == nil {
+		// No frontend can answer the prompt; fail closed instead of waiting
+		// forever.
+		return protocol.ToolResult{ToolUseID: tu.ID, IsError: true, Content: "denied: no frontend to approve " + tu.Name}, false
+	}
+	reply := make(chan bool, 1)
+	ev := protocol.PermissionRequested{
+		ToolUseID: tu.ID,
+		ToolName:  tu.Name,
+		Args:      tu.Args,
+		Reason:    reason,
+		ReplyCh:   reply,
+	}
+	if tu.Name == "bash" || tu.Name == "bash_background" {
+		if cmd, ok := tu.Args["command"].(string); ok {
+			ev.Command = cmd
+		}
+	}
+	emit(ev)
+	// Frontends answer asynchronously (TUI dialog, daemon client, ACP
+	// session/request_permission), so wait for the reply or cancellation.
+	select {
+	case allowed := <-reply:
+		if !allowed {
+			return protocol.ToolResult{ToolUseID: tu.ID, IsError: true, Content: "denied by user"}, false
+		}
+		return protocol.ToolResult{}, true
+	case <-ctx.Done():
+		return protocol.ToolResult{ToolUseID: tu.ID, IsError: true, Content: "cancelled: " + ctx.Err().Error()}, false
 	}
 }

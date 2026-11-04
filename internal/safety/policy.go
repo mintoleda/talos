@@ -149,7 +149,13 @@ func (p *Policy) resolve(base Decision, reason string, mode Mode) (Decision, str
 	}
 }
 
+// WorkDir is the directory relative tool paths resolve against.
+func (p *Policy) WorkDir() string { return p.workDir }
+
 func (p *Policy) withinWorkDir(path string) bool {
+	if !filepath.IsAbs(path) && p.workDir != "" {
+		path = filepath.Join(p.workDir, path)
+	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return false
