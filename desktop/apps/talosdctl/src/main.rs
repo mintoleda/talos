@@ -6,21 +6,16 @@ use serde_json::Value;
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
 #[derive(Debug, Parser)]
-#[command(name = "paseoctl", version, about = "Control the local Paseo daemon")]
+#[command(name = "talosdctl", version, about = "Control the local Paseo daemon")]
 struct Cli {
-    /// Rust-owned home (default: ~/.paseo-rs; never ~/.paseo).
-    #[arg(long, env = "PASEO_RS_HOME", global = true)]
+    /// Rust-owned home (default: ~/.talosd; never ~/.paseo).
+    #[arg(long, env = "TALOSD_HOME", global = true)]
     home: Option<PathBuf>,
-    /// Daemon Unix socket (default: <home>/paseod.sock).
-    #[arg(long, env = "PASEO_RS_SOCKET", global = true)]
+    /// Daemon Unix socket (default: <home>/talosd.sock).
+    #[arg(long, env = "TALOSD_SOCKET", global = true)]
     socket: Option<PathBuf>,
     /// Daemon bearer token, if configured. Avoid supplying secrets in shell history.
-    #[arg(
-        long,
-        env = "PASEO_RS_AUTH_TOKEN",
-        global = true,
-        hide_env_values = true
-    )]
+    #[arg(long, env = "TALOSD_AUTH_TOKEN", global = true, hide_env_values = true)]
     auth_token: Option<String>,
     /// Emit the unmodified daemon result as JSON.
     #[arg(long, global = true)]
@@ -225,13 +220,13 @@ impl Cli {
             None => Ok(PathBuf::from(
                 std::env::var_os("HOME").context("HOME is unset; use --home or --socket")?,
             )
-            .join(".paseo-rs")),
+            .join(".talosd")),
         }
     }
     fn socket_path(&self) -> Result<PathBuf> {
         match &self.socket {
             Some(path) => Ok(path.clone()),
-            None => Ok(self.home_path()?.join("paseod.sock")),
+            None => Ok(self.home_path()?.join("talosd.sock")),
         }
     }
     async fn token(&self) -> Result<Option<String>> {
@@ -482,7 +477,7 @@ fn select_result(action: &Action, value: Value) -> Result<Value> {
             .iter()
             .find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str()))
             .cloned()
-            .ok_or_else(|| anyhow!("provider {id:?} not found; run `paseoctl provider list`"));
+            .ok_or_else(|| anyhow!("provider {id:?} not found; run `talosdctl provider list`"));
     }
     if let Action::Agent {
         action: AgentAction::List { workspace: None },
@@ -557,7 +552,7 @@ async fn execute(cli: &Cli) -> Result<Value> {
         .await
         .with_context(|| {
             format!(
-                "cannot connect to daemon at {}; start `paseod` or pass --socket/--home",
+                "cannot connect to daemon at {}; start `talosd` or pass --socket/--home",
                 socket.display()
             )
         })?;
@@ -573,7 +568,7 @@ async fn follow_events(cli: &Cli, after: u64, limit: Option<u32>) -> Result<()> 
         .await
         .with_context(|| {
             format!(
-                "cannot connect to daemon at {}; start `paseod` or pass --socket/--home",
+                "cannot connect to daemon at {}; start `talosd` or pass --socket/--home",
                 socket.display()
             )
         })?;
@@ -684,7 +679,7 @@ fn ipc_error(error: &IpcError) -> anyhow::Error {
     match error {
         IpcError::Remote(-32003, _) => {
             anyhow!(
-                "daemon authentication failed; check <home>/auth.token, --auth-token or PASEO_RS_AUTH_TOKEN"
+                "daemon authentication failed; check <home>/auth.token, --auth-token or TALOSD_AUTH_TOKEN"
             )
         }
         IpcError::Remote(-32001, _) | IpcError::Negotiation(_) => {
@@ -717,7 +712,7 @@ mod tests {
     #[test]
     fn replay_commands_preserve_per_session_positions() {
         let cli = Cli::try_parse_from([
-            "paseoctl",
+            "talosdctl",
             "events",
             "replay",
             "--cursors",
@@ -734,7 +729,7 @@ mod tests {
             }
         );
         let cli = Cli::try_parse_from([
-            "paseoctl",
+            "talosdctl",
             "session",
             "replay",
             "--session",
@@ -752,7 +747,7 @@ mod tests {
             }
         );
         assert!(
-            Cli::try_parse_from(["paseoctl", "events", "replay", "--cursors", "{\"s\":-1}"])
+            Cli::try_parse_from(["talosdctl", "events", "replay", "--cursors", "{\"s\":-1}"])
                 .is_err()
         );
         assert_eq!(
@@ -765,10 +760,10 @@ mod tests {
     #[test]
     fn parser_maps_commands_and_flags() {
         let cli = Cli::try_parse_from([
-            "paseoctl",
+            "talosdctl",
             "--json",
             "--home",
-            "/tmp/paseo-test",
+            "/tmp/talosd-test",
             "session",
             "prompt",
             "s1",
@@ -780,7 +775,7 @@ mod tests {
         assert!(cli.json);
         assert_eq!(
             cli.socket_path().unwrap(),
-            PathBuf::from("/tmp/paseo-test/paseod.sock")
+            PathBuf::from("/tmp/talosd-test/talosd.sock")
         );
         assert_eq!(
             command_for(&cli.command).unwrap(),
@@ -791,7 +786,7 @@ mod tests {
             }
         );
 
-        let cli = Cli::try_parse_from(["paseoctl", "workspace", "show", "w1"]).unwrap();
+        let cli = Cli::try_parse_from(["talosdctl", "workspace", "show", "w1"]).unwrap();
         assert_eq!(
             command_for(&cli.command).unwrap(),
             Command::GetWorkspace {
@@ -800,7 +795,7 @@ mod tests {
         );
 
         let cli =
-            Cli::try_parse_from(["paseoctl", "events", "--after", "3", "--limit", "5"]).unwrap();
+            Cli::try_parse_from(["talosdctl", "events", "--after", "3", "--limit", "5"]).unwrap();
         assert_eq!(
             command_for(&cli.command).unwrap(),
             Command::Replay {
@@ -809,7 +804,7 @@ mod tests {
             }
         );
 
-        let cli = Cli::try_parse_from(["paseoctl", "permission", "deny", "p1"]).unwrap();
+        let cli = Cli::try_parse_from(["talosdctl", "permission", "deny", "p1"]).unwrap();
         assert_eq!(
             command_for(&cli.command).unwrap(),
             Command::PermissionDecision {
@@ -822,7 +817,7 @@ mod tests {
     #[test]
     fn new_verbs_map_to_additive_ipc_commands() {
         let cli = Cli::try_parse_from([
-            "paseoctl",
+            "talosdctl",
             "session",
             "new",
             "w1",
@@ -841,7 +836,7 @@ mod tests {
             }
         );
 
-        let cli = Cli::try_parse_from(["paseoctl", "session", "archive", "s1"]).unwrap();
+        let cli = Cli::try_parse_from(["talosdctl", "session", "archive", "s1"]).unwrap();
         assert_eq!(
             command_for(&cli.command).unwrap(),
             Command::ArchiveSession {
@@ -849,7 +844,8 @@ mod tests {
             }
         );
 
-        let cli = Cli::try_parse_from(["paseoctl", "session", "rename", "s1", "New name"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["talosdctl", "session", "rename", "s1", "New name"]).unwrap();
         assert_eq!(
             command_for(&cli.command).unwrap(),
             Command::RenameSession {
@@ -859,7 +855,7 @@ mod tests {
         );
 
         let cli =
-            Cli::try_parse_from(["paseoctl", "session", "set-thinking", "s1", "high"]).unwrap();
+            Cli::try_parse_from(["talosdctl", "session", "set-thinking", "s1", "high"]).unwrap();
         assert_eq!(
             command_for(&cli.command).unwrap(),
             Command::SetThinking {
@@ -869,7 +865,7 @@ mod tests {
         );
 
         let cli =
-            Cli::try_parse_from(["paseoctl", "model", "list", "--provider", "talos"]).unwrap();
+            Cli::try_parse_from(["talosdctl", "model", "list", "--provider", "talos"]).unwrap();
         assert_eq!(
             command_for(&cli.command).unwrap(),
             Command::ListModels {
@@ -877,13 +873,13 @@ mod tests {
             }
         );
 
-        let cli = Cli::try_parse_from(["paseoctl", "permission", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["talosdctl", "permission", "list"]).unwrap();
         assert_eq!(
             command_for(&cli.command).unwrap(),
             Command::ListPendingPermissions
         );
 
-        let cli = Cli::try_parse_from(["paseoctl", "agent", "show", "a1"]).unwrap();
+        let cli = Cli::try_parse_from(["talosdctl", "agent", "show", "a1"]).unwrap();
         assert_eq!(
             command_for(&cli.command).unwrap(),
             Command::GetAgent {
@@ -891,13 +887,13 @@ mod tests {
             }
         );
 
-        let cli = Cli::try_parse_from(["paseoctl", "shutdown"]).unwrap();
+        let cli = Cli::try_parse_from(["talosdctl", "shutdown"]).unwrap();
         assert_eq!(command_for(&cli.command).unwrap(), Command::Shutdown);
     }
 
     #[test]
     fn events_tail_follow_is_detected_for_streaming() {
-        let cli = Cli::try_parse_from(["paseoctl", "events", "tail", "--follow", "--after", "9"])
+        let cli = Cli::try_parse_from(["talosdctl", "events", "tail", "--follow", "--after", "9"])
             .unwrap();
         assert_eq!(follow_args(&cli.command), Some((9, None)));
         assert_eq!(
@@ -908,13 +904,13 @@ mod tests {
             }
         );
 
-        let cli = Cli::try_parse_from(["paseoctl", "events", "--after", "4"]).unwrap();
+        let cli = Cli::try_parse_from(["talosdctl", "events", "--after", "4"]).unwrap();
         assert_eq!(follow_args(&cli.command), None);
     }
 
     #[test]
     fn agent_list_without_workspace_selects_snapshot_agents() {
-        let cli = Cli::try_parse_from(["paseoctl", "agent", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["talosdctl", "agent", "list"]).unwrap();
         assert_eq!(command_for(&cli.command).unwrap(), Command::Snapshot);
         assert_eq!(
             select_result(
@@ -925,7 +921,7 @@ mod tests {
             json!([{"id":"a1","title":"Alpha"}])
         );
 
-        let cli = Cli::try_parse_from(["paseoctl", "agent", "list", "--workspace", "w1"]).unwrap();
+        let cli = Cli::try_parse_from(["talosdctl", "agent", "list", "--workspace", "w1"]).unwrap();
         assert_eq!(
             command_for(&cli.command).unwrap(),
             Command::ListAgents {
@@ -990,7 +986,7 @@ mod tests {
             .await
             .unwrap();
         });
-        let cli = Cli::try_parse_from(["paseoctl", "--json", "health"]).unwrap();
+        let cli = Cli::try_parse_from(["talosdctl", "--json", "health"]).unwrap();
         let mut client = paseo_ipc::Client::new(client_io, None);
         client.negotiate().await.unwrap();
         let mut cursors = [("s1".into(), 9), ("s2".into(), 1)].into();
@@ -1013,7 +1009,7 @@ mod tests {
             .await
             .unwrap();
         });
-        let cli = Cli::try_parse_from(["paseoctl", "health"]).unwrap();
+        let cli = Cli::try_parse_from(["talosdctl", "health"]).unwrap();
         let mut client = paseo_ipc::Client::new(client_io, None);
         client.negotiate().await.unwrap();
         let error = replay_follow_events(&cli, &mut client, &mut BTreeMap::new(), Some(1))
@@ -1029,7 +1025,7 @@ mod tests {
     async fn rejected_token_is_reported() {
         use tokio::net::UnixListener;
         let root = std::env::temp_dir().join(format!(
-            "paseoctl-auth-{}-{}",
+            "talosdctl-auth-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1037,7 +1033,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&root).unwrap();
-        let path = root.join("paseod.sock");
+        let path = root.join("talosd.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
             paseo_ipc::unix::serve(listener, Some("expected".into()), |_| async {
@@ -1047,7 +1043,7 @@ mod tests {
             .unwrap();
         });
         let cli = Cli::try_parse_from([
-            "paseoctl",
+            "talosdctl",
             "--home",
             root.to_str().unwrap(),
             "--auth-token",
@@ -1072,7 +1068,7 @@ mod tests {
     async fn temporary_socket_negotiates_and_calls() {
         use tokio::net::UnixListener;
         let root = std::env::temp_dir().join(format!(
-            "paseoctl-test-{}-{}",
+            "talosdctl-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1080,7 +1076,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&root).unwrap();
-        let path = root.join("paseod.sock");
+        let path = root.join("talosd.sock");
         let listener = UnixListener::bind(&path).unwrap();
         std::fs::write(root.join("auth.token"), "secret\n").unwrap();
         let server = tokio::spawn(async move {
@@ -1092,7 +1088,7 @@ mod tests {
             .unwrap();
         });
         let cli =
-            Cli::try_parse_from(["paseoctl", "--home", root.to_str().unwrap(), "health"]).unwrap();
+            Cli::try_parse_from(["talosdctl", "--home", root.to_str().unwrap(), "health"]).unwrap();
         assert_eq!(execute(&cli).await.unwrap(), json!({"status":"ok"}));
         server.await.unwrap();
         std::fs::remove_file(&path).unwrap();

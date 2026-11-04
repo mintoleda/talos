@@ -1,6 +1,6 @@
 //! Stateful fake ACP subprocess used by the integration tests.
 //!
-//! `PASEO_ACP_FIXTURE_MODE` selects a deterministic behaviour. The `scripted`
+//! `TALOSD_ACP_FIXTURE_MODE` selects a deterministic behaviour. The `scripted`
 //! mode keeps one process usable for the daemon/CLI smoke harness by choosing
 //! the scenario from the prompt text; it never consults a real provider.
 
@@ -11,12 +11,12 @@ use std::{
 };
 
 fn main() {
-    let mode = std::env::var("PASEO_ACP_FIXTURE_MODE").unwrap_or_else(|_| "stream".to_owned());
+    let mode = std::env::var("TALOSD_ACP_FIXTURE_MODE").unwrap_or_else(|_| "stream".to_owned());
     trace(
         "start",
         serde_json::json!({"mode": mode, "pid": std::process::id()}),
     );
-    if mode == "scripted" && std::env::var_os("PASEO_ACP_FIXTURE_ECHO_SECRET").is_some() {
+    if mode == "scripted" && std::env::var_os("TALOSD_ACP_FIXTURE_ECHO_SECRET").is_some() {
         echo_secret();
     }
     if mode == "malformed" {
@@ -468,7 +468,7 @@ fn echo_secret() {
 }
 
 fn trace(event: &str, data: serde_json::Value) {
-    let Some(path) = std::env::var_os("PASEO_ACP_FIXTURE_TRACE") else {
+    let Some(path) = std::env::var_os("TALOSD_ACP_FIXTURE_TRACE") else {
         return;
     };
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {

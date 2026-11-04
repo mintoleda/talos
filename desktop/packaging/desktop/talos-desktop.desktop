@@ -2,8 +2,9 @@
 Type=Application
 Name=Talos Desktop
 Comment=Native Talos desktop preview
-Exec=paseo
+Exec=talos-desktop
 Icon=utilities-terminal
 Terminal=false
 Categories=Development;
 StartupNotify=true
+StartupWMClass=talos-desktop

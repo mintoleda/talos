@@ -40,7 +40,7 @@ Start as a Cargo workspace with these crates (some can begin as modules if the w
 | `paseo-ipc` | Versioned daemon-client protocol, framing, local socket setup/authentication | Provider implementations, UI toolkit |
 | `paseo-daemon` | Composition root, Tokio runtime, IPC server, workers, shutdown | UI toolkit |
 | `paseo-ui` | Desktop shell, view state, IPC client, rendering/input | Store and provider implementations |
-| `paseo-cli` | Headless client commands, diagnostics, import/export | Store internals (all mutations through daemon) |
+| `talosdctl` | Headless client commands, diagnostics, import/export | Store internals (all mutations through daemon) |
 | `paseo-test-support` | Fake ports, fixtures, deterministic clocks/process harnesses | Production dependency graph |
 
 Dependency direction: `domain <- application <- daemon`; `store`, `providers`, `acp`, `process`, and `ipc` implement/use ports at the edge. `ui` and `cli` speak only the public IPC protocol. Avoid a giant `common` crate and avoid passing database rows or provider SDK types into domain/UI code. Keep feature flags at edge crates, not as pervasive conditional compilation in the domain.

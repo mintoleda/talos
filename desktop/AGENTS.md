@@ -1,6 +1,6 @@
 # Project instructions
 
-- `desktop/` is the Rust workspace inside the Talos monorepo: the native `egui` desktop app (`paseo`), its local daemon (`paseod`), CLI (`paseoctl`) and supporting crates. The Go agent runtime lives at the repository root (`cmd/`, `internal/`).
+- `desktop/` is the Rust workspace inside the Talos monorepo: the native `egui` desktop app (`talos-desktop`), its local daemon (`talosd`), CLI (`talosdctl`) and supporting crates. The Go agent runtime lives at the repository root (`cmd/`, `internal/`).
 - The desktop reaches Talos only through `talos acp` (ACP over stdio). Do not reimplement Go runtime behavior in Rust; runtime fixes belong in `internal/`. Changes spanning both sides must keep `docs/architecture/talos-acp.md` and `../docs/paseo-integration.md` in sync.
 - Do not modify the installed runtime under `~/.paseo` or the real `~/.talos` home; tests and smoke runs use isolated temporary homes.
 - Talos/ACP is the primary backend; Claude Code is the only secondary provider.

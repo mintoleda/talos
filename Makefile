@@ -11,7 +11,7 @@ app:
 
 # Native Rust desktop app (egui) and its local daemon/CLI.
 desktop: talos
-	cd desktop && cargo run -p paseo
+	cd desktop && cargo run -p talos-desktop
 
 desktop-check:
 	cd desktop && cargo check --workspace
@@ -20,5 +20,5 @@ desktop-test:
 	cd desktop && cargo test --workspace
 
 desktop-accept:
-	cd desktop && cargo build --locked -p paseod -p paseo-cli -p paseo-acp --bins
-	cd desktop && python3 scripts/paseo-smoke.py --verbose --timeout 300
+	cd desktop && cargo build --locked -p talosd -p talosdctl -p paseo-acp --bins
+	cd desktop && python3 scripts/talosd-smoke.py --verbose --timeout 300

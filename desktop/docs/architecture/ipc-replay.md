@@ -3,7 +3,7 @@
 Protocol version remains **1**. `replay_sessions` is an additive command. Older
 servers may reject it; clients must report incompatibility rather than silently
 substitute an unsafe global cursor. Wire types live in
-`crates/paseo-ipc/src/lib.rs`; handlers live in `apps/paseod/src/main.rs`.
+`crates/paseo-ipc/src/lib.rs`; handlers live in `apps/talosd/src/main.rs`.
 
 ## Identity and ordering
 
@@ -68,10 +68,10 @@ operator action after checking that no daemon is running.
 ## CLI
 
 ```sh
-paseoctl events replay --cursors '{}' --limit 100 --json
-paseoctl events replay --cursors '{"SESSION_ID":7}' --limit 100 --json
-paseoctl session replay --session SESSION_ID --after 7 --json
-paseoctl events tail --follow --limit 100 --json
+talosdctl events replay --cursors '{}' --limit 100 --json
+talosdctl events replay --cursors '{"SESSION_ID":7}' --limit 100 --json
+talosdctl session replay --session SESSION_ID --after 7 --json
+talosdctl events tail --follow --limit 100 --json
 ```
 
 Follow subscribes on connection, drains all replay pages, deduplicates buffered

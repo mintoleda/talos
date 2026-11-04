@@ -43,13 +43,13 @@ jobs:
         with:
           workspaces: desktop
       - name: Backend strict lint baseline
-        run: cargo clippy --workspace --all-targets --exclude paseo --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude talos-desktop --locked -- -D warnings
       - name: Backend tests
-        run: cargo test --workspace --exclude paseo --locked
+        run: cargo test --workspace --exclude talos-desktop --locked
       - name: Build process acceptance binaries
-        run: cargo build --locked -p paseod -p paseo-cli -p paseo-acp --bins
+        run: cargo build --locked -p talosd -p talosdctl -p paseo-acp --bins
       - name: Isolated daemon and CLI acceptance
-        run: python3 scripts/paseo-smoke.py --verbose --timeout 300
+        run: python3 scripts/talosd-smoke.py --verbose --timeout 300
 
   # The full-workspace gates are still known-failing (see desktop/docs/STATUS.md).
   # They run here for signal only until the desktop UI workstream closes them.
@@ -76,7 +76,7 @@ jobs:
       - name: Validate Linux integration assets
         run: |
           bash -n packaging/install-user.sh
-          desktop-file-validate packaging/desktop/paseo.desktop
+          desktop-file-validate packaging/desktop/talos-desktop.desktop
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy (all targets, warnings denied)

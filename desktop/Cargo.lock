@@ -2910,21 +2910,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73072a9470554c8e794778acece2312661218aaabb635600957d952cf01c716e"
 
 [[package]]
-name = "paseo"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "directories",
- "eframe",
- "egui",
- "egui_commonmark",
- "egui_extras",
- "paseo-ipc",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "paseo-acp"
 version = "0.1.0"
 dependencies = [
@@ -2934,17 +2919,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "paseo-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "paseo-ipc",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -3025,27 +2999,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
- "uuid",
-]
-
-[[package]]
-name = "paseod"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "directories",
- "paseo-acp",
- "paseo-core",
- "paseo-domain",
- "paseo-ipc",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -4089,6 +4042,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "talos-desktop"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "directories",
+ "eframe",
+ "egui",
+ "egui_commonmark",
+ "egui_extras",
+ "paseo-ipc",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "talosd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "directories",
+ "paseo-acp",
+ "paseo-core",
+ "paseo-domain",
+ "paseo-ipc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "talosdctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "paseo-ipc",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

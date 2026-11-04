@@ -55,9 +55,9 @@ reported as successful completion.
 ## CLI
 
 ```sh
-paseoctl session prompt SESSION_ID 'Summarize this project' --request-key summary-001 --json
+talosdctl session prompt SESSION_ID 'Summarize this project' --request-key summary-001 --json
 # Retrying this exact request returns the same run_id, with restored: true.
-paseoctl session prompt SESSION_ID 'Summarize this project' --request-key summary-001 --json
+talosdctl session prompt SESSION_ID 'Summarize this project' --request-key summary-001 --json
 ```
 
 Without `--request-key`, each submission remains a distinct prompt; do not

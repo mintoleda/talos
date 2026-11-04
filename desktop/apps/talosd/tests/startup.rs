@@ -10,10 +10,10 @@ use std::{
 };
 
 fn run_to_failure(home: &Path, user_home: &Path) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_paseod"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_talosd"))
         .env_clear()
         .env("HOME", user_home)
-        .env("PASEO_RS_HOME", home)
+        .env("TALOSD_HOME", home)
         .env("RUST_LOG", "error")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -53,7 +53,7 @@ fn legacy_home_and_symlink_aliases_are_rejected_before_any_writes() {
             "{output:?}"
         );
         assert!(!legacy.join("child").exists());
-        assert!(!legacy.join("paseod.lock").exists());
+        assert!(!legacy.join("talosd.lock").exists());
         assert!(!legacy.join("auth.token").exists());
         assert_eq!(fs::read_to_string(&sentinel).unwrap(), "legacy sentinel");
         assert_eq!(
@@ -78,7 +78,7 @@ fn invalid_config_cleans_up_the_socket_and_lock_for_the_next_attempt() {
             String::from_utf8_lossy(&output.stdout).contains("configuration"),
             "{output:?}"
         );
-        assert!(!home.join("paseod.sock").exists());
-        assert!(!home.join("paseod.lock").exists());
+        assert!(!home.join("talosd.sock").exists());
+        assert!(!home.join("talosd.lock").exists());
     }
 }

@@ -28,7 +28,7 @@ impl StoreActor {
         let (sender, mut receiver) = mpsc::channel(STORE_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
-            .name("paseo-sqlite".into())
+            .name("talosd-sqlite".into())
             .spawn(move || {
                 let mut store = match SqliteStore::open(path) {
                     Ok(store) => {
