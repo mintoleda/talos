@@ -25,3 +25,10 @@ app/node_modules/
 app/out/
 app/dist/
 *.tsbuildinfo
+
+# Desktop (Rust) workspace
+# The Rust workspace keeps its own ignore rules in desktop/.gitignore;
+# these are repository-level belts and braces.
+desktop/target/
+# Project instructions for the Rust workspace must be versioned.
+!desktop/AGENTS.md

@@ -82,6 +82,28 @@ make app            # production renderer/main bundles → app/out/
 `talos serve` still serves the static UI from `app/out/renderer` when present
 (browser byproduct). The daemon keeps running after you quit the Electron window.
 
+### native desktop (Rust, egui)
+
+`desktop/` is a Rust workspace containing a native `egui` desktop app, a local
+daemon/CLI, and storage. It drives Talos headlessly through `talos acp` (Agent
+Client Protocol over stdio), with Claude Code as the only secondary provider.
+It is intended to replace the Electron app once it reaches parity.
+
+```bash
+make desktop          # build ./talos, then run the desktop UI
+make desktop-test     # cargo test --workspace
+make desktop-accept   # daemon/CLI acceptance against a fake ACP agent
+```
+
+See [desktop/README.md](desktop/README.md) and
+[docs/paseo-integration.md](docs/paseo-integration.md) for the Go/Rust boundary.
+
+### headless ACP
+
+```bash
+./talos acp           # ACP v1 on stdio, for the desktop or any ACP client
+```
+
 ## server / attach workflow
 
 Run a long-lived daemon, then detach/reattach from any terminal:
@@ -156,6 +178,8 @@ mkdir -p ~/.talos/skills/push
 ## further reading
 
 - [docs/architecture.md](docs/architecture.md) — package map and component seams
+- [docs/paseo-integration.md](docs/paseo-integration.md) — `talos acp` and the Rust desktop boundary
+- [desktop/README.md](desktop/README.md) — native Rust desktop workspace
 - [docs/configuration.md](docs/configuration.md) — full config reference
 - `~/.talos/SYSTEM_PROMPT.md` — global system prompt overrides
 - `~/.talos/subagents/` — define custom subagents as markdown files

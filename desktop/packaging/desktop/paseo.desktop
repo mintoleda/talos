@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Paseo
+Comment=Native Paseo desktop preview
+Exec=paseo
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;
+StartupNotify=true
