@@ -1,0 +1,19 @@
+[package]
+name = "paseo-migrate-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "paseo-migrate"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+directories.workspace = true
+paseo-migrate = { path = "../../crates/paseo-migrate" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

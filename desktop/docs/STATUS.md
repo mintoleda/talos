@@ -1,0 +1,283 @@
+# Implementation status and execution checklist
+
+This is the execution tracker for [PLAN.md](PLAN.md). The feature requirements
+remain in [feature-parity.md](architecture/feature-parity.md); file ownership is
+in [workstreams.md](architecture/workstreams.md).
+
+## Baseline and status rules
+
+Evidence snapshot: the standalone `paseo-rs` working tree over `f56b32a`,
+imported unchanged into the Talos monorepo under `desktop/` (branch `talos`).
+Commands below run from `desktop/`. This is not a release certification.
+
+- **Implemented**: a source path exists; this does not establish acceptance.
+- **Fixture-verified**: relevant automated checks passed without a live provider.
+- **Partial**: some requirements exist, but the full acceptance gate is open.
+- **Open**: no completion evidence recorded; investigate before implementing.
+- **Deferred**: intentionally outside the current phase, not removed from scope.
+- Check a task only after recording its command/scenario, outcome and scope here.
+  An unavailable live provider is a blocker, not a passing result.
+
+**Execution order: P0 → P1 → P2 → P3 → P4. Desktop UI is P4, last.** Preserve
+existing UI changes; no visual work, widget expansion or UI cleanup is scheduled
+before the non-UI gates. Broader parity remains a separate backlog, not a hidden
+prerequisite that makes the desktop wait indefinitely.
+
+## Backend implementation pass
+
+Implementation is proceeding through P0/P1, not P2–P4. Desktop remains deferred.
+GPT-6 Luna (`xhigh`) completed the initial core lifecycle/recovery pass. New
+implementation and testing work is primarily assigned to DeepSeek Flash (`high`):
+durable keyed prompt acceptance, process/tool-stream regression coverage, and
+independent migration safety preflight. Luna is reserved for targeted reviews.
+The orchestrator owns cross-stream integration, transport/CLI fixes and docs.
+Migration preflight hardens existing code only; it does not advance or certify P3
+feature parity ahead of the P1 live-provider gate.
+
+Initial implementation pass, integrated and regression-tested:
+
+- Cancellation-safe partial IPC frame reads on server and client; authentication
+  and protocol checks on every command; bounded queues with explicit replay
+  requirements instead of silent event loss.
+- Additive `replay_sessions` with independent per-session cursor maps, pagination
+  that never acknowledges truncated records, and ordered-session-head merging
+  that remains safe across backwards wall-clock adjustments. See
+  [the replay contract](architecture/ipc-replay.md).
+- CLI `events replay --cursors`, `session replay --session`, and paginated
+  follow/replay deduplication with gap/lag recovery. Transport disconnection still
+  ends follow; automatic reconnect is not claimed.
+- ACP idle-reader busy-spin fix: retain the watch receiver's seen version instead
+  of cloning it repeatedly. A regression test bounds idle-reader polling.
+- Bounded/tracked daemon connections, handshake/write deadlines and bounded
+  shutdown draining. Startup validates legacy-home aliases before any writes;
+  token creation is private and rejects symlinks; failed startup cleans its socket.
+- Startup reconciliation marks orphaned runs `Interrupted`, cancels unresolved
+  permissions and resets busy agents without automatically restarting providers.
+  Run completion persists cleanup before terminal publication; shutdown joins run
+  writers before store close; create/load are serialized against shutdown.
+- Scoped permission decisions persist outcomes before replying; cancelled/dropped
+  callbacks are reconciled before the terminal run event. Provider mutations
+  reject values absent from advertised capabilities/options.
+- A real-process fixture harness and independent CI `backend-acceptance` job.
+  The complete initial suite and opt-in Rust wrapper passed, including cancellation
+  while a permission was pending and shutdown/restart under a pending permission.
+  Harness results are not proof of live model/provider parity.
+
+Known limitations remain explicit: `request_key` is echoed correlation metadata,
+not durable idempotency; do not automatically retry prompts after a lost response.
+Automatic stale lock/socket removal remains intentionally unsupported.
+
+### Installed Talos probe (no model calls)
+
+Installed `talos 0.2.0` successfully negotiated ACP v1 and created a session using
+isolated temporary `HOME`/`TALOS_HOME`. After terminating and restarting the
+provider, loading that **empty, never-prompted** native session failed with
+`session not found`. No model requests were sent, no real provider credentials
+were used, and temporary homes were removed. This is not prompted-session resume
+acceptance; that live gate remains open and must not silently create a replacement
+session or change providers.
+
+## Verification snapshot
+
+Historical pre-implementation baseline (superseded by implementation results
+when recorded below):
+
+| Check | Result | Meaning |
+|---|---|---|
+| `cargo check --workspace --locked` | Pass, desktop warnings | Compiles; not runtime acceptance |
+| `cargo fmt --all -- --check` | Fail | Existing desktop formatting debt; no broad formatting applied |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Fail | Desktop warnings/lints block the workspace gate |
+| `cargo test --workspace` | Fail | Desktop `state::tests::permissions_are_scoped_and_resolved_by_run` fails; 21 other desktop tests pass; run stops before establishing other packages |
+| `cargo clippy --workspace --all-targets --exclude paseo -- -D warnings` | Pass | Non-desktop lint baseline only |
+| `cargo test --workspace --exclude paseo` | Pass | Non-desktop automated baseline only |
+
+The excluded-desktop commands are interim gates, never substitutes for the final
+workspace gates. Live Talos, real daemon restart recovery, fresh installation,
+and full migration acceptance were not exercised in this inventory.
+
+### Monorepo import check (2026-11-03)
+
+Run from `desktop/` after importing into the Talos monorepo; source unchanged.
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all -- --check` | Pass |
+| `cargo clippy --workspace --all-targets --exclude paseo --locked -- -D warnings` | Pass |
+| `cargo test --workspace --locked --no-fail-fast` | All backend crates pass; desktop `permissions_are_scoped_and_resolved_by_run` still fails (pre-existing) |
+| `go build ./... && go vet ./... && go test ./...` (repo root) | Pass |
+| `python3 scripts/paseo-smoke.py --timeout 300` | **Flaky**: 1 of 4 runs passed (3 in `desktop/`, 1 in the original `paseo-rs` checkout). Failures: "tool lifecycle events were not attributed to the tool prompt run" (×2) and a cancel run stuck in `CancelRequested` (×1). Same behavior before the move; open race, see P1 |
+
+### Initial integrated implementation results
+
+Before the follow-up DeepSeek work:
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all -- --check` | Pass |
+| `cargo test --workspace --exclude paseo --locked` | 69 passed; 0 failed; 1 opt-in smoke wrapper ignored |
+| `cargo clippy --workspace --all-targets --exclude paseo --locked -- -D warnings` | Pass |
+| `cargo build --locked -p paseod -p paseo-cli -p paseo-acp --bins` | Pass |
+| `python3 scripts/paseo-smoke.py --verbose --timeout 90` | Entire initial process suite passed; tail delivered 88 unique events across two sessions at one-event page size |
+| `cargo test -p paseo-cli --test daemon_smoke -- --ignored --nocapture` | Opt-in wrapper passed the entire process suite |
+| Forced Python `--timeout 1 --keep` using frozen binaries | Expected failure; all five traced fixture children gone after cleanup; retained debug home explicitly removed |
+| `cargo test --workspace --locked` | Existing desktop permission-state test still fails (21 desktop tests pass) |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Existing desktop lint debt still blocks full workspace |
+
+These are an initial integrated checkpoint, not completion of P1 or the release.
+Follow-up keyed prompt/tool coverage and migration preflight must be verified again.
+
+## Current implementation inventory
+
+| Area | Status / evidence | Remaining acceptance |
+|---|---|---|
+| Domain and SQLite | Fixture-verified foundation: `crates/paseo-domain`, `crates/paseo-store`; store tests `persistence_survives_reopen_and_replay_cursor`, `migrations_are_idempotent_and_events_ordered` | Crash/restart recovery across the complete daemon/provider stack |
+| Talos / Claude Code ACP | Fixture-verified transport: `crates/paseo-acp/tests/process.rs` covers streaming, permission RPC, cancellation, load replay, malformed/large frames, process exit and redaction | Authenticated live Talos and Claude Code workflows plus provider-native resume after daemon restart |
+| Core orchestration | Fixture-verified initial recovery/shutdown/permission pass: eight core tests plus the process harness prove durable cancellation, orphan reconciliation, concurrency and native fixture resume | Durable keyed prompt idempotency follow-up in progress; authenticated Talos and Claude Code acceptance remain open |
+| Daemon / IPC | Fixture-verified commands and delivery: `apps/paseod/src/main.rs`, `crates/paseo-ipc/tests/{protocol,reliability}.rs` cover scoped replay, truncation, clock rollback, fragmented input, lag and auth; `apps/paseod/tests/startup.rs` covers startup safety | Finish process-level lifecycle acceptance and real-provider restart/resume |
+| CLI / provider config | Partial: `apps/paseo-cli/src/main.rs` tests cover commands, typed session cursors, multi-page follow and stalled-page rejection; README documents recovery semantics | Complete process harness acceptance; durable idempotency, automatic reconnect and config reload boundary remain open |
+| Projects / workspaces | Partial: core and CLI register/list/get workspaces; domain retains workspace kinds | Project CRUD, workspace rename/archive/restore, safe managed-worktree creation/deletion and persisted branch/ownership links |
+| Permissions / trust | Partial: durable timeline plus pending request/decision handlers and scoped fixture tests | Restart/timeout behavior must fail closed; stale decisions must not approve another run |
+| Usage / diagnostics | Partial: summaries and provider diagnostics have daemon fixture tests | Unknown usage/prices versus zero, aggregation/replay deduplication and redaction acceptance |
+| Attachments / output | Open beyond JSON CLI output | Image validation, durable storage/reference replay, provider capability rejection and migration integrity |
+| Terminals / scripts | Open PTY backend; script management deferred | Owned PTY lifecycle/input/resize/capture/cleanup with two-workspace isolation |
+| Legacy migration | Partial: `crates/paseo-migrate/src/lib.rs`; read-only dry run and idempotent workspace-subset import tests | Backup/transactional recovery, source-path safety, sessions/history/attachments and interrupted-import coverage; current importer explicitly excludes these |
+| Packaging / settings | Partial: `.github/workflows/ci.yml`, `packaging/`, `docs/release/README.md` | Fresh-home install/upgrade/uninstall and config validation without modifying user data; no signed/cross-platform release claim |
+| Desktop | Deferred, existing code retained in `apps/paseo` | Fix failing test/lints/formatting, then connect verified backend contracts and perform visual/accessibility QA |
+| Remote / schedules / browser-MCP / voice / OS notifications / plugins / usage dashboards | Deferred broader parity | Separate acceptance work after the local release; see parity inventory |
+
+## P0 — establish a reproducible non-UI baseline
+
+Owner: core/daemon/CLI maintainers; scope excludes `apps/paseo`.
+
+- [x] Inventory the dirty tree without discarding or committing unrelated changes.
+- [x] Run non-desktop tests and strict Clippy; record the workspace blockers above.
+- [x] Review initial uncommitted backend changes against IPC v1 compatibility,
+  capability checks, bounded queues and cancellation/shutdown. Fixed partial-read
+  corruption, replay cursor loss, ACP busy-spin and core terminal/permission races.
+- [x] Add regression tests for those initial review findings and rerun interim
+  gates: see initial integrated results above. Follow-up changes require new runs.
+- [ ] Make a reviewed backend checkpoint separately from unfinished UI work.
+
+Exit: reviewed non-UI diff, reproducible passing interim gates, no undocumented
+IPC incompatibility. Do not mark the whole workspace green.
+
+## P1 — prove the backend / CLI vertical slice
+
+Depends on P0. Owners: ACP, core, storage, daemon/IPC, CLI.
+
+- [x] Add a deterministic process-level daemon + CLI smoke harness using a fake
+  provider and temporary Rust-owned home: `scripts/paseo-smoke.py`, with an opt-in
+  Rust wrapper in `apps/paseo-cli/tests/daemon_smoke.rs` and a dedicated CI job.
+  Individual workflow acceptance below still requires a passing execution.
+- [ ] Register workspace → create Talos-owned session → stream text/tools/usage →
+  follow-up → permission allow/deny → cancel → rename/archive/history. Initial
+  fixture flow passes text/usage/lifecycle; explicit streamed tool lifecycle
+  coverage is being added before checking this whole item.
+- [ ] Make `scripts/paseo-smoke.py` deterministic: on 2026-11-03 it passed 1 of 4
+  runs, failing on tool-event run attribution and on a cancel that never left
+  `CancelRequested`. Investigate the race before relying on the CI job as a gate.
+- [ ] Persist optional prompt request keys transactionally with run acceptance;
+  identical retries return the original run across concurrency/restart, conflicting
+  payloads fail explicitly, and accepted-but-interrupted work is not re-executed.
+  DeepSeek owns implementation and separate process-level regression coverage.
+- [x] Fixture acceptance: stop/restart the real daemon, replay ordered history and
+  resume the same native fixture session without duplicate creation/replayed
+  output (`scripts/paseo-smoke.py`, initial suite passed). Live Talos is separate.
+- [x] Fixture acceptance: two simultaneous agents with distinct pending requests;
+  duplicate, stale and post-cancel decisions fail closed without cross-talk
+  (core `concurrent_permission_decisions_are_run_scoped_and_stale_ids_fail_closed`
+  and process harness).
+- [x] Fixture acceptance: cancel prompts/permission waits; durably settle requests
+  before terminal state; bounded shutdown joins writers and cleans children.
+  Core `shutdown_joins_run_writers_before_closing_store` and the process harness
+  passed. Startup reconciliation is idempotent; process-level hard-kill stress
+  beyond graceful shutdown/restart is not yet claimed.
+- [x] Fixture acceptance: disconnected-tail durable replay and one-event pages
+  deliver 88 unique records across two sessions; IPC reliability tests force lag
+  and signal replay explicitly. Session-local ordering is preserved across clock
+  rollback. Automatic transport reconnect remains a separate open enhancement.
+- [x] Fixture acceptance: missing/wrong auth, bad protocol, unadvertised mutation
+  values and unavailable providers are rejected; two homes remain isolated;
+  scripted provider secrets are redacted from timeline, diagnostics and logs
+  (IPC/daemon unit tests plus complete process harness).
+- [ ] Repeat prompt/follow-up/cancel/restart-resume against installed Talos with
+  credentials in an isolated provider home. Record provider version and redacted
+  outcomes; never write to the real `~/.talos` home or legacy `~/.paseo`.
+- [ ] Verify explicit Claude Code selection through the official ACP adapter or report it unavailable; preserve session ownership and never silently substitute a provider.
+
+Exit: repeatable fixture harness plus recorded live Talos acceptance; backend
+and CLI can complete the vertical slice without the desktop.
+
+## P2 — close local daily-driver backend parity
+
+Depends on P1. Owners: domain/store/core plus daemon/IPC/CLI adapters.
+
+- [ ] Implement/verify project and workspace CRUD/archive/restore and managed
+  worktree ownership checks; never delete dirty or unmanaged checkouts.
+- [ ] Finish capability-driven model/mode/thinking controls and provider metadata
+  round-trip, including explicit unsupported/unavailable errors.
+- [ ] Implement/verify image MIME/size/path checks, durable attachment references,
+  restart replay and missing-file errors through CLI and provider adapters.
+- [ ] Add owned PTY creation/list/input/resize/capture/kill; prove two-workspace
+  isolation and child cleanup without relying on a desktop terminal widget.
+- [ ] Expose history/search and basic usage through CLI/IPC; test unknown usage,
+  unknown prices and reconnect aggregation without double counting.
+- [ ] Verify invalid config rejection, atomic persistence, redaction and a
+  documented reload-versus-restart boundary.
+
+Exit: each local MVP requirement in the parity inventory has a non-UI test or
+recorded CLI acceptance result. Script management, forge automation and remote
+features remain separately deferred.
+
+## P3 — safe migration and distribution
+
+Depends on P2. Owners: migration/storage and packaging/QA.
+
+- [ ] Audit source/destination overlap, symlink traversal and legacy-home guards
+  before expanding the importer or running it against real data. Independent
+  DeepSeek preflight is hardening the existing workspace-only importer and its
+  database filename integration now; no real-data import or P3 parity is claimed.
+- [ ] Add dry-run inventory, destination backup and transactional/journaled import
+  recovery; test deterministic reruns after interruption and rollback.
+- [ ] Preserve projects/workspaces, stable IDs, archives and ownership metadata;
+  import sessions/history and hashed attachments or label unsupported records
+  explicitly historical/read-only. Never claim a workspace-only import is parity.
+- [ ] Run corrupt/missing-file, archived/worktree and partial-import fixtures;
+  verify source hashes unchanged and no credentials/runtime/plugin execution.
+- [ ] Exercise fresh-home Linux artifact install, CLI workflow, upgrade and
+  uninstall in temporary destinations; verify data retention and checksum.
+- [ ] Update public docs to match tested behavior. The release guide's statement
+  that desktop is demo-only is stale relative to current connection code; desktop
+  live acceptance remains pending, not automatically supported.
+
+Exit: tested non-UI install and migration contract, passing interim gates and
+recorded source-preservation evidence. Ready for desktop integration.
+
+## P4 — desktop integration and release QA (UI last)
+
+Depends on P3; workstreams B/C/D start here. Existing code is a starting point,
+not evidence that the desktop acceptance gate is complete.
+
+- [ ] Resolve desktop permission-state test failure, formatting and strict lint debt.
+- [ ] Integrate stable IPC contracts; repeat the P1 lifecycle through the desktop,
+  including offline/reconnect, permissions and restart/history.
+- [ ] Complete shell/composer, icons, markdown/tools/diffs, image/terminal surfaces,
+  history/search, keyboard navigation and capability-driven controls.
+- [ ] Review 1600×900, 1280×800, 900×650 and 720×520; check reduced motion,
+  high contrast, focus, permission prominence and long-timeline performance.
+- [ ] Run `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and
+  `cargo test --workspace` with no desktop exclusion; all must pass.
+- [ ] Record fresh-install and migration workflows through CLI and desktop;
+  reconcile README/release/parity claims and publish a scoped release checklist.
+
+Exit: the local MVP release gate in `architecture/feature-parity.md` is satisfied.
+M3/broader parity remains explicitly unclaimed.
+
+## Updating this tracker
+
+For each completed task, add the source/test reference, command or manual
+scenario, outcome and limitations in the relevant phase. Reopen tasks when the
+contract changes. Keep fixture verification separate from live-provider,
+restart, migration and desktop acceptance. Never infer release readiness from
+compilation or a feature's presence in source alone.
