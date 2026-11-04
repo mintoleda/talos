@@ -1,4 +1,4 @@
-//! Async bridge between the egui shell and the local `paseod` daemon.
+//! Async bridge between the egui shell and the local `talosd` daemon.
 //!
 //! A dedicated thread owns a current-thread Tokio runtime. The UI thread sends
 //! [`Action`]s through a bounded channel and drains [`Update`]s once per frame;
@@ -168,7 +168,7 @@ impl Backend {
         let (updates, receiver) = mpsc::channel(512);
         let endpoint = socket_path().display().to_string();
         std::thread::Builder::new()
-            .name("paseo-backend".into())
+            .name("talos-desktop-backend".into())
             .spawn(move || {
                 let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -383,7 +383,7 @@ impl Backend {
 fn apply_snapshot(view: &mut ViewModel, snapshot: &Value, preserve_entries: bool) {
     view.online = true;
     view.status = snapshot.get("home").and_then(Value::as_str).map_or_else(
-        || "Connected · paseod".into(),
+        || "Connected · talosd".into(),
         |home| format!("Connected · {}", compact_path(home)),
     );
     view.workspaces = snapshot
@@ -674,7 +674,7 @@ async fn connect_and_run(
     let token = auth_token();
     let mut client = paseo_ipc::unix::connect(&socket, token)
         .await
-        .map_err(|error| format!("Connect to paseod: {error}"))?;
+        .map_err(|error| format!("Connect to talosd: {error}"))?;
     client
         .negotiate()
         .await
@@ -726,22 +726,21 @@ async fn connect_and_run(
 }
 
 fn home_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("PASEO_RS_HOME") {
+    if let Some(home) = std::env::var_os("TALOSD_HOME") {
         return PathBuf::from(home);
     }
     directories::BaseDirs::new().map_or_else(
-        || PathBuf::from(".paseo-rs"),
-        |dirs| dirs.home_dir().join(".paseo-rs"),
+        || PathBuf::from(".talosd"),
+        |dirs| dirs.home_dir().join(".talosd"),
     )
 }
 
 fn socket_path() -> PathBuf {
-    std::env::var_os("PASEO_RS_SOCKET")
-        .map_or_else(|| home_dir().join("paseod.sock"), PathBuf::from)
+    std::env::var_os("TALOSD_SOCKET").map_or_else(|| home_dir().join("talosd.sock"), PathBuf::from)
 }
 
 fn auth_token() -> Option<String> {
-    if let Ok(token) = std::env::var("PASEO_RS_AUTH_TOKEN") {
+    if let Ok(token) = std::env::var("TALOSD_AUTH_TOKEN") {
         if !token.is_empty() {
             return Some(token);
         }
@@ -753,15 +752,15 @@ fn auth_token() -> Option<String> {
 }
 
 fn daemon_binary() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PASEO_RS_DAEMON") {
+    if let Some(path) = std::env::var_os("TALOSD_BIN") {
         return Some(PathBuf::from(path));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             let candidate = parent.join(if cfg!(windows) {
-                "paseod.exe"
+                "talosd.exe"
             } else {
-                "paseod"
+                "talosd"
             });
             if candidate.is_file() {
                 return Some(candidate);
@@ -772,9 +771,9 @@ fn daemon_binary() -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| {
             dir.join(if cfg!(windows) {
-                "paseod.exe"
+                "talosd.exe"
             } else {
-                "paseod"
+                "talosd"
             })
         })
         .find(|candidate| candidate.is_file())
@@ -788,7 +787,7 @@ async fn ensure_daemon(updates: &mpsc::Sender<Update>, ctx: &egui::Context) {
     let Some(binary) = daemon_binary() else {
         let _ = updates
             .send(Update::Notice(
-                "paseod was not found; start it manually or set PASEO_RS_DAEMON.".into(),
+                "talosd was not found; start it manually or set TALOSD_BIN.".into(),
             ))
             .await;
         return;
@@ -798,13 +797,13 @@ async fn ensure_daemon(updates: &mpsc::Sender<Update>, ctx: &egui::Context) {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(home.join("paseod.log"))
+        .open(home.join("talosd.log"))
         .ok();
     let mut command = Process::new(binary);
     command
         .arg("--home")
         .arg(&home)
-        .env("PASEO_RS_HOME", &home)
+        .env("TALOSD_HOME", &home)
         .stdin(Stdio::null());
     if let Some(log) = log {
         if let Ok(clone) = log.try_clone() {
@@ -816,7 +815,7 @@ async fn ensure_daemon(updates: &mpsc::Sender<Update>, ctx: &egui::Context) {
     }
     if let Err(error) = command.spawn() {
         let _ = updates
-            .send(Update::Notice(format!("Could not start paseod: {error}")))
+            .send(Update::Notice(format!("Could not start talosd: {error}")))
             .await;
         return;
     }

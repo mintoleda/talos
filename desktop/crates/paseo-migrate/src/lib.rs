@@ -20,8 +20,8 @@ pub const DATABASE_FILE_NAME: &str = "state.sqlite3";
 /// Filename used by the first importer revision. It is never opened or modified.
 const LEGACY_DATABASE_FILE_NAME: &str = "state.sqlite";
 const JOURNAL_FILE_NAME: &str = "import-journal.json";
-/// Shared with `paseod`; `create_new` is the exclusion primitive on both sides.
-const LOCK_FILE_NAME: &str = "paseod.lock";
+/// Shared with `talosd`; `create_new` is the exclusion primitive on both sides.
+const LOCK_FILE_NAME: &str = "talosd.lock";
 const PROJECTS_METADATA_KEY: &str = "legacy_import_projects";
 
 #[derive(Debug, Error)]

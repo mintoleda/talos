@@ -9,14 +9,14 @@ Talos is launched as `talos acp`. Claude Code is the only secondary provider, la
 ## Architecture
 
 ```text
-paseo (egui desktop) ─┐
-                      ├─ local versioned IPC ─ paseod
-paseo-cli ────────────┘                         │
+talos-desktop (egui) ─┐
+                      ├─ local versioned IPC ─ talosd
+talosdctl ────────────┘                         │
                                                ├─ paseo-core (use cases/provider registry)
                                                ├─ paseo-store (SQLite + migrations)
                                                └─ providers
                                                    ├─ Talos ACP (default)
-                                                   └─ Claude Code ACP
+                                                    └─ Claude Code ACP
 ```
 
 Shared domain types are provider-neutral. ACP owns newline-delimited bidirectional JSON-RPC, process lifecycle, capability negotiation, streaming updates, permissions, cancellation, load/resume, and model/mode/config changes.

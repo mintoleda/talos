@@ -818,9 +818,9 @@ impl ViewModel {
                 kind: EntryKind::Tool {
                     call_id: "call-1".into(),
                     name: "Read".into(),
-                    target: "apps/paseo/src/main.rs".into(),
+                    target: "apps/talos-desktop/src/main.rs".into(),
                     state: ToolState::Completed,
-                    input: "{\"path\":\"apps/paseo/src/main.rs\"}".into(),
+                    input: "{\"path\":\"apps/talos-desktop/src/main.rs\"}".into(),
                     output: "read 695 lines".into(),
                 },
             },

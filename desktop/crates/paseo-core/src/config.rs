@@ -25,11 +25,20 @@ pub enum ConfigError {
     Version(u32),
     #[error("invalid configuration: {0}")]
     Invalid(String),
-    #[error("cannot determine a user home directory; set PASEO_RS_HOME")]
+    #[error("cannot determine a user home directory; set TALOSD_HOME")]
     MissingHome,
     #[error("refusing to use the legacy Paseo home or a path inside it: {0}")]
     LegacyHomePath(String),
+    #[error(
+        "{0} is locked by a pre-rename paseod; stop it (or remove paseod.lock once no daemon is running) so its data can move"
+    )]
+    PreRenameHomeLocked(String),
 }
+
+/// Default home directory name under the user's home.
+const HOME_DIR_NAME: &str = ".talosd";
+/// Home used before the Talos rename; adopted once by [`HomePaths::adopt_pre_rename_home`].
+const PRE_RENAME_HOME_DIR_NAME: &str = ".paseo-rs";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,13 +240,13 @@ pub struct HomePaths {
 
 impl HomePaths {
     pub fn discover() -> Result<Self, ConfigError> {
-        let home = if let Some(path) = std::env::var_os("PASEO_RS_HOME") {
+        let home = if let Some(path) = std::env::var_os("TALOSD_HOME") {
             PathBuf::from(path)
         } else {
             directories::BaseDirs::new()
                 .ok_or(ConfigError::MissingHome)?
                 .home_dir()
-                .join(".paseo-rs")
+                .join(HOME_DIR_NAME)
         };
         Ok(Self::at(home))
     }
@@ -270,6 +279,62 @@ impl HomePaths {
             return Err(ConfigError::LegacyHomePath(self.home.display().to_string()));
         }
         Ok(())
+    }
+
+    /// One-time move of the pre-rename `~/.paseo-rs` home into the default
+    /// `~/.talosd`. Only the default home is ever filled this way; an explicit
+    /// `TALOSD_HOME` elsewhere is left alone. Returns whether anything moved.
+    /// Call after [`Self::validate`] and before the instance lock is taken.
+    pub fn adopt_pre_rename_home(&self) -> Result<bool, ConfigError> {
+        let Some(user_home) =
+            directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+        else {
+            return Err(ConfigError::MissingHome);
+        };
+        if canonicalize_future_path(&self.home)?
+            != canonicalize_future_path(&user_home.join(HOME_DIR_NAME))?
+        {
+            return Ok(false);
+        }
+        self.adopt_from(&user_home.join(PRE_RENAME_HOME_DIR_NAME))
+    }
+
+    /// Move entries from `old` into this home. The desktop app may already have
+    /// created the new home for its daemon log, so existence alone does not
+    /// mean "already migrated"; an existing database does.
+    fn adopt_from(&self, old: &Path) -> Result<bool, ConfigError> {
+        match std::fs::symlink_metadata(old) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        if std::fs::symlink_metadata(&self.database).is_ok() {
+            return Ok(false);
+        }
+        if std::fs::symlink_metadata(old.join("paseod.lock")).is_ok() {
+            return Err(ConfigError::PreRenameHomeLocked(old.display().to_string()));
+        }
+        std::fs::create_dir_all(&self.home)?;
+        for entry in std::fs::read_dir(old)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let target = match name.to_str() {
+                // No lock means no daemon is listening; the socket is dead.
+                Some("paseod.sock") => {
+                    std::fs::remove_file(entry.path())?;
+                    continue;
+                }
+                Some("paseod.log") => self.home.join("talosd.log"),
+                _ => self.home.join(&name),
+            };
+            if std::fs::symlink_metadata(&target).is_err() {
+                std::fs::rename(entry.path(), target)?;
+            }
+        }
+        // Anything that collided stays behind for the user to inspect.
+        let _ = std::fs::remove_dir(old);
+        Ok(true)
     }
 }
 
@@ -310,7 +375,7 @@ pub(crate) async fn load_or_create(path: &Path) -> Result<AppConfig, ConfigError
             if normalized {
                 save(path, &config).await?;
             }
-            if let Some(default_provider) = std::env::var_os("PASEO_RS_DEFAULT_PROVIDER") {
+            if let Some(default_provider) = std::env::var_os("TALOSD_DEFAULT_PROVIDER") {
                 config.default_provider = default_provider.to_string_lossy().into_owned();
                 config.validate()?;
             }
@@ -318,7 +383,7 @@ pub(crate) async fn load_or_create(path: &Path) -> Result<AppConfig, ConfigError
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut config = AppConfig::default();
-            if let Some(default_provider) = std::env::var_os("PASEO_RS_DEFAULT_PROVIDER") {
+            if let Some(default_provider) = std::env::var_os("TALOSD_DEFAULT_PROVIDER") {
                 config.default_provider = default_provider.to_string_lossy().into_owned();
             }
             config.validate()?;
@@ -379,7 +444,7 @@ mod tests {
 
     impl TestPaths {
         fn new() -> Self {
-            Self(std::env::temp_dir().join(format!("paseo-config-test-{}", Uuid::now_v7())))
+            Self(std::env::temp_dir().join(format!("talosd-config-test-{}", Uuid::now_v7())))
         }
     }
 
@@ -487,5 +552,49 @@ command = "codex-acp"
 
         let selected = HomePaths::at(alias.join("nested"));
         assert!(selected.validate_not_within(&legacy).is_err());
+    }
+
+    #[test]
+    fn adopts_pre_rename_home_once_alongside_an_existing_log() {
+        let temp = TestPaths::new();
+        let old = temp.0.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("state.sqlite3"), "db").unwrap();
+        std::fs::write(old.join("auth.token"), "token").unwrap();
+        std::fs::write(old.join("paseod.log"), "old log").unwrap();
+        std::fs::write(old.join("paseod.sock"), "").unwrap();
+        let home = HomePaths::at(temp.0.join("new"));
+        std::fs::create_dir_all(&home.home).unwrap();
+        std::fs::write(home.home.join("talosd.log"), "new log").unwrap();
+
+        assert!(home.adopt_from(&old).unwrap());
+        assert_eq!(std::fs::read_to_string(&home.database).unwrap(), "db");
+        assert!(home.home.join("auth.token").exists());
+        assert!(!home.home.join("paseod.sock").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.home.join("talosd.log")).unwrap(),
+            "new log"
+        );
+        // The colliding log stays behind, so the old directory is kept.
+        assert!(old.join("paseod.log").exists());
+        assert!(!old.join("state.sqlite3").exists());
+
+        assert!(!home.adopt_from(&old).unwrap());
+    }
+
+    #[test]
+    fn refuses_to_adopt_a_locked_pre_rename_home() {
+        let temp = TestPaths::new();
+        let old = temp.0.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("state.sqlite3"), "db").unwrap();
+        std::fs::write(old.join("paseod.lock"), "123").unwrap();
+        let home = HomePaths::at(temp.0.join("new"));
+
+        assert!(matches!(
+            home.adopt_from(&old),
+            Err(ConfigError::PreRenameHomeLocked(_))
+        ));
+        assert!(old.join("state.sqlite3").exists());
     }
 }

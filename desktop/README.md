@@ -1,6 +1,6 @@
 # Talos desktop (Rust)
 
-The native Rust desktop for Talos: a polished `egui` interface and a provider-neutral agent control plane. It lives in the Talos monorepo under `desktop/`; the Go agent runtime is at the repository root. Crates and binaries keep their `paseo*` names for now.
+The native Rust desktop for Talos: a polished `egui` interface and a provider-neutral agent control plane. It lives in the Talos monorepo under `desktop/`; the Go agent runtime is at the repository root.
 
 ## Direction
 
@@ -32,18 +32,18 @@ Or from `desktop/`:
 ```bash
 cargo check --workspace
 cargo test --workspace
-cargo run -p paseo          # desktop UI
-cargo run -p paseod         # local daemon
-cargo run -p paseo-cli -- --help
+cargo run -p talos-desktop          # desktop UI
+cargo run -p talosd         # local daemon
+cargo run -p talosdctl -- --help
 ```
 
-The first run uses a separate Rust-owned data directory (`~/.paseo-rs`) and does not overwrite the installed Paseo state. The Talos provider runs `talos acp` from `PATH` by default; set `command` under `[[providers]]` in `~/.paseo-rs/config.toml` to an absolute path (for example the repo-root `talos` binary) to use a local build. See [`apps/paseo-cli/README.md`](apps/paseo-cli/README.md).
+The first run uses a separate Rust-owned data directory (`~/.talosd`) and does not overwrite the installed Paseo state. On first start, `talosd` moves an existing pre-rename `~/.paseo-rs` into `~/.talosd` (stop any old `paseod` first). The Talos provider runs `talos acp` from `PATH` by default; set `command` under `[[providers]]` in `~/.talosd/config.toml` to an absolute path (for example the repo-root `talos` binary) to use a local build. See [`apps/talosdctl/README.md`](apps/talosdctl/README.md).
 
 ## Backend process acceptance
 
 ```bash
-cargo build --locked -p paseod -p paseo-cli -p paseo-acp --bins
-python3 scripts/paseo-smoke.py --verbose --timeout 300
+cargo build --locked -p talosd -p talosdctl -p paseo-acp --bins
+python3 scripts/talosd-smoke.py --verbose --timeout 300
 ```
 
 This runs real daemon/CLI processes against a deterministic ACP fixture in

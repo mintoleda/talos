@@ -6,9 +6,9 @@ members = [
     "crates/paseo-store",
     "crates/paseo-core",
     "crates/paseo-ipc",
-    "apps/paseod",
-    "apps/paseo",
-    "apps/paseo-cli",
+    "apps/talosd",
+    "apps/talos-desktop",
+    "apps/talosdctl",
     "crates/paseo-migrate",
     "apps/paseo-migrate",
 ]

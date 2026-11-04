@@ -942,12 +942,22 @@ fn run_status(state: &RunLifecycle) -> &'static str {
 }
 
 fn home_dir() -> anyhow::Result<PathBuf> {
-    if let Some(home) = std::env::var_os("PASEO_RS_HOME") {
+    if let Some(home) = std::env::var_os("TALOSD_HOME") {
         return Ok(PathBuf::from(home));
     }
     let base = directories::BaseDirs::new()
         .ok_or_else(|| anyhow::anyhow!("home directory is unavailable"))?;
-    Ok(base.home_dir().join(".paseo-rs"))
+    Ok(base.home_dir().join(".talosd"))
+}
+
+/// Validate the selected home, adopt pre-rename data, then create it privately.
+async fn open_home(home: &Path) -> anyhow::Result<()> {
+    let paths = HomePaths::at(home);
+    paths.validate()?;
+    if paths.adopt_pre_rename_home()? {
+        info!(home = %home.display(), "moved pre-rename ~/.paseo-rs home");
+    }
+    prepare_home(home).await
 }
 
 async fn prepare_home(path: &Path) -> anyhow::Result<()> {
@@ -1001,9 +1011,8 @@ async fn load_token(home: &Path) -> anyhow::Result<String> {
 async fn run() -> anyhow::Result<()> {
     let home = home_dir()?;
     // Validate before chmod, token creation, lock creation or socket binding.
-    HomePaths::at(home.clone()).validate()?;
-    prepare_home(&home).await?;
-    let lock_path = home.join("paseod.lock");
+    open_home(&home).await?;
+    let lock_path = home.join("talosd.lock");
     let lock_file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1026,7 +1035,7 @@ async fn run() -> anyhow::Result<()> {
     tokio::fs::write(&lock_path, std::process::id().to_string()).await?;
     let _lock = InstanceLock(lock_path.clone());
     let token = load_token(&home).await?;
-    let socket_path = home.join("paseod.sock");
+    let socket_path = home.join("talosd.sock");
     if tokio::fs::symlink_metadata(&socket_path).await.is_ok() {
         anyhow::bail!(
             "socket path already exists: {}; remove it only after confirming no daemon is running",
@@ -1044,7 +1053,7 @@ async fn run() -> anyhow::Result<()> {
     let shutdown_notify = Arc::new(Notify::new());
     let (daemon, event_bridge) =
         Daemon::new(home.clone(), service.clone(), shutdown_notify.clone());
-    info!(socket = %socket_path.display(), home = %home.display(), "paseod listening");
+    info!(socket = %socket_path.display(), home = %home.display(), "talosd listening");
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut connections = tokio::task::JoinSet::new();
@@ -1097,13 +1106,13 @@ async fn run() -> anyhow::Result<()> {
     service.shutdown().await;
     event_bridge.abort();
     let _ = event_bridge.await;
-    info!("paseod stopped cleanly");
+    info!("talosd stopped cleanly");
     Ok(())
 }
 
 #[cfg(not(unix))]
 async fn run() -> anyhow::Result<()> {
-    anyhow::bail!("paseod currently requires Unix domain socket support")
+    anyhow::bail!("talosd currently requires Unix domain socket support")
 }
 
 #[tokio::main]
@@ -1112,7 +1121,7 @@ async fn main() {
         .json()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "paseod=info".into()),
+                .unwrap_or_else(|_| "talosd=info".into()),
         )
         .init();
     if let Err(error) = run().await {

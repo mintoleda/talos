@@ -1,8 +1,8 @@
 # Process-level smoke harness
 
-`paseo-smoke.py` launches the real `paseod`, `paseoctl` and `acp-fixture`
+`talosd-smoke.py` launches the real `talosd`, `talosdctl` and `acp-fixture`
 binaries against temporary Rust-owned homes. It is deterministic, needs no live
-provider, and never reads or writes `~/.paseo-rs`, `~/.paseo`, or a real Talos
+provider, and never reads or writes `~/.talosd`, `~/.paseo`, or a real Talos
 provider home.
 
 ## Build and run
@@ -10,14 +10,14 @@ provider home.
 The script never invokes cargo. Build the binaries first:
 
 ```sh
-cargo build -p paseod -p paseo-cli -p paseo-acp --bins
-python3 scripts/paseo-smoke.py --verbose --timeout 300
+cargo build -p talosd -p talosdctl -p paseo-acp --bins
+python3 scripts/talosd-smoke.py --verbose --timeout 300
 ```
 
 Run the same harness through the ignored integration test:
 
 ```sh
-cargo test -p paseo-cli --test daemon_smoke -- --ignored --nocapture
+cargo test -p talosdctl --test daemon_smoke -- --ignored --nocapture
 ```
 
 Do not run `cargo build` while a smoke run is in progress: replacing the
@@ -37,11 +37,11 @@ removal claim.
 
 | Variable | Default |
 |---|---|
-| `PASEO_PASEOD_BIN` | `target/debug/paseod` |
-| `PASEO_PASEOCTL_BIN` | `target/debug/paseoctl` |
-| `PASEO_ACP_FIXTURE_BIN` | `target/debug/acp-fixture` |
-| `PASEO_SMOKE_PYTHON` | `python3` (test wrapper only) |
-| `PASEO_SMOKE_TIMEOUT_SECS` | `300` (test wrapper only; the script alarm is 10s earlier) |
+| `TALOSD_SMOKE_DAEMON_BIN` | `target/debug/talosd` |
+| `TALOSD_SMOKE_CTL_BIN` | `target/debug/talosdctl` |
+| `TALOSD_ACP_FIXTURE_BIN` | `target/debug/acp-fixture` |
+| `TALOSD_SMOKE_PYTHON` | `python3` (test wrapper only) |
+| `TALOSD_SMOKE_TIMEOUT_SECS` | `300` (test wrapper only; the script alarm is 10s earlier) |
 
 Paths are resolved from the repository root (the script's parent directory).
 
@@ -80,10 +80,10 @@ unkeyed prompt path is exercised separately and does not claim idempotency.
 
 ## Safety and cleanup
 
-Every daemon and provider child runs with `HOME` and `PASEO_RS_HOME` pointing
+Every daemon and provider child runs with `HOME` and `TALOSD_HOME` pointing
 inside a `tempfile.mkdtemp` root. Daemons are started in their own process group.
 On assertion failure, `finally` stops every daemon with a bounded wait, kills
-leftover fixture PIDs recorded by `PASEO_ACP_FIXTURE_TRACE`, and removes the
+leftover fixture PIDs recorded by `TALOSD_ACP_FIXTURE_TRACE`, and removes the
 temporary root unless `--keep` was supplied.
 
 Both timeout paths unwind instead of orphaning children:
@@ -99,7 +99,7 @@ Both timeout paths unwind instead of orphaning children:
 
 `acp-fixture` keeps its existing `stream`, `permission`, `cancel`, `eof`,
 `malformed`, `oversized`, `stderr` and `minimal` modes. The smoke harness uses
-`PASEO_ACP_FIXTURE_MODE=scripted`, which selects a deterministic scenario from
+`TALOSD_ACP_FIXTURE_MODE=scripted`, which selects a deterministic scenario from
 the prompt text:
 
 | Prompt contains | Behaviour |
@@ -111,8 +111,8 @@ the prompt text:
 | `secret-exit` | write the configured secret to stderr, then exit |
 | anything else | stream `hello ` + `world` and usage |
 
-`PASEO_ACP_FIXTURE_TRACE=<path>` appends JSON-lines process events
+`TALOSD_ACP_FIXTURE_TRACE=<path>` appends JSON-lines process events
 (`start`, `session/new`, `session/load`, permission decisions, cancellation)
-for cleanup and restart assertions. `PASEO_ACP_FIXTURE_ECHO_SECRET=1` writes
+for cleanup and restart assertions. `TALOSD_ACP_FIXTURE_ECHO_SECRET=1` writes
 `FIXTURE_SECRET` to stderr so the redaction scenario can verify it never reaches
 durable output.

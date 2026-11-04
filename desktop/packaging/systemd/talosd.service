@@ -1,0 +1,14 @@
+[Unit]
+Description=Talos desktop daemon (per-user)
+Documentation=https://github.com/mintoleda/talos
+
+[Service]
+Type=simple
+# SIGINT lets talosd remove its Unix socket and instance lock on shutdown.
+ExecStart=%h/.local/bin/talosd
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=default.target

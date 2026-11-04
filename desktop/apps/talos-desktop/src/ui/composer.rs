@@ -299,7 +299,7 @@ fn model_selector(
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(
-                        "Talos reports its model catalog during a session. Configure credentials in ~/.paseo-rs/config.toml.",
+                        "Talos reports its model catalog during a session. Configure credentials in ~/.talosd/config.toml.",
                     )
                     .font(theme::ui(10.5))
                     .color(theme::FAINT),
