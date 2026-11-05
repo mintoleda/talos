@@ -395,7 +395,11 @@ pub struct PromptUsage {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ContentBlock {
     Text {
         text: String,
@@ -626,3 +630,23 @@ pub struct JsonRpcErrorResponse {
 
 /// Generic unrecognized protocol fields are retained as JSON objects.
 pub type ExtensionFields = BTreeMap<String, Value>;
+
+#[cfg(test)]
+mod tests {
+    use super::ContentBlock;
+    use serde_json::json;
+
+    #[test]
+    fn image_content_uses_acp_camel_case_fields() {
+        let block = ContentBlock::Image {
+            mime_type: Some("image/png".into()),
+            data: Some("aGVsbG8=".into()),
+            uri: None,
+            extra: serde_json::Map::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(block).unwrap(),
+            json!({"type":"image", "mimeType":"image/png", "data":"aGVsbG8=", "uri":null})
+        );
+    }
+}

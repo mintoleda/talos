@@ -7,8 +7,9 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use talos_acp::{
     AcpClient, AcpError, AcpEvent, ConfigOption, PermissionDecision, PermissionFuture,
     PermissionHandler as AcpPermissionHandler, PermissionRequest as AcpPermissionRequest,
@@ -91,6 +92,15 @@ pub struct ProviderPromptResult {
     pub usage: Option<talos_acp::PromptUsage>,
 }
 
+/// An image payload passed through the provider-neutral prompt port.
+///
+/// The bytes are deliberately omitted from diagnostics and formatting. Adapters
+/// encode them only at the provider boundary.
+pub struct ProviderImage {
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
 /// A provider model with enough metadata for the UI to render a picker.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProviderModel {
@@ -149,6 +159,20 @@ pub trait ProviderSession: Send + Sync {
         text: &str,
         cancellation: &CancellationToken,
     ) -> Result<ProviderPromptResult, ProviderError>;
+    async fn prompt_with_images(
+        &self,
+        text: &str,
+        images: &[ProviderImage],
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderPromptResult, ProviderError> {
+        if !images.is_empty() {
+            return Err(ProviderError::Unsupported {
+                provider: self.provider_id().to_string(),
+                feature: "image prompts",
+            });
+        }
+        self.prompt(text, cancellation).await
+    }
     async fn cancel(&self) -> Result<(), ProviderError>;
     async fn set_mode(&self, mode_id: &str) -> Result<(), ProviderError>;
     async fn set_model(&self, model_id: &str) -> Result<(), ProviderError>;
@@ -364,6 +388,21 @@ struct AcpSession {
     config_options: Vec<ConfigOption>,
 }
 
+fn acp_prompt_blocks(text: &str, images: &[ProviderImage]) -> Vec<talos_acp::ContentBlock> {
+    let mut blocks = Vec::with_capacity(images.len() + 1);
+    blocks.push(talos_acp::ContentBlock::Text {
+        text: text.to_owned(),
+        extra: Map::new(),
+    });
+    blocks.extend(images.iter().map(|image| talos_acp::ContentBlock::Image {
+        mime_type: Some(image.mime_type.clone()),
+        data: Some(STANDARD.encode(&image.data)),
+        uri: None,
+        extra: Map::new(),
+    }));
+    blocks
+}
+
 impl AcpSession {
     fn new(
         id: ProviderId,
@@ -511,13 +550,25 @@ impl ProviderSession for AcpSession {
         text: &str,
         cancellation: &CancellationToken,
     ) -> Result<ProviderPromptResult, ProviderError> {
-        let block = talos_acp::ContentBlock::Text {
-            text: text.to_owned(),
-            extra: serde_json::Map::new(),
-        };
+        self.prompt_with_images(text, &[], cancellation).await
+    }
+
+    async fn prompt_with_images(
+        &self,
+        text: &str,
+        images: &[ProviderImage],
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderPromptResult, ProviderError> {
+        if !images.is_empty() && !self.capabilities.images {
+            return Err(ProviderError::Unsupported {
+                provider: self.id.to_string(),
+                feature: "image prompts",
+            });
+        }
+        let blocks = acp_prompt_blocks(text, images);
         let response = self
             .client
-            .prompt_cancellable(&self.native_id, &[block], cancellation)
+            .prompt_cancellable(&self.native_id, &blocks, cancellation)
             .await?;
         Ok(ProviderPromptResult {
             stop_reason: response.stop_reason,
@@ -563,4 +614,35 @@ fn executable_exists(command: &Path) -> bool {
     }
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|path| path.join(command).is_file()))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn acp_image_prompt_preserves_text_and_encodes_payload_at_provider_boundary() {
+        let blocks = acp_prompt_blocks(
+            "describe this",
+            &[ProviderImage {
+                mime_type: "image/png".into(),
+                data: b"image bytes".to_vec(),
+            }],
+        );
+
+        assert_eq!(
+            serde_json::to_value(blocks).unwrap(),
+            json!([
+                {"type": "text", "text": "describe this"},
+                {
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "data": "aW1hZ2UgYnl0ZXM=",
+                    "uri": null
+                }
+            ])
+        );
+    }
 }

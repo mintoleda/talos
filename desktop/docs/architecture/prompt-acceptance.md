@@ -11,6 +11,30 @@ with a newer, unsupported schema version are rejected rather than silently used.
 The keyed response includes `run_id`, `request_key`, the run's `status`, and
 `restored` (true when returning an already-accepted request).
 
+## Image prompts
+
+The additive IPC method `prompt_with_images` accepts the same text and
+`request_key` fields plus `image_paths: string[]`. CLI `--image PATH` options are
+resolved against the CLI working directory and sent as absolute paths. Existing
+text-only `prompt` requests retain their wire shape and fingerprint behavior.
+
+The daemon opens image paths without following symbolic links on Unix and
+requires a regular file. It recognizes PNG, JPEG, GIF, and WebP from file
+contents, accepts at most 8 images, limits each image to 16 MiB and all images
+to 32 MiB, and checks the negotiated provider image capability before
+acceptance. It stores bytes in the private `<TALOSD_HOME>/attachments/` directory
+under their SHA-256 key. The timeline stores an `Attachment` event with MIME,
+size, hash, and storage key; it never stores image bytes. The content file is
+synced and the directory entry is synced on Unix before the timeline reference
+is committed, so both survive daemon restart. The non-Unix helper does not
+claim directory-entry sync durability; non-Unix daemon IPC is not currently
+supported.
+
+Image keyed requests fingerprint the exact text, MIME types, order, and image
+content hashes. Text-only request keys continue using the v1 text fingerprint,
+so existing retry records remain compatible. Image bytes and base64 payloads
+are not included in application diagnostics.
+
 ## Contract
 
 - A key is scoped to one session, must not be whitespace-only, and is at most

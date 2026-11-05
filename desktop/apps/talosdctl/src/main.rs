@@ -201,6 +201,9 @@ enum SessionAction {
         text: String,
         #[arg(long)]
         request_key: Option<String>,
+        /// Attach a local image file (repeat for multiple images).
+        #[arg(long = "image", value_name = "PATH")]
+        image_paths: Vec<PathBuf>,
     },
     Cancel {
         id: String,
@@ -398,6 +401,45 @@ fn events_command(after: u64, limit: Option<u32>, command: Option<&EventsCommand
     }
 }
 
+fn prompt_command(
+    session_id: &str,
+    text: &str,
+    request_key: Option<&String>,
+    image_paths: &[PathBuf],
+) -> Result<Command> {
+    if text.trim().is_empty() {
+        bail!("prompt text cannot be empty");
+    }
+    if image_paths.is_empty() {
+        return Ok(Command::Prompt {
+            session_id: session_id.to_owned(),
+            text: text.to_owned(),
+            request_key: request_key.cloned(),
+        });
+    }
+
+    let cwd = std::env::current_dir().context("cannot resolve image paths")?;
+    let image_paths = image_paths
+        .iter()
+        .map(|path| {
+            let path = if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(path)
+            };
+            path.to_str()
+                .map(str::to_owned)
+                .context("image paths must be valid UTF-8")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Command::PromptWithImages {
+        session_id: session_id.to_owned(),
+        text: text.to_owned(),
+        image_paths,
+        request_key: request_key.cloned(),
+    })
+}
+
 fn session_command(action: &SessionAction) -> Result<Command> {
     match action {
         SessionAction::List { workspace } => Ok(Command::ListSessions {
@@ -462,16 +504,8 @@ fn session_command(action: &SessionAction) -> Result<Command> {
             id,
             text,
             request_key,
-        } => {
-            if text.trim().is_empty() {
-                bail!("prompt text cannot be empty");
-            }
-            Ok(Command::Prompt {
-                session_id: id.clone(),
-                text: text.clone(),
-                request_key: request_key.clone(),
-            })
-        }
+            image_paths,
+        } => prompt_command(id, text, request_key.as_ref(), image_paths),
         SessionAction::Cancel { id } => Ok(Command::Cancel {
             session_id: id.clone(),
         }),
@@ -856,6 +890,28 @@ mod tests {
                 session_id: "s1".into(),
                 text: "hello".into(),
                 request_key: Some("once".into())
+            }
+        );
+
+        let cli = Cli::try_parse_from([
+            "talosdctl",
+            "session",
+            "prompt",
+            "s1",
+            "describe",
+            "--image",
+            "/tmp/image.png",
+            "--request-key",
+            "image-once",
+        ])
+        .unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::PromptWithImages {
+                session_id: "s1".into(),
+                text: "describe".into(),
+                image_paths: vec!["/tmp/image.png".into()],
+                request_key: Some("image-once".into()),
             }
         );
 
