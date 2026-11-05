@@ -7,7 +7,6 @@
 //! reconnect so late events never land in the wrong session.
 
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     process::{Command as Process, Stdio},
     time::Duration,
@@ -55,10 +54,6 @@ pub enum Action {
     SetModel {
         session: String,
         model: String,
-    },
-    SetMode {
-        session: String,
-        mode: String,
     },
     SetConfig {
         session: String,
@@ -112,10 +107,6 @@ impl Action {
             Self::SetModel { session, model } => Command::SetModel {
                 session_id: session.clone(),
                 model_id: model.clone(),
-            },
-            Self::SetMode { session, mode } => Command::SetMode {
-                session_id: session.clone(),
-                mode_id: mode.clone(),
             },
             Self::SetConfig {
                 session,
@@ -307,6 +298,10 @@ impl Backend {
                     self.created_session = Some(session.id.clone());
                     self.view.sessions.insert(0, session);
                     self.view.notice = Some("Agent created.".into());
+                    // The provider's model catalogue is advertised by ACP when
+                    // its session is created. Refresh provider summaries now so
+                    // the composer picker can expose those concrete model IDs.
+                    self.submit(Action::Refresh);
                 }
             }
             Action::CreateWorkspace { name, path } => {
@@ -323,11 +318,6 @@ impl Backend {
             Action::SetModel { session, model } => {
                 if let Some(item) = self.view.session_mut(&session) {
                     item.model = Some(model);
-                }
-            }
-            Action::SetMode { session, mode } => {
-                if let Some(item) = self.view.session_mut(&session) {
-                    item.mode = Some(mode);
                 }
             }
             Action::SetConfig { .. } => {}
@@ -361,7 +351,6 @@ impl Backend {
                 self.view.pending.insert(id, PendingState::Failed);
             }
             Action::SetModel { session, .. }
-            | Action::SetMode { session, .. }
             | Action::SetConfig { session, .. }
             | Action::Rename { session, .. }
             | Action::CreateAgent {
@@ -448,20 +437,33 @@ fn parse_providers(value: Option<&Value>) -> Vec<ProviderSummary> {
                 .and_then(Value::as_str)
                 .unwrap_or(&id)
                 .to_owned();
-            let models = item
-                .get("models")
+            // Snapshot model_options uses ProviderModel { id, label, ... },
+            // while the legacy `models` field contains ModelRef { provider,
+            // model_id, ... }. Accept both wire shapes; otherwise Talos' ACP
+            // catalogue appears empty even though session/new advertised it.
+            let detailed_models = item
+                .get("model_options")
                 .and_then(Value::as_array)
+                .filter(|models| !models.is_empty());
+            let raw_models =
+                detailed_models.or_else(|| item.get("models").and_then(Value::as_array));
+            let models = raw_models
                 .into_iter()
                 .flatten()
                 .filter_map(|model| {
+                    let id = model
+                        .get("id")
+                        .or_else(|| model.get("model_id"))?
+                        .as_str()?
+                        .to_owned();
                     Some(crate::state::ModelSummary {
-                        id: model.get("id")?.as_str()?.to_owned(),
                         label: model
                             .get("label")
+                            .or_else(|| model.get("name"))
                             .and_then(Value::as_str)
-                            .or_else(|| model.get("id").and_then(Value::as_str))
-                            .unwrap_or_default()
+                            .unwrap_or(&id)
                             .to_owned(),
+                        id,
                         default: model
                             .get("is_default")
                             .and_then(Value::as_bool)
@@ -933,6 +935,26 @@ mod tests {
         assert_eq!(parsed[0].models[0].label, "Model 1");
         assert_eq!(parsed[0].modes[0].0, "auto");
         assert!(parsed[0].default);
+    }
+
+    #[test]
+    fn snapshot_parses_detailed_and_legacy_model_shapes() {
+        let providers = serde_json::json!([
+            {
+                "id": "talos", "display_name": "Talos",
+                "model_options": [{"id": "openai/gpt-5.6-luna", "label": "GPT 5.6 Luna"}],
+                "models": [{"provider": "talos", "model_id": "openai/gpt-5.6-luna"}]
+            },
+            {
+                "id": "claude", "display_name": "Claude",
+                "models": [{"provider": "claude", "model_id": "claude-sonnet-4-6"}]
+            }
+        ]);
+        let parsed = parse_providers(Some(&providers));
+        assert_eq!(parsed[0].models[0].id, "openai/gpt-5.6-luna");
+        assert_eq!(parsed[0].models[0].label, "GPT 5.6 Luna");
+        assert_eq!(parsed[1].models[0].id, "claude-sonnet-4-6");
+        assert_eq!(parsed[1].models[0].label, "claude-sonnet-4-6");
     }
 
     #[test]
