@@ -23,7 +23,9 @@ use talos_domain::{
     TimelineEventKind, ToolCall, ToolStatus, Usage, Workspace, WorkspaceId, WorkspaceKind,
     WorkspaceLifecycle,
 };
-use talos_store::{PromptRequestAcceptance, PromptRequestRecord, SessionSnapshot};
+use talos_store::{
+    PromptRequestAcceptance, PromptRequestRecord, SessionSnapshot, WorkspaceArchiveResult,
+};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -63,6 +65,10 @@ pub enum CoreError {
     RunNotFound(RunId),
     #[error("workspace path is not an existing directory: {0}")]
     InvalidWorkspacePath(String),
+    #[error("invalid workspace name: {0}")]
+    InvalidWorkspaceName(String),
+    #[error("workspace {0} has active runs and cannot be archived")]
+    WorkspaceHasActiveRuns(WorkspaceId),
     #[error("workspace is archived and cannot start a new agent")]
     WorkspaceArchived,
     #[error("session {0} has no persisted provider-native session handle")]
@@ -450,6 +456,51 @@ impl AppService {
         self.inner
             .store
             .run(move |store| store.workspace(id))
+            .await
+            .map_err(CoreError::Store)?
+            .ok_or(CoreError::WorkspaceNotFound(id))
+    }
+
+    pub async fn rename_workspace(
+        &self,
+        id: WorkspaceId,
+        name: impl Into<String>,
+    ) -> CoreResult<Workspace> {
+        self.ensure_running()?;
+        let name = name.into();
+        let mut candidate = self.workspace(id).await?;
+        candidate
+            .rename(name.clone())
+            .map_err(|error| CoreError::InvalidWorkspaceName(error.to_string()))?;
+        self.inner
+            .store
+            .run(move |store| store.rename_workspace(id, name))
+            .await
+            .map_err(CoreError::Store)?
+            .ok_or(CoreError::WorkspaceNotFound(id))
+    }
+
+    pub async fn archive_workspace(&self, id: WorkspaceId) -> CoreResult<Workspace> {
+        let _start_guard = self.inner.run_start_gate.lock().await;
+        self.ensure_running()?;
+        match self
+            .inner
+            .store
+            .run(move |store| store.archive_workspace(id))
+            .await
+            .map_err(CoreError::Store)?
+        {
+            WorkspaceArchiveResult::Archived(workspace) => Ok(workspace),
+            WorkspaceArchiveResult::NotFound => Err(CoreError::WorkspaceNotFound(id)),
+            WorkspaceArchiveResult::ActiveRuns => Err(CoreError::WorkspaceHasActiveRuns(id)),
+        }
+    }
+
+    pub async fn restore_workspace(&self, id: WorkspaceId) -> CoreResult<Workspace> {
+        self.ensure_running()?;
+        self.inner
+            .store
+            .run(move |store| store.restore_workspace(id))
             .await
             .map_err(CoreError::Store)?
             .ok_or(CoreError::WorkspaceNotFound(id))
@@ -2964,6 +3015,71 @@ mod tests {
             .await
             .unwrap();
         (service, created.session.id, provider)
+    }
+
+    #[tokio::test]
+    async fn workspace_lifecycle_preserves_sessions_and_rejects_active_runs() {
+        let home = TestHome::new();
+        let (service, session_id, _provider) = fixture_service_with_provider(&home).await;
+        let original = service.list_workspaces().await.unwrap().remove(0);
+        let session = service
+            .session_snapshot(session_id, 10)
+            .await
+            .unwrap()
+            .session;
+        let run_id = RunId::new();
+
+        service
+            .emit(
+                session_id,
+                Some(run_id),
+                TimelineEventKind::RunState {
+                    state: RunLifecycle::Running,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.archive_workspace(original.id).await,
+            Err(CoreError::WorkspaceHasActiveRuns(id)) if id == original.id
+        ));
+        assert_eq!(
+            service.workspace(original.id).await.unwrap().lifecycle,
+            WorkspaceLifecycle::Active
+        );
+
+        service
+            .emit(
+                session_id,
+                Some(run_id),
+                TimelineEventKind::RunState {
+                    state: RunLifecycle::Succeeded,
+                },
+            )
+            .await
+            .unwrap();
+        let renamed = service
+            .rename_workspace(original.id, "renamed fixture")
+            .await
+            .unwrap();
+        assert_eq!(renamed.id, original.id);
+        assert_eq!(renamed.name, "renamed fixture");
+        assert_eq!(renamed.created_at, original.created_at);
+
+        let archived = service.archive_workspace(original.id).await.unwrap();
+        assert_eq!(archived.lifecycle, WorkspaceLifecycle::Archived);
+        let restored = service.restore_workspace(original.id).await.unwrap();
+        assert_eq!(restored.lifecycle, WorkspaceLifecycle::Active);
+        assert_eq!(restored.id, original.id);
+        assert_eq!(
+            service
+                .session_snapshot(session_id, 10)
+                .await
+                .unwrap()
+                .session,
+            session
+        );
+        service.shutdown().await;
     }
 
     /// Poll a future exactly once. Used to enter the owned-operation path, then

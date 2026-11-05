@@ -155,6 +155,20 @@ pub enum WorkspaceLifecycle {
     Archived,
     Deleting,
 }
+impl WorkspaceLifecycle {
+    pub fn transition(&mut self, next: Self) -> Result<(), ValidationError> {
+        let ok = *self == next
+            || matches!(
+                (&*self, &next),
+                (Self::Active, Self::Archived) | (Self::Archived, Self::Active)
+            );
+        if !ok {
+            return Err(transition_error(self, &next));
+        }
+        *self = next;
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: WorkspaceId,
@@ -185,6 +199,24 @@ impl Workspace {
             created_at: now,
             updated_at: now,
         })
+    }
+
+    pub fn rename(&mut self, name: impl Into<String>) -> Result<(), ValidationError> {
+        self.name = nonempty(name.into(), 256)?;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn archive(&mut self) -> Result<(), ValidationError> {
+        self.lifecycle.transition(WorkspaceLifecycle::Archived)?;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub fn restore(&mut self) -> Result<(), ValidationError> {
+        self.lifecycle.transition(WorkspaceLifecycle::Active)?;
+        self.updated_at = Utc::now();
+        Ok(())
     }
 }
 
@@ -522,6 +554,42 @@ fn transition_error(from: &impl fmt::Debug, to: &impl fmt::Debug) -> ValidationE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_rename_archive_and_restore_preserve_identity() {
+        let mut workspace =
+            Workspace::new("before", "/tmp/workspace", WorkspaceKind::Directory).unwrap();
+        let id = workspace.id;
+        let created_at = workspace.created_at;
+
+        workspace.rename("after").unwrap();
+        assert_eq!(workspace.name, "after");
+        assert_eq!(workspace.id, id);
+        assert_eq!(workspace.created_at, created_at);
+
+        workspace.archive().unwrap();
+        assert_eq!(workspace.lifecycle, WorkspaceLifecycle::Archived);
+        workspace.archive().unwrap();
+        workspace.restore().unwrap();
+        assert_eq!(workspace.lifecycle, WorkspaceLifecycle::Active);
+        assert_eq!(workspace.id, id);
+        assert_eq!(workspace.created_at, created_at);
+    }
+
+    #[test]
+    fn workspace_rename_validates_name_and_deleting_cannot_be_restored() {
+        let mut workspace =
+            Workspace::new("before", "/tmp/workspace", WorkspaceKind::Directory).unwrap();
+        assert_eq!(workspace.rename("  "), Err(ValidationError::Empty));
+        assert_eq!(workspace.name, "before");
+
+        workspace.lifecycle = WorkspaceLifecycle::Deleting;
+        assert!(matches!(
+            workspace.restore(),
+            Err(ValidationError::InvalidTransition { .. })
+        ));
+    }
+
     #[test]
     fn ids_are_uuid_v7_and_round_trip() {
         let id = AgentId::new();

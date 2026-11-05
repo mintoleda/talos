@@ -29,6 +29,16 @@ pub enum Command {
         name: String,
         path: String,
     },
+    RenameWorkspace {
+        workspace_id: String,
+        name: String,
+    },
+    ArchiveWorkspace {
+        workspace_id: String,
+    },
+    RestoreWorkspace {
+        workspace_id: String,
+    },
     ListProviders,
     ProviderDiagnostics {
         provider_id: Option<String>,
@@ -724,6 +734,16 @@ mod tests {
 
     #[test]
     fn new_commands_serde_round_trip() {
+        round_trip(&Command::RenameWorkspace {
+            workspace_id: "workspace-1".into(),
+            name: "Renamed workspace".into(),
+        });
+        round_trip(&Command::ArchiveWorkspace {
+            workspace_id: "workspace-1".into(),
+        });
+        round_trip(&Command::RestoreWorkspace {
+            workspace_id: "workspace-1".into(),
+        });
         round_trip(&Command::ListPendingPermissions);
         round_trip(&Command::ListModels {
             provider_id: "talos".into(),
@@ -757,6 +777,28 @@ mod tests {
 
     #[test]
     fn new_commands_use_stable_snake_case_method_names() {
+        assert_eq!(
+            serde_json::to_value(&Command::RenameWorkspace {
+                workspace_id: "w".into(),
+                name: "n".into(),
+            })
+            .unwrap()["method"],
+            "rename_workspace"
+        );
+        assert_eq!(
+            serde_json::to_value(&Command::ArchiveWorkspace {
+                workspace_id: "w".into(),
+            })
+            .unwrap()["method"],
+            "archive_workspace"
+        );
+        assert_eq!(
+            serde_json::to_value(&Command::RestoreWorkspace {
+                workspace_id: "w".into(),
+            })
+            .unwrap()["method"],
+            "restore_workspace"
+        );
         assert_eq!(
             serde_json::to_value(&Command::ListPendingPermissions).unwrap()["method"],
             "list_pending_permissions"
