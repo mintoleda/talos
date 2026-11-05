@@ -46,7 +46,9 @@ func isolate(t *testing.T) (home, baseDir string) {
 	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
 	for _, k := range provider.All {
-		t.Setenv(k.EnvVar, "")
+		if k.EnvVar != "" { // OAuth providers have no env var
+			t.Setenv(k.EnvVar, "")
+		}
 	}
 	return home, baseDir
 }

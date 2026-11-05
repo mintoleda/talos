@@ -54,7 +54,7 @@ var slashCommands = []slashCommand{
 	{"/compact", "Compact conversation history (optionally: /compact <focus message>)", false},
 	{"/stats", "Show aggregate token usage and cache hit rate", false},
 	{"/resume", "Resume a session (optionally: /resume <id>)", false},
-	{"/login", "Add an API key for a provider", false},
+	{"/login", "Log in to a provider (API key or ChatGPT)", false},
 	{"/model", "Switch provider/model (optionally: /model <query>)", false},
 	{"/thinking", "Cycle thinking level", false},
 	{"/subagents", "Toggle subagent delegation on/off", false},
@@ -303,12 +303,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.relayout()
 
 	case dialogs.LoginDoneMsg:
-		if !msg.Canceled && msg.Provider != "" && msg.Key != "" {
+		if !msg.Canceled && msg.Provider != "" && (msg.Key != "" || msg.OAuth != nil) {
 			if m.cfg.Engine == nil {
 				m.chat = m.chat.AppendNotice("error", "engine unavailable")
 				return m, nil
 			}
-			if err := m.cfg.Engine.Login(msg.Provider, msg.Key); err != nil {
+			var err error
+			if msg.OAuth != nil {
+				// The OAuth flow ran in this process; persist on the engine side.
+				err = m.cfg.Engine.SaveOAuth(msg.Provider, *msg.OAuth)
+			} else {
+				err = m.cfg.Engine.Login(msg.Provider, msg.Key)
+			}
+			if err != nil {
 				m.chat = m.chat.AppendNotice("error", err.Error())
 			} else {
 				m.chat = m.chat.AppendNotice("info", "logged in to "+msg.Provider)

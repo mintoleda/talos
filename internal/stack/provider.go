@@ -8,6 +8,7 @@ import (
 	"github.com/mintoleda/talos/internal/memory"
 	"github.com/mintoleda/talos/internal/provider"
 	"github.com/mintoleda/talos/internal/provider/anthropic"
+	"github.com/mintoleda/talos/internal/provider/codex"
 	"github.com/mintoleda/talos/internal/provider/openai"
 	"github.com/mintoleda/talos/internal/session"
 )
@@ -25,6 +26,14 @@ func NewProvider(cfg *config.Config, noTools bool) (provider.Provider, *session.
 			MaxTokens:     8192,
 			ThinkingLevel: cfg.ThinkingLevel,
 		})
+	case codex.ProviderName:
+		// OAuth credentials are read (and refreshed) from auth.json per
+		// request; cfg.APIKey is unused.
+		base := CleanBaseURL(cfg.BaseURL)
+		if base == "https://api.deepseek.com" {
+			base = ""
+		}
+		prov = codex.New(base, cfg.BaseDir)
 	default:
 		// For all OpenAI-compatible providers, look up the canonical base URL
 		// from the known-provider registry so switchProvider works correctly
@@ -67,6 +76,9 @@ func NewProvider(cfg *config.Config, noTools bool) (provider.Provider, *session.
 // OpenAICompatibleBaseURL resolves the base URL for an OpenAI-compatible provider.
 func OpenAICompatibleBaseURL(baseDir, name, configured string) (string, error) {
 	base := CleanBaseURL(configured)
+	if kp, ok := provider.ByName(name); ok && kp.OAuth {
+		return "", fmt.Errorf("%s is not an OpenAI-compatible provider", name)
+	}
 	if name == "cloudflare" {
 		if base == "" || base == "https://api.deepseek.com" {
 			accountID := config.ResolveCloudflareAccountID(baseDir)

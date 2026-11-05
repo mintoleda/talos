@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/tui/dialogs"
@@ -71,6 +72,7 @@ func (e *fakeEngine) Stats() (int, int, int, int, int, float64, error) {
 }
 func (e *fakeEngine) LoginProviders() ([]dialogs.LoginProvider, error) { return nil, nil }
 func (e *fakeEngine) Login(string, string) error                       { return nil }
+func (e *fakeEngine) SaveOAuth(string, config.OAuthCredential) error   { return nil }
 func (e *fakeEngine) MCPStatus() (string, error)                       { return "", nil }
 func (e *fakeEngine) MCPCount() int                                    { return 0 }
 func (e *fakeEngine) CancelSubagent(string)                            {}

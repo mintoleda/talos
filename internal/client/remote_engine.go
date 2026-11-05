@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mintoleda/talos/internal/client/rpc"
+	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/tui/dialogs"
@@ -148,6 +149,10 @@ func (e *RemoteEngine) LoginProviders() ([]dialogs.LoginProvider, error) {
 
 func (e *RemoteEngine) Login(provider, key string) error {
 	return e.request(rpc.Login, rpc.LoginParams{Provider: provider, Key: key}, nil)
+}
+
+func (e *RemoteEngine) SaveOAuth(provider string, cred config.OAuthCredential) error {
+	return e.request(rpc.SaveOAuth, rpc.SaveOAuthParams{Provider: provider, Credential: cred}, nil)
 }
 
 func (e *RemoteEngine) MCPStatus() (string, error) {
