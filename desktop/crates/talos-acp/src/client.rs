@@ -13,7 +13,7 @@ use std::{
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -74,6 +74,17 @@ impl PermissionHandler for RejectPermissions {
 #[derive(Debug, Clone)]
 pub enum AcpEvent {
     SessionUpdate(Box<SessionUpdateNotification>),
+    /// Ordered drain barrier for the single event consumer.
+    ///
+    /// JSON-RPC prompt responses resolve independently of the notification
+    /// queue, so a prompt can complete while earlier `session/update` frames are
+    /// still queued. A producer enqueues this marker on the same ordered channel
+    /// and waits for `ack`; the consumer signals `ack` only after processing every
+    /// event ahead of the marker. That gives callers a race-free point at which
+    /// all provider notifications that preceded the prompt response are visible.
+    Barrier {
+        ack: Arc<Notify>,
+    },
     /// All session/load replay updates are emitted atomically after a successful
     /// load response; consumers can replace rather than append their projection.
     SessionReplay {
@@ -384,6 +395,28 @@ impl AcpClient {
     }
 
     /// Receive protocol updates and diagnostics. There is one ordered consumer.
+    /// Wait until every event already queued ahead of this call has been
+    /// consumed. The barrier is ordered behind notifications sent before it, so
+    /// a prompt result followed by this barrier cannot strand earlier tool or
+    /// assistant updates outside the prompt's run association.
+    ///
+    /// The consumer must acknowledge [`AcpEvent::Barrier`]. Core always runs
+    /// exactly one event consumer per session; callers that own the receiver
+    /// directly must do the same or this future will wait indefinitely.
+    pub async fn event_barrier(&self) -> Result<(), AcpError> {
+        let ack = Arc::new(Notify::new());
+        tokio::select! {
+            result = self.shared.events.send(AcpEvent::Barrier { ack: ack.clone() }) => {
+                result.map_err(|_| self.closed_error())?;
+            }
+            _ = self.shared.cancellation.cancelled() => return Err(self.closed_error()),
+        }
+        tokio::select! {
+            () = ack.notified() => Ok(()),
+            _ = self.shared.cancellation.cancelled() => Err(self.closed_error()),
+        }
+    }
+
     pub async fn next_event(&self) -> Option<AcpEvent> {
         let mut receiver = self.event_receiver.lock().await;
         // Keep the watch receiver's seen version across iterations. Re-cloning
@@ -1155,13 +1188,18 @@ async fn dispatch_server_request(shared: Arc<Shared>, id: RpcId, method: String,
             Ok(request) => {
                 let session_id = request.session_id.clone();
                 let (permission_id, cancellation) = shared.register_permission(&session_id);
-                let permission = shared
+                // Do not race the handler against its cancellation token here.
+                // Dropping the handler future at an await can interrupt an event
+                // append after SQLite persistence but before the in-memory
+                // sequence cache advances, corrupting later sequence allocation.
+                // The handler contract is to observe `cancellation` and return
+                // `Cancelled`; `ServicePermissionHandler` does exactly that, so
+                // awaiting it preserves cancellation semantics while keeping its
+                // own state transitions atomic.
+                let decision = shared
                     .permission_handler
-                    .request_permission(request, cancellation.clone());
-                let decision = tokio::select! {
-                    decision = permission => decision,
-                    _ = cancellation.cancelled() => PermissionDecision::Cancelled,
-                };
+                    .request_permission(request, cancellation.clone())
+                    .await;
                 shared.unregister_permission(&session_id, permission_id);
                 match serde_json::to_value(decision) {
                     Ok(value) => json!({ "jsonrpc": "2.0", "id": id, "result": value }),
