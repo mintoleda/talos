@@ -17,16 +17,17 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use talos_acp::{AcpEvent, SessionUpdateNotification};
 use talos_domain::{
-    Agent, AgentId, AgentLifecycle, DomainError, EventCursor, ModelRef, Notice, PermissionOutcome,
-    PermissionRequest, PermissionRequestId, PermissionRisk, ProviderDescriptor, ProviderId,
-    ProviderMode, RunId, RunLifecycle, Session, SessionId, SessionLifecycle, TimelineEvent,
-    TimelineEventKind, ToolCall, ToolStatus, Usage, Workspace, WorkspaceId, WorkspaceKind,
-    WorkspaceLifecycle,
+    Agent, AgentId, AgentLifecycle, Attachment, DomainError, EventCursor, ModelRef, Notice,
+    PermissionOutcome, PermissionRequest, PermissionRequestId, PermissionRisk, ProviderDescriptor,
+    ProviderId, ProviderMode, RunId, RunLifecycle, Session, SessionId, SessionLifecycle,
+    TimelineEvent, TimelineEventKind, ToolCall, ToolStatus, Usage, Workspace, WorkspaceId,
+    WorkspaceKind, WorkspaceLifecycle,
 };
 use talos_store::{
     PromptRequestAcceptance, PromptRequestRecord, SessionSnapshot, WorkspaceArchiveResult,
 };
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -35,8 +36,8 @@ use crate::{
     config::{self, AppConfig, ConfigError, HomePaths},
     provider::{
         self, AgentProvider, PermissionHandler, ProviderDiagnostic, ProviderError, ProviderEvent,
-        ProviderModel, ProviderPermissionDecision, ProviderPermissionRequest, ProviderPromptResult,
-        ProviderSession,
+        ProviderImage, ProviderModel, ProviderPermissionDecision, ProviderPermissionRequest,
+        ProviderPromptResult, ProviderSession,
     },
     store_actor::StoreActor,
 };
@@ -85,6 +86,10 @@ pub enum CoreError {
         "prompt request key was already accepted with a different payload for session {session}"
     )]
     PromptRequestKeyConflict { session: SessionId },
+    #[error("provider does not support image prompts")]
+    ImagePromptUnsupported,
+    #[error("invalid image attachment: {0}")]
+    InvalidImage(String),
     #[error("permission request {0} is not pending")]
     PermissionNotPending(PermissionRequestId),
     #[error("permission option {option:?} is not valid for request {request}")]
@@ -118,7 +123,29 @@ pub struct AcceptedPrompt {
     pub restored: bool,
 }
 
+struct PreparedImage {
+    attachment: Attachment,
+    bytes: Vec<u8>,
+}
+
+struct KeyedPromptStart {
+    run_id: RunId,
+    text: String,
+    attachments: Vec<Attachment>,
+    images: Vec<ProviderImage>,
+    request_key: String,
+    fingerprint: String,
+}
+
+enum KeyedPromptAcceptance {
+    Accepted,
+    Existing(AcceptedPrompt),
+}
+
 const MAX_PROMPT_REQUEST_KEY_BYTES: usize = 256;
+const MAX_PROMPT_IMAGE_COUNT: usize = 8;
+const MAX_PROMPT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PROMPT_IMAGES_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PermissionOptionSummary {
@@ -754,7 +781,7 @@ impl AppService {
         text: impl Into<String>,
     ) -> CoreResult<RunId> {
         Ok(self
-            .submit_prompt(session_id, text.into(), None)
+            .submit_prompt(session_id, text.into(), Vec::new(), None)
             .await?
             .run_id)
     }
@@ -773,7 +800,26 @@ impl AppService {
         text: impl Into<String>,
         request_key: impl Into<String>,
     ) -> CoreResult<AcceptedPrompt> {
-        self.submit_prompt(session_id, text.into(), Some(request_key.into()))
+        self.submit_prompt(
+            session_id,
+            text.into(),
+            Vec::new(),
+            Some(request_key.into()),
+        )
+        .await
+    }
+
+    /// Submit a text prompt with local image files. Files are validated and
+    /// copied into the Rust-owned home before their durable timeline references
+    /// are accepted. The optional key fingerprints both the text and image bytes.
+    pub async fn send_prompt_with_images(
+        &self,
+        session_id: SessionId,
+        text: impl Into<String>,
+        image_paths: Vec<PathBuf>,
+        request_key: Option<String>,
+    ) -> CoreResult<AcceptedPrompt> {
+        self.submit_prompt(session_id, text.into(), image_paths, request_key)
             .await
     }
 
@@ -781,6 +827,7 @@ impl AppService {
         &self,
         session_id: SessionId,
         text: String,
+        image_paths: Vec<PathBuf>,
         request_key: Option<String>,
     ) -> CoreResult<AcceptedPrompt> {
         // Acceptance runs in an owned task so dropping the requesting future cannot
@@ -790,7 +837,7 @@ impl AppService {
         let (reply, response) = oneshot::channel();
         tokio::spawn(async move {
             let result = service
-                .submit_prompt_owned(session_id, text, request_key)
+                .submit_prompt_owned(session_id, text, image_paths, request_key)
                 .await;
             let _ = reply.send(result);
         });
@@ -803,16 +850,21 @@ impl AppService {
         &self,
         session_id: SessionId,
         text: String,
+        image_paths: Vec<PathBuf>,
         request_key: Option<String>,
     ) -> CoreResult<AcceptedPrompt> {
         self.ensure_running()?;
         if text.trim().is_empty() {
             return Err(CoreError::Other("prompt text must not be empty".into()));
         }
+        let prepared_images = prepare_prompt_images(image_paths).await?;
         let keyed = request_key
             .map(|key| -> CoreResult<(String, String)> {
                 validate_prompt_request_key(&key)?;
-                Ok((key, prompt_payload_fingerprint(&text)))
+                Ok((
+                    key,
+                    prompt_payload_fingerprint_with_images(&text, &prepared_images),
+                ))
             })
             .transpose()?;
         let _start_guard = self.inner.run_start_gate.lock().await;
@@ -847,6 +899,9 @@ impl AppService {
             .get(&session_id)
             .cloned()
             .ok_or(CoreError::SessionNotLoaded(session_id))?;
+        if !prepared_images.is_empty() && !runtime.provider.capabilities().images {
+            return Err(CoreError::ImagePromptUnsupported);
+        }
         let run_id = RunId::new();
         {
             let mut active = runtime
@@ -864,13 +919,98 @@ impl AppService {
             .write()
             .await
             .insert(run_id, control.clone());
+        let attachments = match self.persist_prompt_images(&prepared_images).await {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                self.discard_unstarted_run(&runtime, run_id).await;
+                return Err(error);
+            }
+        };
+        let provider_images = prepared_images
+            .into_iter()
+            .map(|image| ProviderImage {
+                mime_type: image.attachment.mime_type,
+                data: image.bytes,
+            })
+            .collect();
         if let Some((request_key, fingerprint)) = keyed {
-            self.start_keyed_prompt(runtime, control, run_id, text, request_key, fingerprint)
-                .await
+            self.start_keyed_prompt(
+                runtime,
+                control,
+                KeyedPromptStart {
+                    run_id,
+                    text,
+                    attachments,
+                    images: provider_images,
+                    request_key,
+                    fingerprint,
+                },
+            )
+            .await
         } else {
-            self.start_unkeyed_prompt(runtime, control, run_id, text)
+            self.start_unkeyed_prompt(runtime, control, run_id, text, attachments, provider_images)
                 .await
         }
+    }
+
+    async fn persist_prompt_images(&self, images: &[PreparedImage]) -> CoreResult<Vec<Attachment>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let directory = self.inner.paths.home.join("attachments");
+        let created = match tokio::fs::create_dir(&directory).await {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error.into()),
+        };
+        let directory_metadata = tokio::fs::symlink_metadata(&directory).await?;
+        if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+            return Err(CoreError::InvalidImage(
+                "attachment storage is not a private directory".into(),
+            ));
+        }
+        set_private_directory_permissions(&directory).await?;
+        if created {
+            // Persist the new directory entry in the home before any timeline
+            // event can refer to content inside it.
+            sync_attachment_directory(&self.inner.paths.home).await?;
+        }
+
+        for image in images {
+            let target = directory.join(&image.attachment.storage_key);
+            match tokio::fs::symlink_metadata(&target).await {
+                Ok(_) => verify_stored_image(&target, image).await?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::now_v7()));
+                    let write_result = async {
+                        let mut file = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&temporary)
+                            .await?;
+                        file.write_all(&image.bytes).await?;
+                        file.sync_all().await?;
+                        set_private_file_permissions(&temporary).await?;
+                        match tokio::fs::hard_link(&temporary, &target).await {
+                            Ok(()) => Ok(()),
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                                verify_stored_image(&target, image).await
+                            }
+                            Err(error) => Err(CoreError::Io(error)),
+                        }
+                    }
+                    .await;
+                    let _ = tokio::fs::remove_file(&temporary).await;
+                    write_result?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        sync_attachment_directory(&directory).await?;
+        Ok(images
+            .iter()
+            .map(|image| image.attachment.clone())
+            .collect())
     }
 
     async fn start_unkeyed_prompt(
@@ -879,6 +1019,8 @@ impl AppService {
         control: Arc<RunControl>,
         run_id: RunId,
         text: String,
+        attachments: Vec<Attachment>,
+        images: Vec<ProviderImage>,
     ) -> CoreResult<AcceptedPrompt> {
         let session_id = runtime.session.id;
         let startup = async {
@@ -888,6 +1030,14 @@ impl AppService {
                 TimelineEventKind::UserText { text: text.clone() },
             )
             .await?;
+            for attachment in &attachments {
+                self.emit(
+                    session_id,
+                    Some(run_id),
+                    TimelineEventKind::Attachment(attachment.clone()),
+                )
+                .await?;
+            }
             self.set_run_state(run_id, RunLifecycle::Starting).await?;
             self.mark_agent_busy(runtime.agent.id).await?;
             if control.cancellation.is_cancelled() {
@@ -917,7 +1067,7 @@ impl AppService {
             }
             return Err(error);
         }
-        self.spawn_run(run_id, runtime, control, text).await;
+        self.spawn_run(run_id, runtime, control, text, images).await;
         Ok(AcceptedPrompt {
             run_id,
             state: RunLifecycle::Running,
@@ -929,11 +1079,16 @@ impl AppService {
         &self,
         runtime: Arc<SessionRuntime>,
         control: Arc<RunControl>,
-        run_id: RunId,
-        text: String,
-        request_key: String,
-        fingerprint: String,
+        prompt: KeyedPromptStart,
     ) -> CoreResult<AcceptedPrompt> {
+        let KeyedPromptStart {
+            run_id,
+            text,
+            attachments,
+            images,
+            request_key,
+            fingerprint,
+        } = prompt;
         let session_id = runtime.session.id;
         let record = PromptRequestRecord {
             session_id,
@@ -946,64 +1101,11 @@ impl AppService {
         // that lands during acceptance is observed after the transaction commits.
         *control.state.lock().await = RunLifecycle::Starting;
         control.state_tx.send_replace(RunLifecycle::Starting);
-        // Sequence allocation and the key + UserText + Starting transaction share
-        // this lock so concurrent emitters cannot allocate the same sequences.
-        let mut sequences = self.inner.sequence.lock().await;
-        let prepared = self
-            .prepare_keyed_acceptance_locked(session_id, run_id, &text, &mut sequences)
-            .await;
-        let (second, events) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                drop(sequences);
-                self.discard_unstarted_run(&runtime, run_id).await;
-                return Err(error);
-            }
-        };
-        let acceptance = match self
-            .inner
-            .store
-            .run({
-                let record = record.clone();
-                let events = events.clone();
-                move |store| store.accept_prompt_request(&record, &events)
-            })
-            .await
-        {
-            Ok(acceptance) => acceptance,
-            Err(error) => {
-                drop(sequences);
-                self.discard_unstarted_run(&runtime, run_id).await;
-                return Err(CoreError::Store(error));
-            }
-        };
-        match acceptance {
-            PromptRequestAcceptance::Accepted(_) => {
-                sequences.insert(session_id, second);
-            }
-            PromptRequestAcceptance::Existing(existing) => {
-                drop(sequences);
-                self.discard_unstarted_run(&runtime, run_id).await;
-                let state = self
-                    .accepted_prompt_state(session_id, existing.run_id)
-                    .await?;
-                return Ok(AcceptedPrompt {
-                    run_id: existing.run_id,
-                    state,
-                    restored: true,
-                });
-            }
-            PromptRequestAcceptance::Conflict { .. } => {
-                drop(sequences);
-                self.discard_unstarted_run(&runtime, run_id).await;
-                return Err(CoreError::PromptRequestKeyConflict {
-                    session: session_id,
-                });
-            }
-        }
-        drop(sequences);
-        for event in events {
-            let _ = self.inner.events.send(event);
+        let acceptance = self
+            .persist_keyed_prompt_acceptance(&runtime, &record, &text, &attachments)
+            .await?;
+        if let KeyedPromptAcceptance::Existing(accepted) = acceptance {
+            return Ok(accepted);
         }
 
         if let Err(error) = self.mark_agent_busy(runtime.agent.id).await {
@@ -1025,7 +1127,7 @@ impl AppService {
                 .await;
             return Err(error);
         }
-        self.spawn_run(run_id, runtime, control, text).await;
+        self.spawn_run(run_id, runtime, control, text, images).await;
         Ok(AcceptedPrompt {
             run_id,
             state: RunLifecycle::Running,
@@ -1033,38 +1135,127 @@ impl AppService {
         })
     }
 
+    async fn persist_keyed_prompt_acceptance(
+        &self,
+        runtime: &Arc<SessionRuntime>,
+        record: &PromptRequestRecord,
+        text: &str,
+        attachments: &[Attachment],
+    ) -> CoreResult<KeyedPromptAcceptance> {
+        let session_id = record.session_id;
+        let run_id = record.run_id;
+        // Sequence allocation and the key + UserText + attachment + Starting
+        // transaction share this lock to prevent concurrent sequence reuse.
+        let mut sequences = self.inner.sequence.lock().await;
+        let prepared = self
+            .prepare_keyed_acceptance_locked(session_id, run_id, text, attachments, &mut sequences)
+            .await;
+        let (last_sequence, events) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(sequences);
+                self.discard_unstarted_run(runtime, run_id).await;
+                return Err(error);
+            }
+        };
+        let acceptance = match self
+            .inner
+            .store
+            .run({
+                let record = record.clone();
+                let events = events.clone();
+                move |store| store.accept_prompt_request(&record, &events)
+            })
+            .await
+        {
+            Ok(acceptance) => acceptance,
+            Err(error) => {
+                drop(sequences);
+                self.discard_unstarted_run(runtime, run_id).await;
+                return Err(CoreError::Store(error));
+            }
+        };
+        match acceptance {
+            PromptRequestAcceptance::Accepted(_) => {
+                sequences.insert(session_id, last_sequence);
+            }
+            PromptRequestAcceptance::Existing(existing) => {
+                drop(sequences);
+                self.discard_unstarted_run(runtime, run_id).await;
+                let state = self
+                    .accepted_prompt_state(session_id, existing.run_id)
+                    .await?;
+                return Ok(KeyedPromptAcceptance::Existing(AcceptedPrompt {
+                    run_id: existing.run_id,
+                    state,
+                    restored: true,
+                }));
+            }
+            PromptRequestAcceptance::Conflict { .. } => {
+                drop(sequences);
+                self.discard_unstarted_run(runtime, run_id).await;
+                return Err(CoreError::PromptRequestKeyConflict {
+                    session: session_id,
+                });
+            }
+        }
+        drop(sequences);
+        for event in events {
+            let _ = self.inner.events.send(event);
+        }
+        Ok(KeyedPromptAcceptance::Accepted)
+    }
+
     async fn prepare_keyed_acceptance_locked(
         &self,
         session_id: SessionId,
         run_id: RunId,
         text: &str,
+        attachments: &[Attachment],
         sequences: &mut HashMap<SessionId, u64>,
     ) -> CoreResult<(u64, Vec<TimelineEvent>)> {
-        let first = self.next_sequence_locked(session_id, sequences).await?;
-        let second = first
-            .checked_add(1)
-            .ok_or_else(|| CoreError::Other("event sequence is exhausted".into()))?;
-        let events = vec![
+        let mut sequence = self.next_sequence_locked(session_id, sequences).await?;
+        let mut events = Vec::with_capacity(attachments.len() + 2);
+        events.push(
             TimelineEvent::new(
                 session_id,
                 Some(run_id),
-                first,
+                sequence,
                 TimelineEventKind::UserText {
                     text: text.to_owned(),
                 },
             )
             .map_err(|error| CoreError::Other(error.to_string()))?,
+        );
+        for attachment in attachments {
+            sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| CoreError::Other("event sequence is exhausted".into()))?;
+            events.push(
+                TimelineEvent::new(
+                    session_id,
+                    Some(run_id),
+                    sequence,
+                    TimelineEventKind::Attachment(attachment.clone()),
+                )
+                .map_err(|error| CoreError::Other(error.to_string()))?,
+            );
+        }
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Other("event sequence is exhausted".into()))?;
+        events.push(
             TimelineEvent::new(
                 session_id,
                 Some(run_id),
-                second,
+                sequence,
                 TimelineEventKind::RunState {
                     state: RunLifecycle::Starting,
                 },
             )
             .map_err(|error| CoreError::Other(error.to_string()))?,
-        ];
-        Ok((second, events))
+        );
+        Ok((sequence, events))
     }
 
     async fn mark_agent_busy(&self, agent_id: AgentId) -> CoreResult<()> {
@@ -1090,10 +1281,13 @@ impl AppService {
         runtime: Arc<SessionRuntime>,
         control: Arc<RunControl>,
         text: String,
+        images: Vec<ProviderImage>,
     ) {
         let service = self.clone();
         let task = tokio::spawn(async move {
-            service.execute_run(run_id, runtime, control, text).await;
+            service
+                .execute_run(run_id, runtime, control, text, images)
+                .await;
         });
         let mut tasks = self.inner.run_tasks.lock().await;
         tasks.retain(|_, task| !task.is_finished());
@@ -1158,10 +1352,12 @@ impl AppService {
         runtime: Arc<SessionRuntime>,
         control: Arc<RunControl>,
         text: String,
+        images: Vec<ProviderImage>,
     ) {
         let result = run_provider_prompt(
             &runtime.provider,
             &text,
+            &images,
             &control.cancellation,
             Duration::from_millis(self.inner.config.read().await.shutdown_grace_ms),
         )
@@ -2676,10 +2872,11 @@ async fn publish_acp_update(
 async fn run_provider_prompt(
     provider: &Arc<dyn ProviderSession>,
     text: &str,
+    images: &[ProviderImage],
     cancellation: &CancellationToken,
     shutdown_grace: Duration,
 ) -> Result<ProviderPromptResult, ProviderError> {
-    let prompt = provider.prompt(text, cancellation);
+    let prompt = provider.prompt_with_images(text, images, cancellation);
     tokio::pin!(prompt);
     tokio::select! {
         result = &mut prompt => result,
@@ -2717,6 +2914,268 @@ fn prompt_payload_fingerprint(text: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn prompt_payload_fingerprint_with_images(text: &str, images: &[PreparedImage]) -> String {
+    if images.is_empty() {
+        return prompt_payload_fingerprint(text);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"paseo.prompt.image.v1\0");
+    hasher.update(u64::try_from(text.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(text.as_bytes());
+    hasher.update(
+        u64::try_from(images.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for image in images {
+        let mime_type = image.attachment.mime_type.as_bytes();
+        hasher.update(
+            u64::try_from(mime_type.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        hasher.update(mime_type);
+        hasher.update(
+            image
+                .attachment
+                .sha256
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+async fn prepare_prompt_images(paths: Vec<PathBuf>) -> CoreResult<Vec<PreparedImage>> {
+    if paths.len() > MAX_PROMPT_IMAGE_COUNT {
+        return Err(CoreError::InvalidImage(format!(
+            "at most {MAX_PROMPT_IMAGE_COUNT} images may be attached"
+        )));
+    }
+    let mut total_bytes = 0_usize;
+    let mut images = Vec::with_capacity(paths.len());
+    for path in paths {
+        let file = tokio::fs::File::from_std(open_image_source(&path)?);
+        let opened_metadata = file.metadata().await?;
+        if !opened_metadata.is_file() {
+            return Err(CoreError::InvalidImage(
+                "image source must be a regular file".into(),
+            ));
+        }
+        let path_size = usize::try_from(opened_metadata.len()).unwrap_or(usize::MAX);
+        if path_size == 0 {
+            return Err(CoreError::InvalidImage("image file is empty".into()));
+        }
+        if path_size > MAX_PROMPT_IMAGE_BYTES {
+            return Err(CoreError::InvalidImage(format!(
+                "image exceeds the {MAX_PROMPT_IMAGE_BYTES}-byte limit"
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(path_size)
+            .ok_or_else(|| CoreError::InvalidImage("total image size overflowed".into()))?;
+        if total_bytes > MAX_PROMPT_IMAGES_TOTAL_BYTES {
+            return Err(CoreError::InvalidImage(format!(
+                "combined images exceed the {MAX_PROMPT_IMAGES_TOTAL_BYTES}-byte limit"
+            )));
+        }
+
+        let mut bytes = Vec::with_capacity(path_size);
+        file.take(u64::try_from(MAX_PROMPT_IMAGE_BYTES + 1).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.is_empty() {
+            return Err(CoreError::InvalidImage("image file is empty".into()));
+        }
+        if bytes.len() > MAX_PROMPT_IMAGE_BYTES {
+            return Err(CoreError::InvalidImage(format!(
+                "image exceeds the {MAX_PROMPT_IMAGE_BYTES}-byte limit"
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_sub(path_size)
+            .and_then(|total| total.checked_add(bytes.len()))
+            .ok_or_else(|| CoreError::InvalidImage("total image size overflowed".into()))?;
+        if total_bytes > MAX_PROMPT_IMAGES_TOTAL_BYTES {
+            return Err(CoreError::InvalidImage(format!(
+                "combined images exceed the {MAX_PROMPT_IMAGES_TOTAL_BYTES}-byte limit"
+            )));
+        }
+        let mime_type = sniff_image_mime(&bytes).ok_or_else(|| {
+            CoreError::InvalidImage("image format is not one of PNG, JPEG, GIF, or WebP".into())
+        })?;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let name = path.file_name().map_or_else(
+            || "image".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let mut attachment = Attachment::new(
+            name,
+            mime_type,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            sha256.clone(),
+        )
+        .map_err(|error| CoreError::InvalidImage(error.to_string()))?;
+        attachment.sha256 = Some(sha256);
+        images.push(PreparedImage { attachment, bytes });
+    }
+    Ok(images)
+}
+
+#[cfg(unix)]
+fn open_image_source(path: &Path) -> CoreResult<std::fs::File> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    if !path.is_absolute() {
+        return Err(CoreError::InvalidImage(
+            "image paths must be absolute".into(),
+        ));
+    }
+    let components: Vec<_> = path.components().collect();
+    let mut directory = std::fs::File::open("/")?;
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            std::path::Component::Prefix(_) => {
+                return Err(CoreError::InvalidImage(
+                    "image path contains an unsupported prefix".into(),
+                ));
+            }
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(CoreError::InvalidImage(
+                    "image paths must not traverse parent directories".into(),
+                ));
+            }
+            std::path::Component::Normal(part) => {
+                let is_final = !components[index + 1..]
+                    .iter()
+                    .any(|next| matches!(next, std::path::Component::Normal(_)));
+                let flags = if is_final {
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK
+                } else {
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+                };
+                let descriptor = openat(&directory, *part, flags, Mode::empty())
+                    .map_err(std::io::Error::from)?;
+                let opened = std::fs::File::from(descriptor);
+                if is_final {
+                    if !opened.metadata()?.is_file() {
+                        return Err(CoreError::InvalidImage(
+                            "image source must be a regular file".into(),
+                        ));
+                    }
+                    return Ok(opened);
+                }
+                directory = opened;
+            }
+        }
+    }
+    Err(CoreError::InvalidImage(
+        "image source must name a regular file".into(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn open_image_source(path: &Path) -> CoreResult<std::fs::File> {
+    if !path.is_absolute() {
+        return Err(CoreError::InvalidImage(
+            "image paths must be absolute".into(),
+        ));
+    }
+    let components: Vec<_> = path.components().collect();
+    let mut current = PathBuf::new();
+    let mut final_metadata = None;
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            std::path::Component::RootDir => current.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(CoreError::InvalidImage(
+                    "image paths must not traverse parent directories".into(),
+                ));
+            }
+            std::path::Component::Normal(part) => {
+                current.push(part);
+                let metadata = std::fs::symlink_metadata(&current)?;
+                if metadata.file_type().is_symlink() {
+                    return Err(CoreError::InvalidImage(
+                        "image paths must not traverse symbolic links".into(),
+                    ));
+                }
+                let has_later_name = components[index + 1..]
+                    .iter()
+                    .any(|next| matches!(next, std::path::Component::Normal(_)));
+                if has_later_name && !metadata.is_dir() {
+                    return Err(CoreError::InvalidImage(
+                        "image path contains a non-directory component".into(),
+                    ));
+                }
+                if !has_later_name {
+                    if !metadata.is_file() {
+                        return Err(CoreError::InvalidImage(
+                            "image source must be a regular file".into(),
+                        ));
+                    }
+                    final_metadata = Some(metadata);
+                }
+            }
+        }
+    }
+    let path_metadata = final_metadata
+        .ok_or_else(|| CoreError::InvalidImage("image source must name a regular file".into()))?;
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() || !same_file_identity(&path_metadata, &file.metadata()?) {
+        return Err(CoreError::InvalidImage(
+            "image source changed during validation".into(),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+}
+
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+async fn verify_stored_image(path: &Path, image: &PreparedImage) -> CoreResult<()> {
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CoreError::InvalidImage(
+            "stored attachment is not a regular file".into(),
+        ));
+    }
+    if metadata.len() != u64::try_from(image.bytes.len()).unwrap_or(u64::MAX) {
+        return Err(CoreError::InvalidImage(
+            "stored attachment failed its integrity check".into(),
+        ));
+    }
+    let bytes = tokio::fs::read(path).await?;
+    if format!("{:x}", Sha256::digest(&bytes))
+        != image.attachment.sha256.as_deref().unwrap_or_default()
+    {
+        return Err(CoreError::InvalidImage(
+            "stored attachment failed its integrity check".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn is_terminal_run(state: &RunLifecycle) -> bool {
     matches!(
         state,
@@ -2745,8 +3204,31 @@ async fn set_private_directory_permissions(path: &Path) -> Result<(), std::io::E
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await
 }
 
+#[cfg(unix)]
+async fn sync_attachment_directory(path: &Path) -> Result<(), std::io::Error> {
+    tokio::fs::File::open(path).await?.sync_all().await
+}
+
+#[cfg(unix)]
+async fn set_private_file_permissions(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await
+}
+
 #[cfg(not(unix))]
 async fn set_private_directory_permissions(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+// Non-Unix platforms currently have no supported daemon IPC target, and this
+// fallback does not promise durable directory-entry synchronization.
+#[cfg(not(unix))]
+async fn sync_attachment_directory(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn set_private_file_permissions(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
@@ -2788,6 +3270,8 @@ mod tests {
         id: ProviderId,
         next_session: AtomicUsize,
         prompts: Arc<AtomicUsize>,
+        received_images: Arc<AtomicUsize>,
+        image_support: bool,
     }
 
     impl FixtureProvider {
@@ -2796,11 +3280,22 @@ mod tests {
                 id,
                 next_session: AtomicUsize::new(0),
                 prompts: Arc::new(AtomicUsize::new(0)),
+                received_images: Arc::new(AtomicUsize::new(0)),
+                image_support: false,
             }
+        }
+
+        fn with_image_support(mut self) -> Self {
+            self.image_support = true;
+            self
         }
 
         fn prompts(&self) -> usize {
             self.prompts.load(AtomicOrdering::Relaxed)
+        }
+
+        fn received_images(&self) -> usize {
+            self.received_images.load(AtomicOrdering::Relaxed)
         }
 
         fn session(
@@ -2813,6 +3308,8 @@ mod tests {
                 native_id,
                 permissions,
                 prompts: self.prompts.clone(),
+                received_images: self.received_images.clone(),
+                image_support: self.image_support,
             })
         }
     }
@@ -2829,7 +3326,7 @@ mod tests {
                     id: self.id.clone(),
                     display_name: "Fixture".into(),
                     available: true,
-                    capabilities: fixture_capabilities(),
+                    capabilities: fixture_capabilities_with_images(self.image_support),
                     modes: fixture_modes(),
                     models: fixture_models(&self.id),
                 },
@@ -2864,6 +3361,8 @@ mod tests {
         native_id: String,
         permissions: Arc<dyn PermissionHandler>,
         prompts: Arc<AtomicUsize>,
+        received_images: Arc<AtomicUsize>,
+        image_support: bool,
     }
 
     #[async_trait::async_trait]
@@ -2877,7 +3376,7 @@ mod tests {
         }
 
         fn capabilities(&self) -> talos_domain::Capabilities {
-            fixture_capabilities()
+            fixture_capabilities_with_images(self.image_support)
         }
 
         fn modes(&self) -> Vec<ProviderMode> {
@@ -2939,6 +3438,17 @@ mod tests {
             }
         }
 
+        async fn prompt_with_images(
+            &self,
+            text: &str,
+            images: &[ProviderImage],
+            cancellation: &CancellationToken,
+        ) -> Result<ProviderPromptResult, ProviderError> {
+            self.received_images
+                .store(images.len(), AtomicOrdering::Relaxed);
+            self.prompt(text, cancellation).await
+        }
+
         async fn cancel(&self) -> Result<(), ProviderError> {
             Ok(())
         }
@@ -2963,10 +3473,15 @@ mod tests {
     }
 
     fn fixture_capabilities() -> Capabilities {
+        fixture_capabilities_with_images(false)
+    }
+
+    fn fixture_capabilities_with_images(images: bool) -> Capabilities {
         Capabilities {
             streaming: true,
             modes: true,
             permissions: true,
+            images,
             model_selection: true,
             config_options: true,
             ..Capabilities::default()
@@ -3001,10 +3516,27 @@ mod tests {
     async fn fixture_service_with_provider(
         home: &TestHome,
     ) -> (AppService, SessionId, Arc<FixtureProvider>) {
+        fixture_service_with_image_capability(home, false).await
+    }
+
+    async fn fixture_service_with_image_provider(
+        home: &TestHome,
+    ) -> (AppService, SessionId, Arc<FixtureProvider>) {
+        fixture_service_with_image_capability(home, true).await
+    }
+
+    async fn fixture_service_with_image_capability(
+        home: &TestHome,
+        image_support: bool,
+    ) -> (AppService, SessionId, Arc<FixtureProvider>) {
         tokio::fs::create_dir_all(home.workspace()).await.unwrap();
         let service = AppService::open_at(home.home()).await.unwrap();
         let provider_id = ProviderId::new("fixture").unwrap();
-        let provider = Arc::new(FixtureProvider::new(provider_id.clone()));
+        let provider = Arc::new(if image_support {
+            FixtureProvider::new(provider_id.clone()).with_image_support()
+        } else {
+            FixtureProvider::new(provider_id.clone())
+        });
         service.register_provider(provider.clone()).await;
         let workspace = service
             .create_workspace("fixture", home.workspace(), WorkspaceKind::Directory)
@@ -3015,6 +3547,215 @@ mod tests {
             .await
             .unwrap();
         (service, created.session.id, provider)
+    }
+
+    fn fixture_png() -> Vec<u8> {
+        b"\x89PNG\r\n\x1a\nfixture image bytes".to_vec()
+    }
+
+    #[tokio::test]
+    async fn image_prompts_are_capability_gated_and_refs_survive_restart() {
+        let home = TestHome::new();
+        let (service, session_id, provider) = fixture_service_with_image_provider(&home).await;
+        let image_path = home.root.join("input.jpg");
+        let image_bytes = fixture_png();
+        tokio::fs::write(&image_path, &image_bytes).await.unwrap();
+
+        let accepted = service
+            .send_prompt_with_images(
+                session_id,
+                "describe this image",
+                vec![image_path.clone()],
+                Some("image-key".into()),
+            )
+            .await
+            .unwrap();
+        assert!(!accepted.restored);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while provider.received_images() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(provider.received_images(), 1);
+
+        let snapshot = service.session_snapshot(session_id, 32).await.unwrap();
+        let attachment = snapshot
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                TimelineEventKind::Attachment(attachment) => Some(attachment.clone()),
+                _ => None,
+            })
+            .expect("accepted image has a timeline reference");
+        assert_eq!(attachment.mime_type, "image/png");
+        assert_eq!(attachment.size_bytes, image_bytes.len() as u64);
+        assert_eq!(
+            attachment.sha256.as_deref(),
+            Some(attachment.storage_key.as_str())
+        );
+        let stored_path = home
+            .home()
+            .join("attachments")
+            .join(&attachment.storage_key);
+        assert_eq!(tokio::fs::read(&stored_path).await.unwrap(), image_bytes);
+        let timeline_json = serde_json::to_string(&snapshot.events).unwrap();
+        assert!(!timeline_json.contains("iVBORw0KGgo="));
+
+        let retry = service
+            .send_prompt_with_images(
+                session_id,
+                "describe this image",
+                vec![image_path.clone()],
+                Some("image-key".into()),
+            )
+            .await
+            .unwrap();
+        assert!(retry.restored);
+        assert_eq!(retry.run_id, accepted.run_id);
+        service.shutdown().await;
+        drop(service);
+
+        let reopened = AppService::open_at(home.home()).await.unwrap();
+        let replayed = reopened.session_snapshot(session_id, 32).await.unwrap();
+        assert!(replayed.events.iter().any(|event| {
+            matches!(&event.kind, TimelineEventKind::Attachment(value) if value == &attachment)
+        }));
+        assert_eq!(tokio::fs::read(&stored_path).await.unwrap(), image_bytes);
+        let retry_after_restart = reopened
+            .send_prompt_with_images(
+                session_id,
+                "describe this image",
+                vec![image_path],
+                Some("image-key".into()),
+            )
+            .await
+            .unwrap();
+        assert!(retry_after_restart.restored);
+        assert_eq!(retry_after_restart.run_id, accepted.run_id);
+        reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn image_prompts_reject_unsupported_provider_before_persisting_files() {
+        let home = TestHome::new();
+        let (service, session_id, provider) = fixture_service_with_provider(&home).await;
+        let image_path = home.root.join("input.png");
+        tokio::fs::write(&image_path, fixture_png()).await.unwrap();
+
+        assert!(matches!(
+            service
+                .send_prompt_with_images(session_id, "look", vec![image_path], None)
+                .await,
+            Err(CoreError::ImagePromptUnsupported)
+        ));
+        assert!(!home.home().join("attachments").exists());
+        assert_eq!(provider.prompts(), 0);
+        service.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn image_storage_rejects_an_attachment_directory_symlink() {
+        use std::os::unix::{fs::PermissionsExt, fs::symlink};
+
+        let home = TestHome::new();
+        let (service, session_id, _) = fixture_service_with_image_provider(&home).await;
+        let outside = home.root.join("outside-attachments");
+        tokio::fs::create_dir(&outside).await.unwrap();
+        let original_mode = tokio::fs::metadata(&outside)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        symlink(&outside, home.home().join("attachments")).unwrap();
+        let image_path = home.root.join("input.png");
+        tokio::fs::write(&image_path, fixture_png()).await.unwrap();
+
+        assert!(matches!(
+            service
+                .send_prompt_with_images(session_id, "look", vec![image_path], None)
+                .await,
+            Err(CoreError::InvalidImage(_))
+        ));
+        let final_mode = tokio::fs::metadata(&outside)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(final_mode, original_mode);
+        assert!(
+            tokio::fs::read_dir(&outside)
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn image_validation_rejects_invalid_file_types_and_sizes() {
+        let home = TestHome::new();
+        tokio::fs::create_dir_all(home.root.join("images"))
+            .await
+            .unwrap();
+        let text_path = home.root.join("images/text.png");
+        tokio::fs::write(&text_path, b"plain text").await.unwrap();
+        assert!(matches!(
+            prepare_prompt_images(vec![text_path]).await,
+            Err(CoreError::InvalidImage(_))
+        ));
+
+        let empty_path = home.root.join("images/empty.png");
+        tokio::fs::write(&empty_path, []).await.unwrap();
+        assert!(matches!(
+            prepare_prompt_images(vec![empty_path]).await,
+            Err(CoreError::InvalidImage(_))
+        ));
+
+        let oversized_path = home.root.join("images/large.png");
+        let oversized = std::fs::File::create(&oversized_path).unwrap();
+        oversized
+            .set_len(u64::try_from(MAX_PROMPT_IMAGE_BYTES + 1).unwrap())
+            .unwrap();
+        assert!(matches!(
+            prepare_prompt_images(vec![oversized_path]).await,
+            Err(CoreError::InvalidImage(_))
+        ));
+
+        assert!(matches!(
+            prepare_prompt_images(vec![home.root.join("images")]).await,
+            Err(CoreError::InvalidImage(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn image_validation_rejects_symlinks_in_every_path_component() {
+        use std::os::unix::fs::symlink;
+
+        let home = TestHome::new();
+        let real_directory = home.root.join("real");
+        tokio::fs::create_dir_all(&real_directory).await.unwrap();
+        let real_image = real_directory.join("image.png");
+        tokio::fs::write(&real_image, fixture_png()).await.unwrap();
+        let linked_directory = home.root.join("linked");
+        symlink(&real_directory, &linked_directory).unwrap();
+        let linked_file = home.root.join("linked-image.png");
+        symlink(&real_image, &linked_file).unwrap();
+
+        for path in [linked_directory.join("image.png"), linked_file] {
+            assert!(matches!(
+                prepare_prompt_images(vec![path]).await,
+                Err(CoreError::Io(_) | CoreError::InvalidImage(_))
+            ));
+        }
     }
 
     #[tokio::test]

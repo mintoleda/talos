@@ -896,6 +896,34 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn attachment_references_survive_store_reopen_without_a_schema_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attachments.sqlite");
+        let (workspace, agent, session) = fixture();
+        let mut db = SqliteStore::open(&path).unwrap();
+        db.save_workspace(&workspace).unwrap();
+        db.save_agent(&agent).unwrap();
+        db.save_session(&session).unwrap();
+        let mut attachment =
+            talos_domain::Attachment::new("photo.png", "image/png", 17, "a".repeat(64)).unwrap();
+        attachment.sha256 = Some("a".repeat(64));
+        let event = TimelineEvent::new(
+            session.id,
+            None,
+            1,
+            TimelineEventKind::Attachment(attachment.clone()),
+        )
+        .unwrap();
+        db.append_event(&event).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 2);
+        drop(db);
+
+        let db = SqliteStore::open(&path).unwrap();
+        assert_eq!(db.replay_events(session.id, None, 10).unwrap(), vec![event]);
+        assert_eq!(db.schema_version().unwrap(), 2);
+    }
+
     fn prompt_record(
         session_id: SessionId,
         request_key: &str,
