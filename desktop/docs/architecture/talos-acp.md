@@ -106,7 +106,6 @@ Normalize updates to a provider-neutral event carrying Paseo session ID, turn ID
 | `tool_call` | create tool activity with `toolCallId`, title, kind, status, raw input, locations, and optional diff content |
 | `tool_call_update` | update that activity with status/output/content/diff; preserve `rawOutput` |
 | `usage_update` | update context occupancy (`used`, `size`), not billed token totals |
-| `current_mode_update` | update the selected provider mode |
 | `config_option_update` | replace/update that option's state |
 | `available_commands_update` | refresh session slash-command completion |
 | unknown update | retain as extension/diagnostic; do not crash |
@@ -129,19 +128,15 @@ Talos owns classification and execution policy; Paseo owns the human interaction
 
 Talos currently offers `allow_once`, `allow_always`, and `reject_once`. If the prompt is canceled, the permission UI is dismissed, the session is closed, or the request cannot be routed, reply with an outcome of `cancelled` (or an explicit reject option when required by the negotiated client contract); never default to allow. Resolve each pending request exactly once. The Talos permission handler waits asynchronously for this response and denies if the turn context is canceled or the client request fails.
 
-Talos exposes `ask`, `auto`, and `panic` modes. `ask` prompts for classified risky shell commands; `auto` runs those prompts without asking but still blocks catastrophic commands; `panic` blocks every tool call, including otherwise safe ones. Its write/edit path checks paths against the session working directory. These semantics are not interchangeable with generic Paseo `plan`, bypass, or auto-review modes. Present the provider-advertised modes and don't map an unsupported global mode silently. In particular, `plan` is not an ACP mode and `panic` is not a read-only plan mode.
+Talos does not advertise or accept ACP session permission modes. Its local safety policy continues to classify tool requests and enforce working-directory checks; permission requests it emits must be handled explicitly by Paseo. Do not infer or synthesize a mode from the presence or absence of permission requests.
 
 `allow_always` is remembered by the current Talos ACP session in memory, keyed by tool name plus exact command. The inspected implementation initializes this map empty on each `session/load`; do not promise that remembered approvals survive process restart or reload. Paseo may provide its own explicitly configured auto-accept feature, but should apply it only to ACP permission requests, make it visible, and still respect Talos' classifier/blocking decisions. Do not synthesize permission requests for operations Talos already allowed or blocked.
 
-## 8. Cancel, mode/model/config updates
+## 8. Cancel, model/config updates
 
 ### Cancel
 
 `session/cancel` is a **notification**, `{sessionId}`, with no JSON-RPC response. Send it without canceling the client reader or discarding the prompt's pending response. Talos cancels the turn context; pending permission handling resolves denied; the prompt normally finishes with `stopReason: "cancelled"`. Keep streaming partial output until that response or transport loss. For a local UI cancellation, send `session/cancel`, mark the turn cancel-requested, and await the final response. For timeout/process shutdown, send cancel first and then apply the bounded shutdown policy. Do not retry a canceled prompt automatically: the user message may already be in the canonical transcript and replaying it can execute tools twice.
-
-### Mode
-
-Use `session/set_mode` `{sessionId, modeId}` and accept only the modes advertised by that session. Talos responds with `{}` and emits `current_mode_update` after a successful change. Update UI state from the notification and keep an optimistic/pending state until then. A failed request leaves the last confirmed value intact.
 
 ### Model
 

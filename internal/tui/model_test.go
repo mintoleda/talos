@@ -62,9 +62,6 @@ func (e *fakeEngine) CycleThinking() (string, error) {
 	return "", nil
 }
 func (e *fakeEngine) CurrentThinkingLevel() string { return "" }
-func (e *fakeEngine) CyclePermissionMode() (string, error) { return "ask", nil }
-func (e *fakeEngine) PermissionMode() string               { return "auto" }
-func (e *fakeEngine) TogglePanic() (string, error)         { return "panic", nil }
 func (e *fakeEngine) Compact(string) error         { return nil }
 func (e *fakeEngine) Stats() (int, int, int, int, int, float64, error) {
 	if e.stats != nil {
