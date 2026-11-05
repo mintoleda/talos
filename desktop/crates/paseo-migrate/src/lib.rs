@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OpenFlags, backup::Backup};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -9,6 +10,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 use talos_domain::{Workspace, WorkspaceId, WorkspaceKind, WorkspaceLifecycle};
 use talos_store::SqliteStore;
@@ -20,6 +22,7 @@ pub const DATABASE_FILE_NAME: &str = "state.sqlite3";
 /// Filename used by the first importer revision. It is never opened or modified.
 const LEGACY_DATABASE_FILE_NAME: &str = "state.sqlite";
 const JOURNAL_FILE_NAME: &str = "import-journal.json";
+const BACKUP_FILE_PREFIX: &str = "state.sqlite3.pre-import-";
 /// Shared with `talosd`; `create_new` is the exclusion primitive on both sides.
 const LOCK_FILE_NAME: &str = "talosd.lock";
 const PROJECTS_METADATA_KEY: &str = "legacy_import_projects";
@@ -52,6 +55,12 @@ pub enum MigrationError {
     JournalMismatch,
     #[error("destination database failed its integrity check")]
     DestinationUnhealthy,
+    #[error("destination database backup could not be created or verified")]
+    DestinationBackup(#[source] rusqlite::Error),
+    #[error("destination database backup failed its integrity check")]
+    DestinationBackupUnhealthy,
+    #[error("destination database could not be restored from its verified backup")]
+    DestinationRestoreFailed,
     #[error("destination records could not be verified after import")]
     IncompleteImport,
     #[error("legacy importer database has active sidecars; close the old importer and retry")]
@@ -74,6 +83,9 @@ pub struct Report {
     pub workspace_records: usize,
     pub imported_workspaces: usize,
     pub already_imported: bool,
+    /// Verified snapshot of the destination database from before apply, when one existed.
+    #[serde(default)]
+    pub destination_backup: Option<PathBuf>,
     pub issues: Vec<Issue>,
     pub unsupported: Vec<String>,
 }
@@ -86,6 +98,8 @@ struct JournalEntry {
     database: String,
     #[serde(default)]
     workspace_ids: Vec<String>,
+    #[serde(default)]
+    destination_backup: Option<String>,
 }
 impl JournalEntry {
     fn matches(&self, fingerprint: &str) -> bool {
@@ -98,6 +112,8 @@ struct PendingImport {
     database: String,
     #[serde(default)]
     workspace_ids: Vec<String>,
+    #[serde(default)]
+    destination_backup: Option<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Journal {
@@ -111,6 +127,8 @@ fn legacy_database_name() -> String {
 }
 
 /// Inventory or import the conservative portable subset. Scanning never follows symlinks.
+// Keep the safety checks and ordered apply steps together for auditability.
+#[allow(clippy::too_many_lines)]
 pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report, MigrationError> {
     let (source_root, destination_root) = validate_paths(source, destination, apply)?;
     let mut issues = Vec::new();
@@ -146,10 +164,18 @@ pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report,
         .collect::<Vec<_>>();
 
     if let Some(pending) = &journal.pending {
+        let expected_backup = destination_backup_name(&fingerprint);
         if pending.database != DATABASE_FILE_NAME || pending.fingerprint != fingerprint {
             return Err(MigrationError::JournalMismatch);
         }
         if !pending.workspace_ids.is_empty() && pending.workspace_ids != expected_ids {
+            return Err(MigrationError::JournalMismatch);
+        }
+        if pending
+            .destination_backup
+            .as_deref()
+            .is_some_and(|name| Some(name) != expected_backup.as_deref())
+        {
             return Err(MigrationError::JournalMismatch);
         }
     }
@@ -181,6 +207,8 @@ pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report,
         .iter()
         .any(|entry| entry.matches(&fingerprint))
         && target_present;
+    let journal_backup =
+        journal_backup_name(&journal, &fingerprint).map(|name| destination_root.join(name));
     let safe_projects = Value::Array(projects.iter().map(safe_project_metadata).collect());
     let mut report = Report {
         source: source.into(),
@@ -191,6 +219,7 @@ pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report,
         workspace_records: workspaces.len(),
         imported_workspaces: 0,
         already_imported,
+        destination_backup: journal_backup,
         issues,
         unsupported: unsupported_features(),
     };
@@ -211,6 +240,7 @@ pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report,
         let outcome = apply_import(&destination_root, &plan)?;
         report.imported_workspaces = outcome.imported_workspaces;
         report.already_imported = outcome.already_imported;
+        report.destination_backup = outcome.destination_backup;
         report.dry_run = false;
     }
 
@@ -243,6 +273,7 @@ struct ImportPlan<'a> {
 struct ApplyOutcome {
     imported_workspaces: usize,
     already_imported: bool,
+    destination_backup: Option<PathBuf>,
 }
 
 fn apply_import(
@@ -254,39 +285,85 @@ fn apply_import(
     let db_path = destination_root.join(DATABASE_FILE_NAME);
     validate_database_file(&db_path)?;
     let _import_lock = acquire_import_lock(destination_root)?;
+    validate_database_file(&db_path)?;
 
     let created_database = !db_path.exists();
-    let cleanup = |error: MigrationError| -> Result<ApplyOutcome, MigrationError> {
-        cleanup_failed_import(created_database, &db_path, plan.journal_path, plan.journal);
-        Err(error)
-    };
-    if created_database && plan.legacy_present {
-        if let Err(error) = ensure_source_unchanged(plan.source_files, plan.fingerprint) {
-            return cleanup(error);
-        }
-        if let Err(error) = seed_from_legacy_database(plan.legacy_db_path, &db_path) {
-            return cleanup(error);
-        }
+    if created_database
+        && plan.legacy_present
+        && let Err(error) = ensure_source_unchanged(plan.source_files, plan.fingerprint)
+            .and_then(|()| seed_from_legacy_database(plan.legacy_db_path, &db_path))
+    {
+        cleanup_failed_import(true, &db_path, plan.journal_path, plan.journal);
+        return Err(error);
     }
 
+    let known_backup_name = journal_backup_name(plan.journal, plan.fingerprint);
+    let backup = if created_database || (plan.already_imported && plan.journal.pending.is_none()) {
+        None
+    } else {
+        Some(create_destination_backup(
+            &db_path,
+            plan.fingerprint,
+            plan.journal,
+        )?)
+    };
+    let backup_name = backup
+        .as_ref()
+        .and_then(|backup| backup.path.file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .or(known_backup_name);
+    let mut pending_written = false;
+    let result =
+        apply_existing_destination(plan, &db_path, backup_name.as_deref(), &mut pending_written);
+    match result {
+        Ok(mut outcome) => {
+            outcome.destination_backup = backup
+                .map(|backup| backup.path)
+                .or_else(|| backup_name.map(|name| destination_root.join(name)));
+            Ok(outcome)
+        }
+        Err(error) => {
+            if created_database {
+                cleanup_failed_import(true, &db_path, plan.journal_path, plan.journal);
+            } else if let Some(backup) = &backup {
+                if restore_destination_backup(&backup.path, &db_path).is_err() {
+                    return Err(MigrationError::DestinationRestoreFailed);
+                }
+                // A pending record points to this snapshot and makes a retry safe. Before
+                // that record is durable, discard only a new, unreferenced backup.
+                if !pending_written
+                    && plan.journal.pending.is_none()
+                    && backup.created
+                    && !plan.already_imported
+                {
+                    remove_database_files(&backup.path);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+fn apply_existing_destination(
+    plan: &ImportPlan<'_>,
+    db_path: &Path,
+    backup_name: Option<&str>,
+    pending_written: &mut bool,
+) -> Result<ApplyOutcome, MigrationError> {
     // `SqliteStore::open` can apply schema migrations before conflicts are known.
-    // The guarantee here is no workspace/config record writes after a refusal.
+    // The caller has made a verified backup and restores it if this operation fails.
     let DestinationState {
         mut store,
         existing,
         metadata: existing_metadata,
-    } = match open_destination_state(&db_path) {
-        Ok(state) => state,
-        Err(error) => return cleanup(error),
-    };
-    if let Err(error) = validate_conflicts(plan.converted, &existing) {
-        return cleanup(error);
-    }
+    } = open_destination_state(db_path)?;
+    validate_conflicts(plan.converted, &existing)?;
     if existing_metadata
         .as_ref()
         .is_some_and(|metadata| metadata != plan.safe_projects)
     {
-        return cleanup(MigrationError::DestinationConflict);
+        return Err(MigrationError::DestinationConflict);
     }
 
     if plan.already_imported
@@ -297,57 +374,57 @@ fn apply_import(
             plan.safe_projects,
         )
     {
-        if plan.journal.pending.is_some() {
-            let mut updated = plan.journal.clone();
-            updated.pending = None;
-            if let Err(error) = write_journal(plan.journal_path, &updated) {
-                return cleanup(error);
-            }
+        ensure_source_unchanged(plan.source_files, plan.fingerprint)?;
+        let mut updated = plan.journal.clone();
+        updated.pending = None;
+        if let Some(entry) = updated
+            .entries
+            .iter_mut()
+            .find(|entry| entry.matches(plan.fingerprint))
+        {
+            entry.destination_backup = backup_name.map(str::to_owned);
         }
-        if let Err(error) = ensure_source_unchanged(plan.source_files, plan.fingerprint) {
-            return cleanup(error);
-        }
+        write_journal(plan.journal_path, &updated)?;
         return Ok(ApplyOutcome {
             imported_workspaces: 0,
             already_imported: true,
+            destination_backup: None,
         });
     }
 
-    if let Err(error) = ensure_source_unchanged(plan.source_files, plan.fingerprint) {
-        return cleanup(error);
-    }
+    ensure_source_unchanged(plan.source_files, plan.fingerprint)?;
     let pending = PendingImport {
         fingerprint: plan.fingerprint.into(),
         database: DATABASE_FILE_NAME.into(),
         workspace_ids: plan.expected_ids.to_vec(),
+        destination_backup: backup_name.map(str::to_owned),
     };
     let mut pending_journal = plan.journal.clone();
     pending_journal.pending = Some(pending);
-    if let Err(error) = write_journal(plan.journal_path, &pending_journal) {
-        return cleanup(error);
-    }
+    write_journal(plan.journal_path, &pending_journal)?;
+    *pending_written = true;
 
-    let applied = apply_to_store(
+    let imported = apply_to_store(
         &mut store,
-        &db_path,
+        db_path,
         plan.converted,
         plan.safe_projects,
         &existing,
         existing_metadata.as_ref(),
-    );
-    match applied {
-        Ok(imported) => match finalize_import(plan, imported) {
-            Ok(imported_workspaces) => Ok(ApplyOutcome {
-                imported_workspaces,
-                already_imported: false,
-            }),
-            Err(error) => cleanup(error),
-        },
-        Err(error) => cleanup(error),
-    }
+    )?;
+    let imported_workspaces = finalize_import(plan, imported, backup_name)?;
+    Ok(ApplyOutcome {
+        imported_workspaces,
+        already_imported: false,
+        destination_backup: None,
+    })
 }
 
-fn finalize_import(plan: &ImportPlan<'_>, imported: usize) -> Result<usize, MigrationError> {
+fn finalize_import(
+    plan: &ImportPlan<'_>,
+    imported: usize,
+    backup_name: Option<&str>,
+) -> Result<usize, MigrationError> {
     ensure_source_unchanged(plan.source_files, plan.fingerprint)?;
     let mut updated = plan.journal.clone();
     updated.pending = None;
@@ -359,6 +436,7 @@ fn finalize_import(plan: &ImportPlan<'_>, imported: usize) -> Result<usize, Migr
         imported_at: Utc::now(),
         database: DATABASE_FILE_NAME.into(),
         workspace_ids: plan.expected_ids.to_vec(),
+        destination_backup: backup_name.map(str::to_owned),
     });
     write_journal(plan.journal_path, &updated)?;
     Ok(imported)
@@ -449,6 +527,169 @@ fn validate_database_file(path: &Path) -> Result<(), MigrationError> {
             }
         }
     }
+    Ok(())
+}
+
+fn destination_backup_name(fingerprint: &str) -> Option<String> {
+    let digest = fingerprint.strip_prefix("sha256:")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("{BACKUP_FILE_PREFIX}{digest}.bak"))
+}
+
+fn journal_backup_name(journal: &Journal, fingerprint: &str) -> Option<String> {
+    let expected = destination_backup_name(fingerprint)?;
+    journal
+        .pending
+        .as_ref()
+        .filter(|pending| {
+            pending.fingerprint == fingerprint && pending.database == DATABASE_FILE_NAME
+        })
+        .and_then(|pending| pending.destination_backup.clone())
+        .or_else(|| {
+            journal
+                .entries
+                .iter()
+                .find(|entry| entry.matches(fingerprint))
+                .and_then(|entry| entry.destination_backup.clone())
+        })
+        .filter(|name| *name == expected)
+}
+
+fn pending_references_backup(journal: &Journal, fingerprint: &str, name: &str) -> bool {
+    journal.pending.as_ref().is_some_and(|pending| {
+        pending.fingerprint == fingerprint
+            && pending.database == DATABASE_FILE_NAME
+            && pending.destination_backup.as_deref() == Some(name)
+    })
+}
+
+struct BackupArtifact {
+    path: PathBuf,
+    created: bool,
+}
+
+/// Make a consistent online snapshot, including committed pages in a SQLite WAL.
+/// An unjournaled file at the deterministic name is stale or orphaned and is refreshed;
+/// only a pending journal entry authorizes reuse after an interrupted import.
+fn create_destination_backup(
+    database: &Path,
+    fingerprint: &str,
+    journal: &Journal,
+) -> Result<BackupArtifact, MigrationError> {
+    let parent = database.parent().ok_or(MigrationError::UnsafePath)?;
+    let name = destination_backup_name(fingerprint).ok_or(MigrationError::UnsafePath)?;
+    let path = parent.join(&name);
+    validate_database_file(&path)?;
+    if path.exists() {
+        if pending_references_backup(journal, fingerprint, &name) {
+            verify_backup(&path)?;
+            return Ok(BackupArtifact {
+                path,
+                created: false,
+            });
+        }
+        // A deterministic name alone does not prove that an artifact is the
+        // snapshot for this attempt. Refresh unjournaled or completed-import files.
+        remove_database_files(&path);
+    }
+
+    let temporary = parent.join(format!(
+        ".{}.tmp.{}",
+        path.file_name().unwrap().to_string_lossy(),
+        Uuid::new_v4()
+    ));
+    let mut created = false;
+    let result = (|| -> Result<(), MigrationError> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        drop(options.open(&temporary)?);
+
+        sqlite_backup(database, &temporary).map_err(MigrationError::DestinationBackup)?;
+        verify_backup(&temporary)?;
+        OpenOptions::new().read(true).open(&temporary)?.sync_all()?;
+        match fs::hard_link(&temporary, &path) {
+            Ok(()) => created = true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                validate_database_file(&path)?;
+                if !pending_references_backup(journal, fingerprint, &name) {
+                    return Err(MigrationError::DestinationBackup(
+                        rusqlite::Error::InvalidQuery,
+                    ));
+                }
+                verify_backup(&path)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        fs::remove_file(&temporary)?;
+        sync_directory(parent)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        remove_database_files(&temporary);
+        if created {
+            remove_database_files(&path);
+        }
+        return Err(error);
+    }
+
+    validate_database_file(&path)?;
+    verify_backup(&path)?;
+    Ok(BackupArtifact { path, created })
+}
+
+fn sqlite_backup(source: &Path, destination: &Path) -> rusqlite::Result<()> {
+    let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut destination = Connection::open(destination)?;
+    source.busy_timeout(Duration::from_secs(5))?;
+    destination.busy_timeout(Duration::from_secs(5))?;
+    let backup = Backup::new(&source, &mut destination)?;
+    backup.run_to_completion(128, Duration::from_millis(10), None)?;
+    drop(backup);
+    drop(destination);
+    drop(source);
+    Ok(())
+}
+
+fn verify_backup(path: &Path) -> Result<(), MigrationError> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(MigrationError::DestinationBackup)?;
+    let result = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .map_err(MigrationError::DestinationBackup)?;
+    if result == "ok" {
+        Ok(())
+    } else {
+        Err(MigrationError::DestinationBackupUnhealthy)
+    }
+}
+
+fn restore_destination_backup(backup: &Path, database: &Path) -> rusqlite::Result<()> {
+    sqlite_backup(backup, database)?;
+    let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let result =
+        connection.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
+    if result == "ok" {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::InvalidQuery)
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), MigrationError> {
+    OpenOptions::new().read(true).open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), MigrationError> {
     Ok(())
 }
 
@@ -1100,6 +1341,139 @@ mod tests {
     }
 
     #[test]
+    fn preexisting_destination_is_backed_up_and_backup_is_journaled() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("legacy");
+        let dest = temp.path().join("new");
+        write_source(
+            &source,
+            r#"[{"id":"imported","name":"imported","cwd":"/imported","kind":"directory"}]"#,
+            "[]",
+        );
+        fs::create_dir_all(&dest).unwrap();
+        let existing = convert_workspace(
+            &json!({"id":"existing","name":"existing","cwd":"/existing","kind":"directory"}),
+        )
+        .unwrap();
+        create_database(&dest.join(DATABASE_FILE_NAME), &existing);
+
+        let report = migrate(&source, &dest, true).unwrap();
+        let backup_path = report.destination_backup.expect("backup is reported");
+        assert!(backup_path.is_file());
+        let backup = SqliteStore::open(&backup_path).unwrap();
+        let backup_workspaces = backup.list_workspaces().unwrap();
+        assert_eq!(backup_workspaces.len(), 1);
+        assert_eq!(backup_workspaces[0].id, existing.id);
+
+        let journal = load_journal(&dest.join(JOURNAL_FILE_NAME)).unwrap();
+        assert!(journal.pending.is_none());
+        assert_eq!(journal.entries.len(), 1);
+        assert_eq!(
+            journal.entries[0].destination_backup.as_deref(),
+            backup_path.file_name().and_then(|name| name.to_str())
+        );
+        let rerun = migrate(&source, &dest, true).unwrap();
+        assert!(rerun.already_imported);
+        assert_eq!(rerun.destination_backup, Some(backup_path));
+    }
+
+    #[test]
+    fn orphan_backup_is_refreshed_before_rollback() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("legacy");
+        let dest = temp.path().join("new");
+        let imported = convert_workspace(
+            &json!({"id":"collision","name":"source-collision","cwd":"/source","kind":"directory"}),
+        )
+        .unwrap();
+        write_source(
+            &source,
+            r#"[{"id":"collision","name":"source-collision","cwd":"/source","kind":"directory"}]"#,
+            "[]",
+        );
+        let source_before = records(&source);
+        fs::create_dir_all(&dest).unwrap();
+        let existing = convert_workspace(
+            &json!({"id":"collision","name":"destination-collision","cwd":"/destination","kind":"directory"}),
+        )
+        .unwrap();
+        let added_later = convert_workspace(
+            &json!({"id":"added-later","name":"added-later","cwd":"/later","kind":"directory"}),
+        )
+        .unwrap();
+        create_database(&dest.join(DATABASE_FILE_NAME), &existing);
+
+        let fingerprint = source_fingerprint(&source);
+        let orphan = create_destination_backup(
+            &dest.join(DATABASE_FILE_NAME),
+            &fingerprint,
+            &Journal::default(),
+        )
+        .unwrap();
+        {
+            let mut db = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
+            db.save_workspace(&added_later).unwrap();
+        }
+
+        assert!(matches!(
+            migrate(&source, &dest, true),
+            Err(MigrationError::DestinationConflict)
+        ));
+        let restored = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
+        let restored_workspaces = restored.list_workspaces().unwrap();
+        assert_eq!(restored_workspaces.len(), 2);
+        assert!(
+            restored_workspaces
+                .iter()
+                .any(|workspace| workspace_equivalent(workspace, &existing))
+        );
+        assert!(
+            restored_workspaces
+                .iter()
+                .any(|workspace| workspace_equivalent(workspace, &added_later))
+        );
+        assert!(
+            !restored_workspaces
+                .iter()
+                .any(|workspace| workspace_equivalent(workspace, &imported))
+        );
+        assert!(!orphan.path.exists());
+        assert_eq!(records(&source), source_before);
+    }
+
+    #[test]
+    fn online_backup_includes_wal_and_can_restore_the_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join(DATABASE_FILE_NAME);
+        let source = Connection::open(&database).unwrap();
+        source.pragma_update(None, "journal_mode", "WAL").unwrap();
+        source
+            .execute_batch("CREATE TABLE sample(value TEXT); INSERT INTO sample VALUES('before');")
+            .unwrap();
+
+        let fingerprint = format!("sha256:{}", "a".repeat(64));
+        let backup =
+            create_destination_backup(&database, &fingerprint, &Journal::default()).unwrap();
+        assert!(backup.created);
+        source
+            .execute("INSERT INTO sample VALUES('after')", [])
+            .unwrap();
+        drop(source);
+
+        restore_destination_backup(&backup.path, &database).unwrap();
+        let restored =
+            Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let values = restored
+            .prepare("SELECT value FROM sample ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(values, vec!["before"]);
+    }
+
+    #[test]
     fn malformed_records_are_redacted() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("src");
@@ -1440,17 +1814,32 @@ mod tests {
             let mut db = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
             db.save_workspace(&first).unwrap();
         }
+        let fingerprint = source_fingerprint(&source);
+        let backup = create_destination_backup(
+            &dest.join(DATABASE_FILE_NAME),
+            &fingerprint,
+            &Journal::default(),
+        )
+        .unwrap();
+        let backup_name = backup
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let journal = Journal {
             entries: Vec::new(),
             pending: Some(PendingImport {
-                fingerprint: source_fingerprint(&source),
+                fingerprint,
                 database: DATABASE_FILE_NAME.into(),
                 workspace_ids: vec![first.id.to_string(), second.id.to_string()],
+                destination_backup: Some(backup_name),
             }),
         };
         write_journal(&dest.join(JOURNAL_FILE_NAME), &journal).unwrap();
         let report = migrate(&source, &dest, true).unwrap();
         assert_eq!(report.imported_workspaces, 1);
+        assert_eq!(report.destination_backup, Some(backup.path));
         let db = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
         assert_eq!(db.list_workspaces().unwrap().len(), 2);
         let journal = load_journal(&dest.join(JOURNAL_FILE_NAME)).unwrap();

@@ -12,6 +12,7 @@ talos-store = { path = "../talos-store" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+rusqlite = { workspace = true, features = ["backup"] }
 thiserror.workspace = true
 uuid.workspace = true
 
