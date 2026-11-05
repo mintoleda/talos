@@ -1868,6 +1868,20 @@ impl AppService {
             .map_err(CoreError::Store)
     }
 
+    /// Search durable user and assistant text timeline events.
+    pub async fn search_timeline(
+        &self,
+        query: String,
+        session_id: Option<SessionId>,
+        limit: usize,
+    ) -> CoreResult<(Vec<TimelineEvent>, bool)> {
+        self.inner
+            .store
+            .run(move |store| store.search_timeline(&query, session_id, limit))
+            .await
+            .map_err(CoreError::Store)
+    }
+
     pub async fn respond_to_permission(
         &self,
         id: PermissionRequestId,

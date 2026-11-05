@@ -212,6 +212,61 @@ impl SqliteStore {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StoreError::Sqlite)
     }
+
+    /// Search durable user and assistant text events, newest first.
+    ///
+    /// Search is a bounded substring scan over text events only. Tool payloads,
+    /// permission details, thoughts, and diagnostics are intentionally excluded.
+    pub fn search_timeline(
+        &self,
+        query: &str,
+        session: Option<SessionId>,
+        limit: usize,
+    ) -> Result<(Vec<TimelineEvent>, bool)> {
+        if query.trim().is_empty() {
+            return Err(StoreError::InvalidData(
+                "timeline search query must not be empty".into(),
+            ));
+        }
+        if query.len() > 512 {
+            return Err(StoreError::InvalidData(
+                "timeline search query exceeds 512 bytes".into(),
+            ));
+        }
+
+        let limit = limit.clamp(1, 1000);
+        let fetch_limit = i64::try_from(limit + 1).expect("bounded search limit fits i64");
+        let session = session.map(|id| id.to_string());
+        let mut statement = self.connection.prepare(
+            "SELECT id,session_id,run_id,sequence,timestamp,payload
+             FROM timeline_events
+             WHERE kind IN ('UserText','AssistantText')
+               AND (?2 IS NULL OR session_id = ?2)
+               AND instr(lower(CASE kind
+                    WHEN 'UserText' THEN json_extract(payload, '$.UserText.text')
+                    WHEN 'AssistantText' THEN json_extract(payload, '$.AssistantText.text')
+                    ELSE '' END), lower(?1)) > 0
+             ORDER BY timestamp DESC, session_id, sequence DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![query, session, fetch_limit], |row| {
+            Ok(TimelineEvent {
+                id: parse_id(row.get::<_, String>(0)?)?,
+                session_id: parse_id(row.get::<_, String>(1)?)?,
+                run_id: row.get::<_, Option<String>>(2)?.map(parse_id).transpose()?,
+                sequence: u64::try_from(row.get::<_, i64>(3)?).map_err(to_sql_conversion)?,
+                timestamp: parse_ts(row.get(4)?)?,
+                kind: decode(row.get(5)?)?,
+            })
+        })?;
+        let mut events = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::Sqlite)?;
+        let has_more = events.len() > limit;
+        events.truncate(limit);
+        Ok((events, has_more))
+    }
+
     pub fn snapshot(&self, session: SessionId, limit: usize) -> Result<SessionSnapshot> {
         let record = self
             .session(session)?
@@ -466,6 +521,99 @@ mod tests {
         let s = Session::new(a.id);
         (w, a, s)
     }
+
+    #[test]
+    fn timeline_search_is_scoped_bounded_and_only_matches_visible_text() {
+        let mut db = SqliteStore::open_in_memory().unwrap();
+        let (workspace, agent, first_session) = fixture();
+        let second_session = Session::new(agent.id);
+        db.save_workspace(&workspace).unwrap();
+        db.save_agent(&agent).unwrap();
+        db.save_session(&first_session).unwrap();
+        db.save_session(&second_session).unwrap();
+
+        let timestamp = |value: &str| {
+            DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let mut first = TimelineEvent::new(
+            first_session.id,
+            None,
+            1,
+            TimelineEventKind::UserText {
+                text: "Needle in the first prompt".into(),
+            },
+        )
+        .unwrap();
+        first.timestamp = timestamp("2026-01-01T00:00:00Z");
+        let mut private_thought = TimelineEvent::new(
+            first_session.id,
+            None,
+            2,
+            TimelineEventKind::Thought {
+                text: "needle in a private thought".into(),
+            },
+        )
+        .unwrap();
+        private_thought.timestamp = timestamp("2026-01-02T00:00:00Z");
+        let mut second = TimelineEvent::new(
+            second_session.id,
+            None,
+            1,
+            TimelineEventKind::AssistantText {
+                text: "The NEEDLE answer".into(),
+            },
+        )
+        .unwrap();
+        second.timestamp = timestamp("2026-01-03T00:00:00Z");
+        let mut tool = TimelineEvent::new(
+            second_session.id,
+            None,
+            2,
+            TimelineEventKind::Tool(talos_domain::ToolCall {
+                id: "tool-1".into(),
+                name: "search".into(),
+                title: None,
+                input: serde_json::json!({"text": "needle inside a tool payload"}),
+                output: None,
+                status: talos_domain::ToolStatus::Completed,
+            }),
+        )
+        .unwrap();
+        tool.timestamp = timestamp("2026-01-04T00:00:00Z");
+        db.append_events(&[first, private_thought, second, tool])
+            .unwrap();
+
+        let (matches, has_more) = db.search_timeline("NEEDLE", None, 10).unwrap();
+        assert!(!has_more);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].session_id, second_session.id);
+        assert_eq!(matches[0].sequence, 1);
+        assert_eq!(matches[1].session_id, first_session.id);
+        assert_eq!(matches[1].sequence, 1);
+
+        let (scoped, has_more) = db
+            .search_timeline("needle", Some(first_session.id), 10)
+            .unwrap();
+        assert!(!has_more);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].session_id, first_session.id);
+
+        let (limited, has_more) = db.search_timeline("needle", None, 0).unwrap();
+        assert!(has_more);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(
+            db.search_timeline("private thought", None, 10).unwrap().0,
+            Vec::new()
+        );
+        assert_eq!(
+            db.search_timeline("tool payload", None, 10).unwrap().0,
+            Vec::new()
+        );
+        assert!(db.search_timeline("  ", None, 10).is_err());
+    }
+
     #[test]
     fn persistence_survives_reopen_and_replay_cursor() {
         let dir = tempfile::tempdir().unwrap();
@@ -498,6 +646,10 @@ mod tests {
             assert_eq!(snap.events.len(), 1);
             assert_eq!(snap.cursor, Some(EventCursor { sequence: 1 }));
             assert_eq!(db.replay_events(s.id, snap.cursor, 100).unwrap().len(), 0);
+            let (matches, has_more) = db.search_timeline("HELLO", Some(s.id), 10).unwrap();
+            assert!(!has_more);
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].id, snap.events[0].id);
             assert_eq!(
                 db.config_metadata("theme").unwrap().unwrap()["accent"],
                 "blue"
