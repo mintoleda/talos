@@ -162,7 +162,7 @@ release gates remain unverified.
 | Projects / workspaces | Partial: workspace create/list/get/rename/archive/restore are fixture-verified through domain, SQLite, core, IPC, daemon and CLI; archiving rejects workspaces with active persisted runs and preserves IDs/history | Project CRUD/association, safe managed-worktree creation/deletion and persisted branch/ownership links |
 | Permissions / trust | Partial: durable timeline plus pending request/decision handlers and scoped fixture tests | Restart/timeout behavior must fail closed; stale decisions must not approve another run |
 | Usage / diagnostics | Partial: summaries and provider diagnostics have daemon fixture tests | Unknown usage/prices versus zero, aggregation/replay deduplication and redaction acceptance |
-| Attachments / output | Open beyond JSON CLI output | Image validation, durable storage/reference replay, provider capability rejection and migration integrity |
+| Attachments / output | Fixture-verified image prompt slice: MIME/path/size validation, content-addressed private storage, timeline references across restart, keyed retries and ACP capability gating through CLI/IPC | Attachment retrieval/display and legacy migration integrity; no UI work is included |
 | Terminals / scripts | Open PTY backend; script management deferred | Owned PTY lifecycle/input/resize/capture/cleanup with two-workspace isolation |
 | Legacy migration | Partial: `crates/paseo-migrate/src/lib.rs`; 22 tests cover dry-run/idempotent workspace-subset import, overlap/symlink/hardlink guards, WAL-aware snapshots, journaled retry and rollback | Real-data/source-hash workflow and kill/restart crash windows; sessions/history/attachments remain explicitly unsupported |
 | Packaging / settings | Partial: `.github/workflows/ci.yml`, `packaging/`, `docs/release/README.md` | Fresh-home install/upgrade/uninstall and config validation without modifying user data; no signed/cross-platform release claim |
@@ -244,8 +244,9 @@ Depends on P1. Owners: domain/store/core plus daemon/IPC/CLI adapters.
   worktree ownership checks; never delete dirty or unmanaged checkouts.
 - [ ] Finish capability-driven model/mode/thinking controls and provider metadata
   round-trip, including explicit unsupported/unavailable errors.
-- [ ] Implement/verify image MIME/size/path checks, durable attachment references,
-  restart replay and missing-file errors through CLI and provider adapters.
+- [x] Implement image MIME/size/path checks, content-addressed durable storage,
+  timeline-reference replay, keyed acceptance and provider capability rejection
+  through CLI/IPC/ACP. Retrieval/display of stored files remains for UI integration.
 - [ ] Add owned PTY creation/list/input/resize/capture/kill; prove two-workspace
   isolation and child cleanup without relying on a desktop terminal widget.
 - [ ] Expose history/search and basic usage through CLI/IPC; test unknown usage,
@@ -267,7 +268,8 @@ creation/deletion remain open.
 
 Current backend verification from `desktop/`: `cargo test --workspace
 --exclude talos-desktop --locked --no-fail-fast` passed (one opt-in smoke test
-ignored); strict non-desktop Clippy and `cargo fmt --all -- --check` passed.
+ignored); strict non-desktop Clippy and `cargo fmt --all -- --check` passed after
+workspace, migration, search and image-attachment changes.
 These exclude the desktop UI only. The workspace UI/release gates have not been
 run as part of this non-UI workstream. Config validation and durable atomic
 writes have focused tests; reload-versus-restart behavior remains open.
