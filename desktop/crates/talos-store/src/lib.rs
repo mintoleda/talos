@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{path::Path, str::FromStr, time::Duration};
 use talos_domain::{
@@ -263,7 +263,20 @@ impl SqliteStore {
                 "prompt acceptance events must belong to the request session".into(),
             ));
         }
-        let tx = self.connection.transaction()?;
+        if events
+            .iter()
+            .any(|event| event.run_id.is_some_and(|run_id| run_id != record.run_id))
+        {
+            return Err(StoreError::InvalidData(
+                "prompt acceptance events must not belong to another run".into(),
+            ));
+        }
+        // Take the write lock before checking the key. A deferred transaction can
+        // let two connections both observe an absent key and then race the insert;
+        // the loser would surface a raw uniqueness error instead of the original run.
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing) = read_prompt_request(&tx, record.session_id, &record.request_key)? {
             tx.rollback()?;
             return Ok(
@@ -624,6 +637,63 @@ mod tests {
     }
 
     #[test]
+    fn prompt_acceptance_survives_reopen_without_duplicate_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt.sqlite");
+        let (w, a, s) = fixture();
+        let run_id = RunId::new();
+        let record = prompt_record(s.id, "reopen", run_id, 'd');
+        let events = vec![
+            TimelineEvent::new(
+                s.id,
+                Some(run_id),
+                1,
+                TimelineEventKind::UserText {
+                    text: "persist me".into(),
+                },
+            )
+            .unwrap(),
+            TimelineEvent::new(
+                s.id,
+                Some(run_id),
+                2,
+                TimelineEventKind::RunState {
+                    state: RunLifecycle::Starting,
+                },
+            )
+            .unwrap(),
+        ];
+        {
+            let mut db = SqliteStore::open(&path).unwrap();
+            db.save_workspace(&w).unwrap();
+            db.save_agent(&a).unwrap();
+            db.save_session(&s).unwrap();
+            assert!(matches!(
+                db.accept_prompt_request(&record, &events).unwrap(),
+                PromptRequestAcceptance::Accepted(_)
+            ));
+        }
+        {
+            let mut db = SqliteStore::open(&path).unwrap();
+            assert_eq!(db.prompt_request(s.id, "reopen").unwrap().unwrap(), record);
+            assert_eq!(
+                db.run_state(s.id, run_id).unwrap(),
+                Some(RunLifecycle::Starting)
+            );
+            assert!(matches!(
+                db.accept_prompt_request(&record, &[]).unwrap(),
+                PromptRequestAcceptance::Existing(existing) if existing == record
+            ));
+            let conflict = prompt_record(s.id, "reopen", RunId::new(), 'e');
+            assert!(matches!(
+                db.accept_prompt_request(&conflict, &[]).unwrap(),
+                PromptRequestAcceptance::Conflict { existing } if existing == record
+            ));
+            assert_eq!(db.replay_events(s.id, None, 10).unwrap().len(), 2);
+        }
+    }
+
+    #[test]
     fn prompt_acceptance_is_session_scoped_and_rolls_back_on_event_failure() {
         let mut db = SqliteStore::open_in_memory().unwrap();
         let (w, a, s) = fixture();
@@ -692,6 +762,151 @@ mod tests {
             db.accept_prompt_request(&empty, &[]),
             Err(StoreError::Validation(ValidationError::Empty))
         ));
+
+        let wrong_run = prompt_record(s.id, "key-4", RunId::new(), 'a');
+        let wrong_event = vec![
+            TimelineEvent::new(
+                s.id,
+                Some(RunId::new()),
+                1,
+                TimelineEventKind::UserText {
+                    text: "wrong run".into(),
+                },
+            )
+            .unwrap(),
+        ];
+        assert!(matches!(
+            db.accept_prompt_request(&wrong_run, &wrong_event),
+            Err(StoreError::InvalidData(_))
+        ));
+        assert!(db.prompt_request(s.id, "key-4").unwrap().is_none());
+    }
+
+    const CONCURRENT_ROUNDS: u64 = 8;
+
+    fn race_prompt_acceptance(
+        path: &Path,
+        session_id: SessionId,
+        sequence: u64,
+        records: [PromptRequestRecord; 2],
+    ) -> Vec<PromptRequestAcceptance> {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = records
+            .into_iter()
+            .map(|record| {
+                let path = path.to_path_buf();
+                let barrier = barrier.clone();
+                let event = TimelineEvent::new(
+                    session_id,
+                    Some(record.run_id),
+                    sequence,
+                    TimelineEventKind::UserText {
+                        text: format!("race {sequence}"),
+                    },
+                )
+                .unwrap();
+                std::thread::spawn(move || {
+                    let mut db = SqliteStore::open(path).unwrap();
+                    barrier.wait();
+                    db.accept_prompt_request(&record, &[event])
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_prompt_acceptance_is_atomic_across_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.sqlite");
+        let (w, a, s) = fixture();
+        {
+            let mut db = SqliteStore::open(&path).unwrap();
+            db.save_workspace(&w).unwrap();
+            db.save_agent(&a).unwrap();
+            db.save_session(&s).unwrap();
+        }
+
+        let mut accepted_records = Vec::new();
+        for round in 0..CONCURRENT_ROUNDS {
+            let key = format!("identical-{round}");
+            let results = race_prompt_acceptance(
+                &path,
+                s.id,
+                round + 1,
+                [
+                    prompt_record(s.id, &key, RunId::new(), 'a'),
+                    prompt_record(s.id, &key, RunId::new(), 'a'),
+                ],
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| matches!(result, PromptRequestAcceptance::Accepted(_)))
+                    .count(),
+                1,
+                "round {round}: {results:?}"
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|result| matches!(result, PromptRequestAcceptance::Existing(_)))
+                    .count(),
+                1,
+                "round {round}: {results:?}"
+            );
+            accepted_records.extend(results.iter().find_map(|result| match result {
+                PromptRequestAcceptance::Accepted(record) => Some(record.clone()),
+                _ => None,
+            }));
+        }
+
+        for round in 0..CONCURRENT_ROUNDS {
+            let key = format!("conflict-{round}");
+            let results = race_prompt_acceptance(
+                &path,
+                s.id,
+                CONCURRENT_ROUNDS + round + 1,
+                [
+                    prompt_record(s.id, &key, RunId::new(), 'a'),
+                    prompt_record(s.id, &key, RunId::new(), 'b'),
+                ],
+            );
+            let accepted = results
+                .iter()
+                .find_map(|result| match result {
+                    PromptRequestAcceptance::Accepted(record) => Some(record.clone()),
+                    _ => None,
+                })
+                .expect("one concurrent payload should be accepted");
+            let conflict = results
+                .iter()
+                .find_map(|result| match result {
+                    PromptRequestAcceptance::Conflict { existing } => Some(existing),
+                    _ => None,
+                })
+                .expect("the competing payload should conflict");
+            assert_eq!(conflict, &accepted, "round {round}: {results:?}");
+            accepted_records.push(accepted);
+        }
+
+        let db = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            db.replay_events(s.id, None, 100).unwrap().len(),
+            usize::try_from(CONCURRENT_ROUNDS * 2).unwrap()
+        );
+        for record in accepted_records {
+            assert_eq!(
+                db.prompt_request(record.session_id, &record.request_key)
+                    .unwrap()
+                    .unwrap(),
+                record
+            );
+        }
+        assert!(db.integrity_check().unwrap());
     }
 
     #[test]

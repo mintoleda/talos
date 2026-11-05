@@ -145,7 +145,12 @@ class Harness:
         env["XDG_DATA_HOME"] = str(self.fake_home / ".local/share")
         env["XDG_CACHE_HOME"] = str(self.fake_home / ".cache")
         env["XDG_RUNTIME_DIR"] = str(self.runtime)
-        env["RUST_LOG"] = env.get("RUST_LOG", "talosd=debug")
+        # Core/ACP warnings are the primary signal for lifecycle races: a stale
+        # sequence cache or an unpersisted terminal state otherwise looks like a
+        # silent timeout. Keep the default narrow but include those targets.
+        env["RUST_LOG"] = env.get(
+            "RUST_LOG", "talosd=debug,talos_core=debug,talos_acp=debug"
+        )
         env["NO_COLOR"] = "1"
         return env
 
@@ -277,6 +282,40 @@ class Harness:
         if text:
             print(f"--- {daemon.name} daemon log ---", file=sys.stderr)
             print("\n".join(text.splitlines()[-80:]), file=sys.stderr)
+
+    def daemon_diagnostics(self, daemon: Daemon, limit: int = 10) -> str:
+        """Return recent daemon warnings/errors to attach to a failure message."""
+        try:
+            daemon.log_file.flush()
+            text = daemon.log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        lines = [
+            line
+            for line in text.splitlines()
+            if '"level":"WARN"' in line or '"level":"ERROR"' in line
+        ]
+        if not lines:
+            return ""
+        return "\nrecent daemon warnings/errors:\n" + "\n".join(lines[-limit:])
+
+    @staticmethod
+    def describe_events(events: list[dict], limit: int = 8) -> str:
+        """Compact event sequence/run-id summary for attribution failures."""
+        if not events:
+            return "[]"
+        rendered = []
+        for event in events[:limit]:
+            name, payload = _kind(event)
+            detail = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            rendered.append(
+                f"seq={event.get('sequence')} "
+                f"run={event.get('run_id') or '<none>'} "
+                f"{name} {detail[:200]}"
+            )
+        if len(events) > limit:
+            rendered.append(f"... {len(events) - limit} more")
+        return "; ".join(rendered)
 
     def stop_daemon(self, daemon: Daemon, *, graceful: bool = True) -> None:
         if daemon.proc.poll() is None and graceful:
@@ -506,6 +545,7 @@ class Harness:
                 pass
             raise SmokeFailure(
                 f"{error}; durable run states for {run_id}: {states}"
+                f"{self.daemon_diagnostics(daemon)}"
             ) from error
 
     def wait_pending(self, daemon: Daemon, session_id: str) -> list[dict]:
@@ -729,13 +769,23 @@ class Harness:
                 and payload.get("id") == "fixture-tool-1")
             or (name == "AssistantText" and payload.get("text") == "tool complete")
         ]
+        misattributed = [
+            event
+            for event in tool_lifecycle_events
+            if str(event.get("run_id")) != tool_run
+        ]
+        observed_runs = sorted(
+            {
+                str(event.get("run_id"))
+                for event in self.session_events(daemon, session_id)
+            }
+        )
         self.check(
-            tool_lifecycle_events
-            and all(
-                str(event.get("run_id")) == tool_run
-                for event in tool_lifecycle_events
-            ),
-            "tool lifecycle events were not attributed to the tool prompt run",
+            tool_lifecycle_events and not misattributed,
+            "tool lifecycle events were not attributed to the tool prompt run "
+            f"{tool_run}; offending: {self.describe_events(misattributed)}; "
+            f"observed run ids: {observed_runs}"
+            f"{self.daemon_diagnostics(daemon)}",
         )
         tool_usage = [
             event
@@ -743,7 +793,11 @@ class Harness:
             for name, _payload in [_kind(event)]
             if name == "Usage" and str(event.get("run_id")) == tool_run
         ]
-        self.check(tool_usage, "tool prompt usage was not attributed to its run")
+        self.check(
+            tool_usage,
+            "tool prompt usage was not attributed to its run "
+            f"{tool_run}{self.daemon_diagnostics(daemon)}",
+        )
         global_tools = [
             (event["session_id"], event["sequence"])
             for event in self.all_events(daemon)
@@ -764,9 +818,19 @@ class Harness:
             self.wait_run_terminal(daemon, session_id, rapid_run) == "Succeeded",
             "rapid follow-up after tool prompt did not succeed",
         )
+        current_tools = self.tool_events(daemon, session_id, "fixture-tool-1")
+        tool_snapshot = [
+            event
+            for event in self.session_events(daemon, session_id)
+            for name, payload in [_kind(event)]
+            if name == "Tool"
+            and isinstance(payload, dict)
+            and payload.get("id") == "fixture-tool-1"
+        ]
         self.check(
-            self.tool_events(daemon, session_id, "fixture-tool-1") == tools,
-            "rapid follow-up duplicated or changed tool events",
+            current_tools == tools,
+            "rapid follow-up duplicated or changed tool events: "
+            f"{self.describe_events(tool_snapshot)}",
         )
         followup_tools = [
             event
@@ -776,18 +840,23 @@ class Harness:
         ]
         self.check(
             not followup_tools,
-            "late tool updates were attributed to the follow-up run",
+            "late tool updates were attributed to the follow-up run "
+            f"{rapid_run}: {self.describe_events(followup_tools)}"
+            f"{self.daemon_diagnostics(daemon)}",
         )
+        late_assistant = [
+            event
+            for event in self.session_events(daemon, session_id)
+            for name, payload in [_kind(event)]
+            if name == "AssistantText"
+            and payload.get("text") == "tool complete"
+            and str(event.get("run_id")) == rapid_run
+        ]
         self.check(
-            not [
-                event
-                for event in self.session_events(daemon, session_id)
-                for name, payload in [_kind(event)]
-                if name == "AssistantText"
-                and payload.get("text") == "tool complete"
-                and str(event.get("run_id")) == rapid_run
-            ],
-            "late assistant tool output was attributed to the follow-up run",
+            not late_assistant,
+            "late assistant tool output was attributed to the follow-up run "
+            f"{rapid_run}: {self.describe_events(late_assistant)}"
+            f"{self.daemon_diagnostics(daemon)}",
         )
 
         renamed = self.ctl(daemon, "session", "rename", session_id, "Renamed Smoke")

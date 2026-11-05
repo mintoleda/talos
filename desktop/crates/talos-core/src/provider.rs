@@ -154,6 +154,19 @@ pub trait ProviderSession: Send + Sync {
     async fn set_model(&self, model_id: &str) -> Result<(), ProviderError>;
     async fn set_config_option(&self, id: &str, value: &str) -> Result<(), ProviderError>;
     async fn next_event(&self) -> Option<ProviderEvent>;
+    /// Wait until every provider event produced before this call has been
+    /// delivered to the single consumer.
+    ///
+    /// A prompt result does not imply that its preceding notifications have been
+    /// consumed: providers resolve the request independently of their update
+    /// stream. Core calls this barrier after a prompt settles but before it
+    /// clears the run association, so late tool/assistant events still carry the
+    /// correct `run_id` and cannot be persisted after the terminal state as
+    /// unscoped events. Providers that deliver events synchronously with the
+    /// prompt may leave the default no-op implementation.
+    async fn event_barrier(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
     async fn shutdown(&self, grace: Duration);
 }
 
@@ -531,6 +544,10 @@ impl ProviderSession for AcpSession {
     }
     async fn next_event(&self) -> Option<ProviderEvent> {
         self.client.next_event().await.map(ProviderEvent::Acp)
+    }
+    async fn event_barrier(&self) -> Result<(), ProviderError> {
+        self.client.event_barrier().await?;
+        Ok(())
     }
     async fn shutdown(&self, grace: Duration) {
         let deadline = tokio::time::Instant::now() + grace;

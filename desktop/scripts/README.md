@@ -33,6 +33,26 @@ a script-wide alarm that raises through the normal `finally` cleanup path; use
 socket, which is intentional: the harness makes no automatic stale-socket
 removal claim.
 
+## Failure diagnostics
+
+On assertion failure the harness prints the last 80 lines of each live daemon
+log. Run-terminal timeouts and tool/assistant attribution failures additionally
+include the offending event sequence and `run_id` pairs plus recent daemon
+`WARN`/`ERROR` lines. The default child `RUST_LOG` is
+`talosd=debug,talos_core=debug,talos_acp=debug` so core lifecycle warnings are
+not hidden behind the daemon target; override `RUST_LOG` in the environment to
+change verbosity.
+
+A single invocation is not evidence of determinism. Repeat the affected
+scenario when investigating a race, for example:
+
+```sh
+for run in $(seq 1 10); do
+  python3 scripts/talosd-smoke.py --scenario lifecycle --timeout 90 || break
+done
+python3 scripts/talosd-smoke.py --scenario cancel-permission --timeout 90
+```
+
 ## Binary overrides
 
 | Variable | Default |

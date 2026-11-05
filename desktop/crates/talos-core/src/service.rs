@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex as StdMutex,
@@ -25,7 +26,7 @@ use talos_domain::{
 use talos_store::{PromptRequestAcceptance, PromptRequestRecord, SessionSnapshot};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -189,6 +190,10 @@ struct Inner {
     sessions: RwLock<HashMap<SessionId, Arc<SessionRuntime>>>,
     runs: RwLock<HashMap<RunId, Arc<RunControl>>>,
     run_tasks: Mutex<HashMap<RunId, JoinHandle<()>>>,
+    /// Durability operations accepted from lifecycle code. `None` is the close
+    /// gate: once shutdown takes the set, new operations fail with
+    /// `ShuttingDown` and the taken set is drained before the store closes.
+    lifecycle_tasks: Mutex<Option<JoinSet<()>>>,
     run_start_gate: Mutex<()>,
     permission_start_gate: Mutex<()>,
     permissions: Mutex<HashMap<PermissionRequestId, PendingPermission>>,
@@ -234,6 +239,7 @@ impl AppService {
                 sessions: RwLock::new(HashMap::new()),
                 runs: RwLock::new(HashMap::new()),
                 run_tasks: Mutex::new(HashMap::new()),
+                lifecycle_tasks: Mutex::new(Some(JoinSet::new())),
                 run_start_gate: Mutex::new(()),
                 permission_start_gate: Mutex::new(()),
                 permissions: Mutex::new(HashMap::new()),
@@ -1109,6 +1115,20 @@ impl AppService {
             Duration::from_millis(self.inner.config.read().await.shutdown_grace_ms),
         )
         .await;
+        // A prompt response can overtake provider notifications that preceded
+        // it: the ACP reader enqueues session/update frames on a separate
+        // channel and resolves the JSON-RPC prompt future immediately. Drain up
+        // to a barrier before clearing `active_run` so every event causally
+        // before this prompt is persisted with this run id, and so usage and the
+        // terminal state are ordered after those updates. This is a rendezvous
+        // with the event consumer, not a timing delay.
+        if let Err(error) = runtime.provider.event_barrier().await {
+            tracing::warn!(
+                %error,
+                %run_id,
+                "provider event barrier failed; late updates may be unscoped"
+            );
+        }
         if let Ok(outcome) = &result
             && let Some(usage) = &outcome.usage
         {
@@ -1195,6 +1215,17 @@ impl AppService {
     }
 
     pub async fn cancel_run(&self, run_id: RunId) -> CoreResult<()> {
+        // Persisting CancelRequested and signalling the provider must remain one
+        // owned operation. If the caller is dropped after the durable transition
+        // but before `cancellation.cancel()`, the provider would keep running
+        // behind a run that can never settle. The owned task guarantees both
+        // steps happen regardless of caller lifetime.
+        let service = self.clone();
+        self.spawn_lifecycle(async move { service.cancel_run_owned(run_id).await })
+            .await
+    }
+
+    async fn cancel_run_owned(&self, run_id: RunId) -> CoreResult<()> {
         let control = self
             .inner
             .runs
@@ -1207,8 +1238,10 @@ impl AppService {
         match state {
             RunLifecycle::Running => {
                 let result = self
-                    .set_run_state(run_id, RunLifecycle::CancelRequested)
+                    .set_run_state_owned(run_id, RunLifecycle::CancelRequested)
                     .await;
+                // Signal cancellation even if state persistence failed; otherwise
+                // an unpersisted transition would leave the provider running.
                 control.cancellation.cancel();
                 result?;
             }
@@ -1431,28 +1464,48 @@ impl AppService {
         option_id: &str,
     ) -> CoreResult<()> {
         self.ensure_running()?;
-        let mut pending = self.inner.permissions.lock().await;
-        let request = pending
-            .get(&id)
-            .ok_or(CoreError::PermissionNotPending(id))?;
-        if !request.options.contains(option_id) {
-            return Err(CoreError::InvalidPermissionOption {
-                request: id,
-                option: option_id.to_owned(),
-            });
-        }
+        // Claiming the pending request and persisting its single outcome is an
+        // owned operation. If the caller disappears at any await, the claim and
+        // resolution still complete exactly once; a second decision then fails
+        // with PermissionNotPending instead of producing a duplicate outcome.
+        let option_id = option_id.to_owned();
+        let service = self.clone();
+        self.spawn_lifecycle(async move { service.resolve_permission_owned(id, option_id).await })
+            .await
+    }
+
+    async fn resolve_permission_owned(
+        &self,
+        id: PermissionRequestId,
+        option_id: String,
+    ) -> CoreResult<()> {
+        // Remove the request before the first durability await. Validation that
+        // needs no await happens while the map lock is held, so an invalid option
+        // leaves the request pending while a valid decision has a single owner.
+        let request = {
+            let mut pending = self.inner.permissions.lock().await;
+            let request = pending
+                .get(&id)
+                .ok_or(CoreError::PermissionNotPending(id))?;
+            if !request.options.contains(&option_id) {
+                return Err(CoreError::InvalidPermissionOption {
+                    request: id,
+                    option: option_id,
+                });
+            }
+            pending.remove(&id).expect("permission was checked above")
+        };
         let run_id = request.run_id;
         let session_id = request.session_id;
         let control = self.inner.runs.read().await.get(&run_id).cloned();
         let Some(control) = control else {
             let _ = self
-                .emit(
+                .emit_owned(
                     session_id,
                     Some(run_id),
                     TimelineEventKind::PermissionResolved(PermissionOutcome::Cancelled),
                 )
                 .await;
-            let request = pending.remove(&id).expect("permission was checked above");
             let _ = request.reply.send(None);
             return Err(CoreError::PermissionNotPending(id));
         };
@@ -1470,39 +1523,49 @@ impl AppService {
                     .map(|active| *active == Some(run_id))
             })
             .unwrap_or(false);
-        let state = control.state.lock().await;
-        if !active_matches || *state != RunLifecycle::Running || control.cancellation.is_cancelled()
+        let state = control.state.lock().await.clone();
+        if !active_matches || state != RunLifecycle::Running || control.cancellation.is_cancelled()
         {
             let _ = self
-                .emit(
+                .emit_owned(
                     session_id,
                     Some(run_id),
                     TimelineEventKind::PermissionResolved(PermissionOutcome::Cancelled),
                 )
                 .await;
-            let request = pending.remove(&id).expect("permission was checked above");
             let _ = request.reply.send(None);
             return Err(CoreError::PermissionNotPending(id));
         }
         let option_kind = request
             .option_kinds
-            .get(option_id)
+            .get(&option_id)
             .and_then(Option::as_deref);
-        let outcome = permission_outcome_kind(option_id, option_kind);
-        self.emit(
-            session_id,
-            Some(run_id),
-            TimelineEventKind::PermissionResolved(outcome),
-        )
-        .await?;
-        let request = pending.remove(&id).expect("permission was checked above");
-        let _ = request.reply.send(Some(option_id.to_owned()));
+        let outcome = permission_outcome_kind(&option_id, option_kind);
+        if let Err(error) = self
+            .emit_owned(
+                session_id,
+                Some(run_id),
+                TimelineEventKind::PermissionResolved(outcome),
+            )
+            .await
+        {
+            // The decision was claimed but not durably recorded. Resolve the
+            // waiter as cancelled rather than leaving it pending forever.
+            let _ = request.reply.send(None);
+            return Err(error);
+        }
+        let _ = request.reply.send(Some(option_id));
         Ok(())
     }
 
     pub async fn cancel_permission(&self, id: PermissionRequestId) -> CoreResult<()> {
         self.ensure_running()?;
-        if self.cancel_pending_permission(id).await? {
+        // Claim and durable resolution are one tracked operation. Doing the map
+        // removal outside the gate would allow shutdown to close the tracker in
+        // the gap, leaving a request removed without its PermissionResolved
+        // event. The gate is checked before the claim, so a rejected operation
+        // cannot mutate pending state.
+        if self.cancel_pending_permission_tracked(id).await? {
             Ok(())
         } else {
             Err(CoreError::PermissionNotPending(id))
@@ -1907,6 +1970,23 @@ impl AppService {
                 let _ = task.await;
             }
         }
+
+        // Close the durability gate only after run writers and event producers
+        // have stopped. Operations accepted before this point are drained; any
+        // later internal emission receives ShuttingDown instead of racing store
+        // close. This preserves the "accepted operation commits before close"
+        // invariant without holding the tracker lock across the join.
+        if let Some(mut tasks) = self.inner.lifecycle_tasks.lock().await.take() {
+            let drained = tokio::time::timeout(shutdown_limit, async {
+                while tasks.join_next().await.is_some() {}
+            })
+            .await;
+            if drained.is_err() {
+                tracing::warn!("aborting lifecycle durability tasks after shutdown deadline");
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+            }
+        }
         self.inner.store.shutdown().await;
     }
 
@@ -1930,21 +2010,33 @@ impl AppService {
         Ok(sessions)
     }
 
-    async fn cancel_pending_permission(&self, id: PermissionRequestId) -> CoreResult<bool> {
-        let mut pending = self.inner.permissions.lock().await;
-        let Some(request) = pending.get(&id) else {
+    /// Run a cancellation claim as an accepted durability operation. Callers
+    /// that can be dropped (external commands, permission handlers, run writers)
+    /// use this so the claim and its resolution are both inside the shutdown
+    /// gate; it deliberately calls the owned helper directly to avoid a nested
+    /// spawn that could be rejected after the claim.
+    async fn cancel_pending_permission_tracked(&self, id: PermissionRequestId) -> CoreResult<bool> {
+        let service = self.clone();
+        self.spawn_lifecycle(async move { service.cancel_pending_permission_owned(id).await })
+            .await
+    }
+
+    /// Claim the pending request, then persist cancellation with the in-memory
+    /// pending entry already removed. The caller must execute this inside a
+    /// tracked operation or during shutdown before the gate closes; that ordering
+    /// is what prevents a removed request from losing its durable resolution.
+    async fn cancel_pending_permission_owned(&self, id: PermissionRequestId) -> CoreResult<bool> {
+        let request = self.inner.permissions.lock().await.remove(&id);
+        let Some(request) = request else {
             return Ok(false);
         };
-        let session_id = request.session_id;
-        let run_id = request.run_id;
         let result = self
-            .emit(
-                session_id,
-                Some(run_id),
+            .emit_owned(
+                request.session_id,
+                Some(request.run_id),
                 TimelineEventKind::PermissionResolved(PermissionOutcome::Cancelled),
             )
             .await;
-        let request = pending.remove(&id).expect("permission was checked above");
         let _ = request.reply.send(None);
         result.map(|_| true)
     }
@@ -1960,7 +2052,7 @@ impl AppService {
             .collect();
         let mut first_error = None;
         for id in ids {
-            if let Err(error) = self.cancel_pending_permission(id).await {
+            if let Err(error) = self.cancel_pending_permission_tracked(id).await {
                 first_error.get_or_insert(error);
             }
         }
@@ -1976,8 +2068,11 @@ impl AppService {
             .keys()
             .copied()
             .collect();
+        // Shutdown-owned: the gate is still open and this future is awaited by
+        // shutdown itself, so use the owned helper directly and keep each
+        // resolution ordered before terminal/run-join completion.
         for id in ids {
-            let _ = self.cancel_pending_permission(id).await;
+            let _ = self.cancel_pending_permission_owned(id).await;
         }
     }
 
@@ -2022,7 +2117,46 @@ impl AppService {
         }
     }
 
+    /// Spawn a durability operation under the shutdown tracker. Once shutdown
+    /// closes the gate, new operations fail with `ShuttingDown`; operations
+    /// accepted before the gate closes always get the chance to finish before
+    /// the SQLite actor is closed. Dropping the caller only abandons its reply,
+    /// never the accepted operation.
+    async fn spawn_lifecycle<T, F>(&self, operation: F) -> CoreResult<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = CoreResult<T>> + Send + 'static,
+    {
+        let (reply, response) = oneshot::channel();
+        {
+            let mut tasks = self.inner.lifecycle_tasks.lock().await;
+            let Some(tasks) = tasks.as_mut() else {
+                return Err(CoreError::ShuttingDown);
+            };
+            // Reap completed handles so a long-lived service does not retain
+            // every historical durability operation until shutdown.
+            while tasks.try_join_next().is_some() {}
+            tasks.spawn(async move {
+                let _ = reply.send(operation.await);
+            });
+        }
+        response
+            .await
+            .map_err(|_| CoreError::Other("lifecycle task was dropped".into()))?
+    }
+
     async fn set_run_state(&self, id: RunId, next: RunLifecycle) -> CoreResult<()> {
+        // Run-state transitions mutate durable state and an in-memory cache. A
+        // caller may disappear while the append is in flight (cancelled command,
+        // dropped permission handler, shutdown), so the transition runs in an
+        // owned task. Dropping the caller then cannot leave the cache behind the
+        // durable event, which would make a later retry duplicate or skip state.
+        let service = self.clone();
+        self.spawn_lifecycle(async move { service.set_run_state_owned(id, next).await })
+            .await
+    }
+
+    async fn set_run_state_owned(&self, id: RunId, next: RunLifecycle) -> CoreResult<()> {
         let control = self
             .inner
             .runs
@@ -2037,7 +2171,7 @@ impl AppService {
             proposed
                 .transition(next.clone())
                 .map_err(|error| CoreError::Other(error.to_string()))?;
-            self.emit(
+            self.emit_owned(
                 control.session_id,
                 Some(id),
                 TimelineEventKind::RunState {
@@ -2052,6 +2186,23 @@ impl AppService {
     }
 
     async fn emit(
+        &self,
+        session_id: SessionId,
+        run_id: Option<RunId>,
+        kind: TimelineEventKind,
+    ) -> CoreResult<TimelineEvent> {
+        // Event emission is a durability boundary. Some callers are themselves
+        // cancellation-sensitive (permission handlers), and a dropped future
+        // must not interrupt allocation/persistence halfway through. Run the
+        // complete operation in an owned task: the in-memory sequence cache is
+        // advanced exactly once for every event SQLite accepted, so a later
+        // event cannot reuse an already-persisted sequence number.
+        let service = self.clone();
+        self.spawn_lifecycle(async move { service.emit_owned(session_id, run_id, kind).await })
+            .await
+    }
+
+    async fn emit_owned(
         &self,
         session_id: SessionId,
         run_id: Option<RunId>,
@@ -2292,7 +2443,7 @@ async fn finish_permission_request(
         let _ = AppService {
             inner: inner.clone(),
         }
-        .cancel_pending_permission(id)
+        .cancel_pending_permission_tracked(id)
         .await;
         return ProviderPermissionDecision::Cancelled;
     }
@@ -2302,7 +2453,7 @@ async fn finish_permission_request(
         let _ = AppService {
             inner: inner.clone(),
         }
-        .cancel_pending_permission(id)
+        .cancel_pending_permission_tracked(id)
         .await;
         ProviderPermissionDecision::Cancelled
     }
@@ -2371,6 +2522,12 @@ async fn provider_event_loop(
                         }),
                     )
                     .await;
+            }
+            ProviderEvent::Acp(AcpEvent::Barrier { ack }) => {
+                // All events ahead of this marker have now been published while
+                // the run association was still installed. Release the prompt
+                // path so it may clear the association and publish terminal state.
+                ack.notify_one();
             }
         }
     }
@@ -2532,7 +2689,7 @@ async fn set_private_directory_permissions(_path: &Path) -> Result<(), std::io::
 mod tests {
     use super::*;
     use crate::provider::ProviderPermissionOption;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use talos_domain::{Capabilities, ProviderDescriptor, WorkspaceKind};
     use uuid::Uuid;
 
@@ -2795,6 +2952,16 @@ mod tests {
         (service, created.session.id, provider)
     }
 
+    /// Poll a future exactly once. Used to enter the owned-operation path, then
+    /// drop the caller to prove accepted durability work is not tied to it.
+    async fn poll_once<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(future.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
     async fn wait_for_permissions(
         service: &AppService,
         expected: usize,
@@ -2921,6 +3088,366 @@ mod tests {
         async fn shutdown(&self, _grace: Duration) {
             std::future::pending::<()>().await;
         }
+    }
+
+    struct BarrierProvider {
+        id: ProviderId,
+        released: Arc<AtomicBool>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    impl BarrierProvider {
+        fn new(id: ProviderId) -> Self {
+            Self {
+                id,
+                released: Arc::new(AtomicBool::new(false)),
+                gate: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        /// Release the intentionally gated event stream. Used only if the drain
+        /// barrier regresses so the test can observe post-terminal attribution
+        /// instead of waiting forever.
+        fn release(&self) {
+            self.released.store(true, AtomicOrdering::Release);
+            self.gate.notify_waiters();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentProvider for BarrierProvider {
+        fn id(&self) -> &ProviderId {
+            &self.id
+        }
+
+        async fn diagnostic(&self) -> ProviderDiagnostic {
+            ProviderDiagnostic {
+                descriptor: ProviderDescriptor {
+                    id: self.id.clone(),
+                    display_name: "Barrier".into(),
+                    available: true,
+                    capabilities: fixture_capabilities(),
+                    modes: Vec::new(),
+                    models: Vec::new(),
+                },
+                command: PathBuf::from("barrier"),
+                executable_found: true,
+                message: None,
+            }
+        }
+
+        async fn create_session(
+            &self,
+            _cwd: &Path,
+            _permissions: Arc<dyn PermissionHandler>,
+        ) -> Result<Box<dyn ProviderSession>, ProviderError> {
+            Ok(Box::new(self.session("barrier-native")))
+        }
+
+        async fn resume_session(
+            &self,
+            _cwd: &Path,
+            native_session_id: &str,
+            _permissions: Arc<dyn PermissionHandler>,
+        ) -> Result<Box<dyn ProviderSession>, ProviderError> {
+            Ok(Box::new(self.session(native_session_id)))
+        }
+    }
+
+    impl BarrierProvider {
+        fn session(&self, native_id: &str) -> BarrierSession {
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+            BarrierSession {
+                id: self.id.clone(),
+                native_id: native_id.to_owned(),
+                released: self.released.clone(),
+                gate: self.gate.clone(),
+                events: Mutex::new(event_rx),
+                event_tx,
+            }
+        }
+    }
+
+    struct BarrierSession {
+        id: ProviderId,
+        native_id: String,
+        released: Arc<AtomicBool>,
+        gate: Arc<tokio::sync::Notify>,
+        events: Mutex<tokio::sync::mpsc::UnboundedReceiver<ProviderEvent>>,
+        event_tx: tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+    }
+
+    impl BarrierSession {
+        fn release(&self) {
+            self.released.store(true, AtomicOrdering::Release);
+            self.gate.notify_waiters();
+        }
+    }
+
+    fn barrier_update(native_id: &str, update: &Value) -> ProviderEvent {
+        let notification: SessionUpdateNotification = serde_json::from_value(json!({
+            "sessionId": native_id,
+            "update": update,
+        }))
+        .unwrap();
+        ProviderEvent::Acp(AcpEvent::SessionUpdate(Box::new(notification)))
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderSession for BarrierSession {
+        fn provider_id(&self) -> &ProviderId {
+            &self.id
+        }
+
+        fn native_session_id(&self) -> &str {
+            &self.native_id
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            fixture_capabilities()
+        }
+
+        fn modes(&self) -> Vec<ProviderMode> {
+            Vec::new()
+        }
+
+        fn models(&self) -> Vec<ModelRef> {
+            Vec::new()
+        }
+
+        fn config_options(&self) -> Vec<talos_acp::ConfigOption> {
+            Vec::new()
+        }
+
+        async fn prompt(
+            &self,
+            _text: &str,
+            _cancellation: &CancellationToken,
+        ) -> Result<ProviderPromptResult, ProviderError> {
+            let send = |event| {
+                self.event_tx
+                    .send(event)
+                    .map_err(|error| ProviderError::Other(error.to_string()))
+            };
+            send(barrier_update(
+                &self.native_id,
+                &json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "barrier-tool-1",
+                    "title": "bash: barrier",
+                    "kind": "execute",
+                    "status": "completed",
+                    "rawInput": {"command": "barrier"},
+                }),
+            ))?;
+            send(barrier_update(
+                &self.native_id,
+                &json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "barrier complete"},
+                }),
+            ))?;
+            Ok(ProviderPromptResult {
+                stop_reason: "end_turn".into(),
+                usage: None,
+            })
+        }
+
+        async fn cancel(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        async fn set_mode(&self, _mode_id: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        async fn set_model(&self, _model_id: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        async fn set_config_option(&self, _id: &str, _value: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        async fn next_event(&self) -> Option<ProviderEvent> {
+            loop {
+                if self.released.load(AtomicOrdering::Acquire) {
+                    break;
+                }
+                self.gate.notified().await;
+            }
+            self.events.lock().await.recv().await
+        }
+
+        async fn event_barrier(&self) -> Result<(), ProviderError> {
+            self.release();
+            let ack = Arc::new(tokio::sync::Notify::new());
+            self.event_tx
+                .send(ProviderEvent::Acp(AcpEvent::Barrier { ack: ack.clone() }))
+                .map_err(|error| ProviderError::Other(error.to_string()))?;
+            ack.notified().await;
+            Ok(())
+        }
+
+        async fn shutdown(&self, _grace: Duration) {}
+    }
+
+    async fn fixture_barrier_service(
+        home: &TestHome,
+    ) -> (AppService, SessionId, Arc<BarrierProvider>) {
+        tokio::fs::create_dir_all(home.workspace()).await.unwrap();
+        let service = AppService::open_at(home.home()).await.unwrap();
+        let provider_id = ProviderId::new("barrier").unwrap();
+        let provider = Arc::new(BarrierProvider::new(provider_id.clone()));
+        service.register_provider(provider.clone()).await;
+        let workspace = service
+            .create_workspace("barrier", home.workspace(), WorkspaceKind::Directory)
+            .await
+            .unwrap();
+        let created = service
+            .create_agent(workspace.id, Some(provider_id), "barrier agent")
+            .await
+            .unwrap();
+        (service, created.session.id, provider)
+    }
+
+    struct CancelProbeProvider {
+        id: ProviderId,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentProvider for CancelProbeProvider {
+        fn id(&self) -> &ProviderId {
+            &self.id
+        }
+
+        async fn diagnostic(&self) -> ProviderDiagnostic {
+            ProviderDiagnostic {
+                descriptor: ProviderDescriptor {
+                    id: self.id.clone(),
+                    display_name: "Cancel probe".into(),
+                    available: true,
+                    capabilities: fixture_capabilities(),
+                    modes: Vec::new(),
+                    models: Vec::new(),
+                },
+                command: PathBuf::from("cancel-probe"),
+                executable_found: true,
+                message: None,
+            }
+        }
+
+        async fn create_session(
+            &self,
+            _cwd: &Path,
+            _permissions: Arc<dyn PermissionHandler>,
+        ) -> Result<Box<dyn ProviderSession>, ProviderError> {
+            Ok(Box::new(CancelProbeSession {
+                id: self.id.clone(),
+                native_id: "cancel-probe-native".into(),
+                cancelled: self.cancelled.clone(),
+            }))
+        }
+
+        async fn resume_session(
+            &self,
+            _cwd: &Path,
+            _native_session_id: &str,
+            permissions: Arc<dyn PermissionHandler>,
+        ) -> Result<Box<dyn ProviderSession>, ProviderError> {
+            self.create_session(_cwd, permissions).await
+        }
+    }
+
+    struct CancelProbeSession {
+        id: ProviderId,
+        native_id: String,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderSession for CancelProbeSession {
+        fn provider_id(&self) -> &ProviderId {
+            &self.id
+        }
+
+        fn native_session_id(&self) -> &str {
+            &self.native_id
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            fixture_capabilities()
+        }
+
+        fn modes(&self) -> Vec<ProviderMode> {
+            Vec::new()
+        }
+
+        fn models(&self) -> Vec<ModelRef> {
+            Vec::new()
+        }
+
+        fn config_options(&self) -> Vec<talos_acp::ConfigOption> {
+            Vec::new()
+        }
+
+        async fn prompt(
+            &self,
+            _text: &str,
+            cancellation: &CancellationToken,
+        ) -> Result<ProviderPromptResult, ProviderError> {
+            cancellation.cancelled().await;
+            self.cancelled.store(true, AtomicOrdering::SeqCst);
+            Ok(ProviderPromptResult {
+                stop_reason: "cancelled".into(),
+                usage: None,
+            })
+        }
+
+        async fn cancel(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        async fn set_mode(&self, _mode_id: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        async fn set_model(&self, _model_id: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        async fn set_config_option(&self, _id: &str, _value: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        async fn next_event(&self) -> Option<ProviderEvent> {
+            std::future::pending().await
+        }
+
+        async fn shutdown(&self, _grace: Duration) {}
+    }
+
+    async fn fixture_cancel_probe_service(
+        home: &TestHome,
+    ) -> (AppService, SessionId, Arc<CancelProbeProvider>) {
+        tokio::fs::create_dir_all(home.workspace()).await.unwrap();
+        let service = AppService::open_at(home.home()).await.unwrap();
+        let provider_id = ProviderId::new("cancel-probe").unwrap();
+        let provider = Arc::new(CancelProbeProvider {
+            id: provider_id.clone(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        service.register_provider(provider.clone()).await;
+        let workspace = service
+            .create_workspace("cancel-probe", home.workspace(), WorkspaceKind::Directory)
+            .await
+            .unwrap();
+        let created = service
+            .create_agent(workspace.id, Some(provider_id), "cancel probe agent")
+            .await
+            .unwrap();
+        (service, created.session.id, provider)
     }
 
     async fn fixture_stalled_service(home: &TestHome) -> (AppService, SessionId) {
@@ -3103,6 +3630,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_keyed_conflicts_start_exactly_one_run() {
+        let home = TestHome::new();
+        let (service, session_id, provider) = fixture_service_with_provider(&home).await;
+        let (left, right) = tokio::join!(
+            service.send_prompt_keyed(session_id, "wait for permission", "concurrent-conflict"),
+            service.send_prompt_keyed(session_id, "different payload", "concurrent-conflict")
+        );
+        let accepted = match (left, right) {
+            (Ok(accepted), Err(CoreError::PromptRequestKeyConflict { session }))
+            | (Err(CoreError::PromptRequestKeyConflict { session }), Ok(accepted))
+                if session == session_id =>
+            {
+                accepted
+            }
+            (left, right) => {
+                panic!("expected one accepted prompt and one conflict: {left:?}, {right:?}")
+            }
+        };
+        wait_for_permissions(&service, 1).await;
+        assert_eq!(provider.prompts(), 1);
+
+        let authoritative = service
+            .replay_events(session_id, None, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|event| match event.kind {
+                TimelineEventKind::UserText { text } => Some(text),
+                _ => None,
+            })
+            .expect("the accepted payload should be recorded once");
+        let retry = service
+            .send_prompt_keyed(session_id, authoritative.clone(), "concurrent-conflict")
+            .await
+            .unwrap();
+        assert_eq!(retry.run_id, accepted.run_id);
+        assert!(retry.restored);
+        let conflicting = if authoritative == "wait for permission" {
+            "different payload"
+        } else {
+            "wait for permission"
+        };
+        assert!(matches!(
+            service
+                .send_prompt_keyed(session_id, conflicting, "concurrent-conflict")
+                .await,
+            Err(CoreError::PromptRequestKeyConflict { session }) if session == session_id
+        ));
+        assert_eq!(provider.prompts(), 1);
+
+        service.cancel_run(accepted.run_id).await.unwrap();
+        let _ = service.wait_run(accepted.run_id).await.unwrap();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn keyed_prompt_retry_survives_restart_without_reexecution() {
         let home = TestHome::new();
         let (service, session_id, provider) = fixture_service_with_provider(&home).await;
@@ -3136,6 +3719,13 @@ mod tests {
         assert_eq!(retry.run_id, first.run_id);
         assert_eq!(retry.state, RunLifecycle::Cancelled);
         assert!(retry.restored);
+        assert_eq!(provider.prompts(), 1);
+        assert!(matches!(
+            reopened
+                .send_prompt_keyed(session_id, "different payload", "restart-key")
+                .await,
+            Err(CoreError::PromptRequestKeyConflict { session }) if session == session_id
+        ));
         assert_eq!(provider.prompts(), 1);
         let events = reopened.replay_events(session_id, None, 100).await.unwrap();
         assert_eq!(
@@ -3405,6 +3995,16 @@ mod tests {
         ));
 
         let events = service.replay_events(session_id, None, 100).await.unwrap();
+        // Cancellation must not leave a persisted event whose sequence was never
+        // committed to the in-memory cache; later permission/terminal appends
+        // would then collide on the same sequence.
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=events.len() as u64).collect::<Vec<_>>()
+        );
         let permission_requested = events
             .iter()
             .position(|event| matches!(event.kind, TimelineEventKind::PermissionRequested(_)))
@@ -3439,6 +4039,458 @@ mod tests {
             RunLifecycle::Cancelled
         );
         service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn provider_events_before_prompt_response_keep_run_scope_and_precede_terminal() {
+        let home = TestHome::new();
+        let (service, session_id, provider) = fixture_barrier_service(&home).await;
+        let run_id = service
+            .send_prompt(session_id, "barrier tool")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), service.wait_run(run_id))
+                .await
+                .expect("barrier run should settle")
+                .unwrap(),
+            RunLifecycle::Succeeded
+        );
+        // If the drain barrier regresses, release the deliberately gated stream
+        // now so the queued updates are attributed after the terminal event and
+        // the assertions below fail with evidence instead of hanging.
+        provider.release();
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events = service
+                    .replay_events(session_id, None, 100)
+                    .await
+                    .unwrap();
+                let has_tool = events.iter().any(|event| {
+                    matches!(&event.kind, TimelineEventKind::Tool(tool) if tool.id == "barrier-tool-1")
+                });
+                let has_text = events.iter().any(|event| {
+                    matches!(&event.kind, TimelineEventKind::AssistantText { text } if text == "barrier complete")
+                });
+                if has_tool && has_text {
+                    return events;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("gated provider updates should be delivered");
+        let tool_index = events
+            .iter()
+            .position(|event| {
+                matches!(&event.kind, TimelineEventKind::Tool(tool) if tool.id == "barrier-tool-1")
+            })
+            .unwrap();
+        let text_index = events
+            .iter()
+            .position(|event| {
+                matches!(&event.kind, TimelineEventKind::AssistantText { text } if text == "barrier complete")
+            })
+            .unwrap();
+        let terminal_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event.kind,
+                    TimelineEventKind::RunState {
+                        state: RunLifecycle::Succeeded
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(events[tool_index].run_id, Some(run_id));
+        assert_eq!(events[text_index].run_id, Some(run_id));
+        assert!(
+            tool_index < terminal_index && text_index < terminal_index,
+            "pre-response provider updates must be persisted before terminal state: {events:?}"
+        );
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropped_emission_task_still_persists_and_advances_sequence() {
+        let home = TestHome::new();
+        let (service, session_id) = fixture_service(&home).await;
+        let baseline = service.replay_events(session_id, None, 100).await.unwrap();
+        let next = baseline
+            .last()
+            .map_or(1, |event| event.sequence.saturating_add(1));
+
+        let mut emission = Box::pin(service.emit(
+            session_id,
+            None,
+            TimelineEventKind::Notice(Notice {
+                code: Some("dropped_caller".into()),
+                message: "emission must survive caller cancellation".into(),
+            }),
+        ));
+        // Poll once so the owned emission task has been spawned and the caller is
+        // suspended at its reply await, then drop the caller. Polling once is
+        // deterministic here: the only earlier awaits are uncontended in-process
+        // sequence operations.
+        std::future::poll_fn(|cx| {
+            let _ = std::future::Future::poll(emission.as_mut(), cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(emission);
+
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events = service.replay_events(session_id, None, 100).await.unwrap();
+                if events.len() > baseline.len() {
+                    return events;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped caller must not cancel the durable emission");
+        assert_eq!(events.last().unwrap().sequence, next);
+
+        // A second emission must use the following sequence. If the cache were
+        // stale, this append would collide with the already-persisted event.
+        service
+            .emit(
+                session_id,
+                None,
+                TimelineEventKind::Notice(Notice {
+                    code: Some("after_drop".into()),
+                    message: "follow-up emission".into(),
+                }),
+            )
+            .await
+            .expect("sequence cache should be advanced");
+        let events = service.replay_events(session_id, None, 100).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=events.len() as u64).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, TimelineEventKind::Notice(_)))
+                .count(),
+            2
+        );
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropped_cancel_caller_still_cancels_provider_and_settles() {
+        let home = TestHome::new();
+        let (service, session_id, provider) = fixture_cancel_probe_service(&home).await;
+        let run_id = service
+            .send_prompt(session_id, "cancel probe")
+            .await
+            .unwrap();
+        let mut cancel = Box::pin(service.cancel_run(run_id));
+        poll_once(cancel.as_mut()).await;
+        drop(cancel);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), service.wait_run(run_id))
+                .await
+                .expect("dropped cancel caller must not strand the run")
+                .unwrap(),
+            RunLifecycle::Cancelled
+        );
+        assert!(
+            provider.cancelled.load(AtomicOrdering::SeqCst),
+            "provider cancellation token was never signalled"
+        );
+        let events = service.replay_events(session_id, None, 100).await.unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            TimelineEventKind::RunState {
+                state: RunLifecycle::CancelRequested
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            TimelineEventKind::RunState {
+                state: RunLifecycle::Cancelled
+            }
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=events.len() as u64).collect::<Vec<_>>()
+        );
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropped_permission_resolution_finishes_once_and_clears_pending() {
+        let home = TestHome::new();
+        let (service, session_id) = fixture_service(&home).await;
+        let run_id = service
+            .send_prompt(session_id, "wait for permission")
+            .await
+            .unwrap();
+        let pending = wait_for_permissions(&service, 1).await;
+        let permission_id = pending[0].id;
+
+        let mut resolve = Box::pin(service.resolve_permission(permission_id, "allow_once"));
+        poll_once(resolve.as_mut()).await;
+        drop(resolve);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), service.wait_run(run_id))
+                .await
+                .expect("dropped resolve caller must still finish the decision")
+                .unwrap(),
+            RunLifecycle::Succeeded
+        );
+        assert_eq!(
+            service.list_pending_permissions().await.unwrap(),
+            Vec::<PendingPermissionSummary>::new()
+        );
+        assert!(matches!(
+            service
+                .resolve_permission(permission_id, "allow_once")
+                .await,
+            Err(CoreError::PermissionNotPending(_))
+        ));
+
+        let events = service.replay_events(session_id, None, 100).await.unwrap();
+        let requested = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.kind,
+                    TimelineEventKind::PermissionRequested(request)
+                        if request.id == permission_id
+                )
+            })
+            .unwrap();
+        let outcomes = events
+            .iter()
+            .enumerate()
+            .filter(|(index, event)| {
+                *index > requested
+                    && matches!(
+                        event.kind,
+                        TimelineEventKind::PermissionResolved(PermissionOutcome::Allowed {
+                            remember: false
+                        })
+                    )
+            })
+            .count();
+        assert_eq!(outcomes, 1, "permission decision must be recorded once");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=events.len() as u64).collect::<Vec<_>>()
+        );
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancel_permission_and_shutdown_keep_one_durable_resolution() {
+        let home = TestHome::new();
+        let (service, session_id) = fixture_service(&home).await;
+        let run_id = service
+            .send_prompt(session_id, "wait for permission")
+            .await
+            .unwrap();
+        let pending = wait_for_permissions(&service, 1).await;
+        let permission_id = pending[0].id;
+
+        // A dropped caller and a concurrent caller race shutdown for the same
+        // request. Exactly one may claim it; the tracked gate must either reject
+        // before claiming or drain the claim through its durable resolution.
+        let mut dropped = Box::pin(service.cancel_permission(permission_id));
+        poll_once(dropped.as_mut()).await;
+        drop(dropped);
+        let concurrent = tokio::spawn({
+            let service = service.clone();
+            async move { service.cancel_permission(permission_id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), service.shutdown())
+            .await
+            .expect("shutdown must drain accepted cancellation work");
+        let concurrent_result = concurrent.await.unwrap();
+        assert!(
+            concurrent_result.is_ok()
+                || matches!(
+                    concurrent_result,
+                    Err(CoreError::PermissionNotPending(_) | CoreError::ShuttingDown)
+                ),
+            "concurrent cancellation returned an unexpected error: {concurrent_result:?}"
+        );
+
+        assert_eq!(
+            service.list_pending_permissions().await.unwrap(),
+            Vec::<PendingPermissionSummary>::new()
+        );
+        assert!(matches!(
+            service.cancel_permission(permission_id).await,
+            Err(CoreError::ShuttingDown)
+        ));
+
+        // Inspect SQLite directly before recovery can synthesize a replacement
+        // resolution for an orphaned request.
+        let store = talos_store::SqliteStore::open(home.home().join("state.sqlite3")).unwrap();
+        let events = store.replay_events(session_id, None, 100).unwrap();
+        let requested = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.kind,
+                    TimelineEventKind::PermissionRequested(request)
+                        if request.id == permission_id
+                )
+            })
+            .unwrap();
+        let resolutions = events
+            .iter()
+            .enumerate()
+            .filter(|(index, event)| {
+                *index > requested && matches!(event.kind, TimelineEventKind::PermissionResolved(_))
+            })
+            .count();
+        assert_eq!(
+            resolutions, 1,
+            "shutdown raced cancellation and lost or duplicated the resolution"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=events.len() as u64).collect::<Vec<_>>()
+        );
+        assert!(events.iter().any(|event| event.run_id == Some(run_id)));
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn cancel_permission_rejected_by_closed_gate_leaves_pending_untouched() {
+        let home = TestHome::new();
+        let (service, session_id) = fixture_service(&home).await;
+        service
+            .send_prompt(session_id, "wait for permission")
+            .await
+            .unwrap();
+        let pending = wait_for_permissions(&service, 1).await;
+        let permission_id = pending[0].id;
+
+        let gate = service
+            .inner
+            .lifecycle_tasks
+            .lock()
+            .await
+            .take()
+            .expect("durability gate should be open");
+        assert!(matches!(
+            service.cancel_permission(permission_id).await,
+            Err(CoreError::ShuttingDown)
+        ));
+        assert_eq!(
+            service.list_pending_permissions().await.unwrap(),
+            pending,
+            "rejected cancellation must not remove the pending request"
+        );
+        *service.inner.lifecycle_tasks.lock().await = Some(gate);
+        service.cancel_permission(permission_id).await.unwrap();
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_dropped_durability_callers_before_store_close() {
+        let home = TestHome::new();
+        let (service, session_id) = fixture_service(&home).await;
+        let run_id = RunId::new();
+        service
+            .inner
+            .runs
+            .write()
+            .await
+            .insert(run_id, Arc::new(RunControl::new(session_id)));
+
+        let mut state = Box::pin(service.set_run_state(run_id, RunLifecycle::Starting));
+        poll_once(state.as_mut()).await;
+        drop(state);
+
+        let mut expected = HashSet::new();
+        for index in 0..16 {
+            let message = format!("dropped-emission-{index}");
+            expected.insert(message.clone());
+            let mut emission = Box::pin(service.emit(
+                session_id,
+                None,
+                TimelineEventKind::Notice(Notice {
+                    code: Some("dropped_shutdown".into()),
+                    message,
+                }),
+            ));
+            poll_once(emission.as_mut()).await;
+            drop(emission);
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), service.shutdown())
+            .await
+            .expect("shutdown must drain accepted durability operations");
+        assert!(
+            service
+                .emit(
+                    session_id,
+                    None,
+                    TimelineEventKind::Notice(Notice {
+                        code: Some("after_close".into()),
+                        message: "must be rejected".into(),
+                    }),
+                )
+                .await
+                .is_err(),
+            "closed durability gate must reject new operations"
+        );
+
+        let reopened = AppService::open_at(home.home()).await.unwrap();
+        let events = reopened.replay_events(session_id, None, 100).await.unwrap();
+        let notices: HashSet<String> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                TimelineEventKind::Notice(notice) => Some(notice.message.clone()),
+                _ => None,
+            })
+            .collect();
+        for message in &expected {
+            assert!(
+                notices.contains(message),
+                "accepted emission was lost across shutdown: {message}"
+            );
+        }
+        assert!(events.iter().any(|event| {
+            event.run_id == Some(run_id)
+                && matches!(
+                    event.kind,
+                    TimelineEventKind::RunState {
+                        state: RunLifecycle::Starting
+                    }
+                )
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=events.len() as u64).collect::<Vec<_>>()
+        );
+        reopened.shutdown().await;
     }
 
     #[tokio::test]
