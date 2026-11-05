@@ -4,14 +4,13 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, FontId, Layout, Margin, RichText, Sense, Stroke,
-    TextWrapMode, UiBuilder, Vec2,
+    self, Align, Color32, Layout, Margin, RichText, Sense, Stroke, TextWrapMode, Vec2,
 };
 
 use crate::backend::{Action, Backend};
 use crate::state::{
-    EntryKind, Layout as Breakpoint, PendingState, ProviderSummary, Session, SessionStatus, Usage,
-    ViewModel, Workspace, layout_for_width,
+    EntryKind, Layout as Breakpoint, PendingState, ProviderSummary, Session, SessionStatus,
+    ViewModel, layout_for_width,
 };
 use crate::theme;
 use crate::ui::composer::{self, ComposerAction, ComposerState};
@@ -103,6 +102,7 @@ pub struct Desktop {
     toast: Option<Toast>,
     composer_focus: bool,
     pending_prompt: Option<String>,
+    pending_model: Option<(String, String)>,
     pending_clipboard: Option<String>,
     preview: bool,
     last_size: Vec2,
@@ -139,6 +139,7 @@ impl Desktop {
             toast: None,
             composer_focus: false,
             pending_prompt: None,
+            pending_model: None,
             pending_clipboard: None,
             preview,
             last_size: Vec2::ZERO,
@@ -157,6 +158,29 @@ impl Desktop {
 
     fn session_id(&self) -> Option<String> {
         self.selected.clone()
+    }
+
+    /// Reuse the most recently active model for this provider when creating a
+    /// new agent. Agent model choices are persisted by talosd, so this survives
+    /// desktop restarts without inventing a second preference store.
+    fn last_model(&self, provider: &str, excluding: Option<&str>) -> Option<String> {
+        self.view()
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.provider == provider
+                    && !session.archived
+                    && excluding != Some(session.id.as_str())
+            })
+            .filter_map(|session| {
+                session
+                    .model
+                    .as_ref()
+                    .filter(|model| !model.is_empty())
+                    .map(|model| (session.time.as_str(), model.clone()))
+            })
+            .max_by_key(|(time, _)| *time)
+            .map(|(_, model)| model)
     }
 
     fn notify(&mut self, text: impl Into<String>) {
@@ -189,6 +213,22 @@ impl Desktop {
             self.selected = Some(id.clone());
             self.loaded.remove(&id);
             self.composer_focus = true;
+            let provider = self
+                .view()
+                .session(&id)
+                .map(|session| session.provider.clone())
+                .unwrap_or_else(|| "talos".into());
+            let model = self
+                .pending_model
+                .take()
+                .map(|(_, model)| model)
+                .or_else(|| self.last_model(&provider, Some(&id)));
+            if let Some(model) = model {
+                self.backend.submit(Action::SetModel {
+                    session: id.clone(),
+                    model,
+                });
+            }
             if let Some(text) = self.pending_prompt.take() {
                 if self.backend.send(&id, text) {
                     self.stick.insert(id.clone(), true);
@@ -247,31 +287,34 @@ impl Desktop {
         }
     }
 
-    fn send(&mut self) {
+    fn send(&mut self) -> bool {
         let Some(id) = self.session_id() else {
             self.warn("Create an agent before sending a prompt.");
-            return;
+            return false;
         };
         let Some(draft) = self.drafts.get(&id) else {
-            return;
+            return false;
         };
         let text = draft.trim_end_matches(['\n', ' ']).trim().to_owned();
         if text.is_empty() {
-            return;
+            return false;
         }
         if self.preview {
             self.warn("Preview mode · start talosd to run prompts.");
-            return;
+            return false;
         }
         if !self.view().online {
             self.warn("Daemon is offline; the prompt was kept as a draft.");
-            return;
+            return false;
         }
         if self.backend.send(&id, text) {
             if let Some(draft) = self.drafts.get_mut(&id) {
                 draft.clear();
             }
             self.stick.insert(id.clone(), true);
+            true
+        } else {
+            false
         }
     }
 
@@ -881,7 +924,7 @@ impl Desktop {
 
     /// With no session selected, the first prompt creates the agent and then
     /// sends itself once the daemon reports the new session.
-    fn start_from_prompt(&mut self) {
+    fn start_from_prompt(&mut self) -> bool {
         let Some(workspace) = self.workspace_filter.clone().or_else(|| {
             self.view()
                 .workspaces
@@ -890,7 +933,7 @@ impl Desktop {
         }) else {
             self.warn("Add a workspace before starting an agent.");
             self.new_workspace.open = true;
-            return;
+            return false;
         };
         let draft = self
             .drafts
@@ -899,18 +942,25 @@ impl Desktop {
             .unwrap_or_default();
         let prompt = draft.trim().to_owned();
         if prompt.is_empty() {
-            return;
+            return false;
         }
         let title = truncate(prompt.lines().next().unwrap_or("New agent"), 52);
+        let provider = self
+            .pending_model
+            .as_ref()
+            .map(|(provider, _)| provider.clone());
         if self.backend.submit(Action::CreateAgent {
             workspace,
-            provider: None,
+            provider,
             title: Some(title),
         }) {
             self.pending_prompt = Some(prompt);
             if let Some(draft) = self.drafts.get_mut(NEW_CONVERSATION) {
                 draft.clear();
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -1080,6 +1130,9 @@ impl Desktop {
                 .animate_value_with_time(egui::Id::unique("composer-height"), target, 0.12)
         };
         let session = self.session().cloned();
+        let remembered_model = (!has_session)
+            .then(|| self.last_model("talos", None))
+            .flatten();
         let usage = self.view().usage.get(&id).cloned();
         let providers = self.view().providers.clone();
         let running = has_session && self.view().running(&id);
@@ -1106,6 +1159,7 @@ impl Desktop {
                     running,
                     online,
                     session: session.as_ref(),
+                    remembered_model: remembered_model.as_deref(),
                     providers: &providers,
                     usage: usage.as_ref(),
                     motion,
@@ -1115,32 +1169,33 @@ impl Desktop {
                 match action {
                     Some(ComposerAction::Send) => {
                         self.drafts.insert(id.clone(), draft.clone());
-                        if has_session {
-                            self.send();
+                        let sent = if has_session {
+                            self.send()
                         } else {
-                            self.start_from_prompt();
+                            self.start_from_prompt()
+                        };
+                        if sent {
+                            draft.clear();
                         }
-                        return;
                     }
                     Some(ComposerAction::Stop) => {
                         self.backend.submit(Action::Cancel(id.clone()));
                         self.backend.view.run.insert(id.clone(), false);
                     }
                     Some(ComposerAction::SetModel { provider, model }) => {
-                        if self.backend.submit(Action::SetModel {
-                            session: id.clone(),
-                            model: model.clone(),
-                        }) {
-                            self.notify(format!("Model set to {model} for the next turn."));
+                        if has_session {
+                            if self.backend.submit(Action::SetModel {
+                                session: id.clone(),
+                                model: model.clone(),
+                            }) {
+                                self.notify(format!("Model set to {model} for the next turn."));
+                            }
+                        } else {
+                            self.pending_model = Some((provider, model.clone()));
+                            self.notify(format!(
+                                "Model {model} selected for the new conversation."
+                            ));
                         }
-                        let _ = provider;
-                    }
-                    Some(ComposerAction::SetMode { mode }) => {
-                        self.backend.submit(Action::SetMode {
-                            session: id.clone(),
-                            mode: mode.clone(),
-                        });
-                        self.notify(format!("Mode set to {mode}."));
                     }
                     Some(ComposerAction::Attach) => {
                         self.notify("Attachments reach the daemon in the next build.");
@@ -1245,10 +1300,6 @@ impl Desktop {
                 provider_label(self.view(), &session.provider).to_owned(),
             ),
             ("Model", session.model_label()),
-            (
-                "Mode",
-                session.mode.clone().unwrap_or_else(|| "Default".into()),
-            ),
             ("Workspace", session.workspace.clone()),
             ("Directory", compact_path(&session.cwd)),
         ] {
