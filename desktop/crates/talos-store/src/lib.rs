@@ -35,6 +35,13 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspaceArchiveResult {
+    Archived(Workspace),
+    NotFound,
+    ActiveRuns,
+}
+
 pub struct SqliteStore {
     connection: Connection,
 }
@@ -101,12 +108,53 @@ impl SqliteStore {
     }
 
     pub fn save_workspace(&mut self, value: &Workspace) -> Result<()> {
-        self.connection.execute("INSERT INTO workspaces(id,name,path,kind,lifecycle,metadata,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET name=excluded.name,path=excluded.path,kind=excluded.kind,lifecycle=excluded.lifecycle,metadata=excluded.metadata,updated_at=excluded.updated_at",
-            params![value.id.to_string(),value.name,value.path,json(&value.kind)?,json(&value.lifecycle)?,json(&value.metadata)?,ts(value.created_at),ts(value.updated_at)])?;
-        Ok(())
+        save_workspace_row(&self.connection, value)
     }
     pub fn workspace(&self, id: WorkspaceId) -> Result<Option<Workspace>> {
-        self.connection.query_row("SELECT id,name,path,kind,lifecycle,metadata,created_at,updated_at FROM workspaces WHERE id=?1",[id.to_string()],|r| Ok(Workspace{id:parse_id(r.get::<_,String>(0)?)?,name:r.get(1)?,path:r.get(2)?,kind:decode(r.get(3)?)?,lifecycle:decode(r.get(4)?)?,metadata:decode(r.get(5)?)?,created_at:parse_ts(r.get(6)?)?,updated_at:parse_ts(r.get(7)?)?})).optional().map_err(Into::into)
+        workspace_on(&self.connection, id)
+    }
+    pub fn rename_workspace(&mut self, id: WorkspaceId, name: String) -> Result<Option<Workspace>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut workspace) = workspace_on(&tx, id)? else {
+            tx.rollback()?;
+            return Ok(None);
+        };
+        workspace.rename(name)?;
+        update_workspace_row(&tx, &workspace)?;
+        tx.commit()?;
+        Ok(Some(workspace))
+    }
+    pub fn archive_workspace(&mut self, id: WorkspaceId) -> Result<WorkspaceArchiveResult> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut workspace) = workspace_on(&tx, id)? else {
+            tx.rollback()?;
+            return Ok(WorkspaceArchiveResult::NotFound);
+        };
+        if workspace_has_active_runs_on(&tx, id)? {
+            tx.rollback()?;
+            return Ok(WorkspaceArchiveResult::ActiveRuns);
+        }
+        workspace.archive()?;
+        update_workspace_row(&tx, &workspace)?;
+        tx.commit()?;
+        Ok(WorkspaceArchiveResult::Archived(workspace))
+    }
+    pub fn restore_workspace(&mut self, id: WorkspaceId) -> Result<Option<Workspace>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut workspace) = workspace_on(&tx, id)? else {
+            tx.rollback()?;
+            return Ok(None);
+        };
+        workspace.restore()?;
+        update_workspace_row(&tx, &workspace)?;
+        tx.commit()?;
+        Ok(Some(workspace))
     }
     pub fn list_workspaces(&self) -> Result<Vec<Workspace>> {
         let mut s=self.connection.prepare("SELECT id,name,path,kind,lifecycle,metadata,created_at,updated_at FROM workspaces ORDER BY created_at,id")?;
@@ -451,6 +499,83 @@ fn read_prompt_request(
         .optional()
         .map_err(Into::into)
 }
+fn save_workspace_row(connection: &Connection, value: &Workspace) -> Result<()> {
+    connection.execute("INSERT INTO workspaces(id,name,path,kind,lifecycle,metadata,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET name=excluded.name,path=excluded.path,kind=excluded.kind,lifecycle=excluded.lifecycle,metadata=excluded.metadata,updated_at=excluded.updated_at",
+        params![value.id.to_string(),value.name,value.path,json(&value.kind)?,json(&value.lifecycle)?,json(&value.metadata)?,ts(value.created_at),ts(value.updated_at)])?;
+    Ok(())
+}
+fn update_workspace_row(connection: &Connection, value: &Workspace) -> Result<()> {
+    let changed = connection.execute(
+        "UPDATE workspaces SET name=?2,path=?3,kind=?4,lifecycle=?5,metadata=?6,updated_at=?7 WHERE id=?1",
+        params![
+            value.id.to_string(),
+            value.name,
+            value.path,
+            json(&value.kind)?,
+            json(&value.lifecycle)?,
+            json(&value.metadata)?,
+            ts(value.updated_at)
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::NotFound(value.id.to_string()));
+    }
+    Ok(())
+}
+fn workspace_on(connection: &Connection, id: WorkspaceId) -> Result<Option<Workspace>> {
+    connection
+        .query_row(
+            "SELECT id,name,path,kind,lifecycle,metadata,created_at,updated_at FROM workspaces WHERE id=?1",
+            [id.to_string()],
+            |row| {
+                Ok(Workspace {
+                    id: parse_id(row.get::<_, String>(0)?)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    kind: decode(row.get(3)?)?,
+                    lifecycle: decode(row.get(4)?)?,
+                    metadata: decode(row.get(5)?)?,
+                    created_at: parse_ts(row.get(6)?)?,
+                    updated_at: parse_ts(row.get(7)?)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+fn workspace_has_active_runs_on(connection: &Connection, id: WorkspaceId) -> Result<bool> {
+    let mut statement = connection.prepare(
+        "SELECT latest.payload FROM timeline_events AS latest
+         INNER JOIN sessions ON sessions.id=latest.session_id
+         INNER JOIN agents ON agents.id=sessions.agent_id
+         WHERE agents.workspace_id=?1 AND latest.kind='RunState' AND latest.run_id IS NOT NULL
+         AND latest.sequence=(
+             SELECT MAX(state_event.sequence) FROM timeline_events AS state_event
+             WHERE state_event.session_id=latest.session_id
+               AND state_event.run_id=latest.run_id AND state_event.kind='RunState'
+         )",
+    )?;
+    let payloads = statement
+        .query_map([id.to_string()], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for payload in payloads {
+        let TimelineEventKind::RunState { state } = serde_json::from_str(&payload)? else {
+            return Err(StoreError::InvalidData(
+                "persisted run-state event has an unexpected payload".into(),
+            ));
+        };
+        if !matches!(
+            state,
+            RunLifecycle::Succeeded
+                | RunLifecycle::Failed
+                | RunLifecycle::Cancelled
+                | RunLifecycle::Interrupted
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 fn insert_event(tx: &Transaction<'_>, event: &TimelineEvent) -> Result<()> {
     let payload = json(&event.kind)?;
     let kind = serde_json::to_value(&event.kind)?
@@ -520,6 +645,84 @@ mod tests {
         let a = Agent::new(w.id, ProviderId::new("talos").unwrap(), "agent").unwrap();
         let s = Session::new(a.id);
         (w, a, s)
+    }
+
+    #[test]
+    fn workspace_lifecycle_preserves_ids_and_rejects_active_runs() {
+        let mut db = SqliteStore::open_in_memory().unwrap();
+        let (workspace, agent, session) = fixture();
+        db.save_workspace(&workspace).unwrap();
+        db.save_agent(&agent).unwrap();
+        db.save_session(&session).unwrap();
+
+        let run_id = RunId::new();
+        db.append_event(
+            &TimelineEvent::new(
+                session.id,
+                Some(run_id),
+                1,
+                TimelineEventKind::RunState {
+                    state: RunLifecycle::Running,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.archive_workspace(workspace.id).unwrap(),
+            WorkspaceArchiveResult::ActiveRuns
+        );
+        assert_eq!(
+            db.workspace(workspace.id).unwrap().unwrap(),
+            workspace,
+            "a rejected archive must leave the workspace unchanged"
+        );
+
+        db.append_event(
+            &TimelineEvent::new(
+                session.id,
+                Some(run_id),
+                2,
+                TimelineEventKind::RunState {
+                    state: RunLifecycle::Succeeded,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let renamed = db
+            .rename_workspace(workspace.id, "renamed project".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed.id, workspace.id);
+        assert_eq!(renamed.name, "renamed project");
+        assert_eq!(renamed.path, workspace.path);
+        assert_eq!(renamed.created_at, workspace.created_at);
+
+        let WorkspaceArchiveResult::Archived(archived) =
+            db.archive_workspace(workspace.id).unwrap()
+        else {
+            panic!("workspace should archive after its run is terminal");
+        };
+        assert_eq!(
+            archived.lifecycle,
+            talos_domain::WorkspaceLifecycle::Archived
+        );
+        assert_eq!(archived.id, workspace.id);
+        assert_eq!(archived.name, "renamed project");
+        assert_eq!(db.list_agents(workspace.id).unwrap(), vec![agent.clone()]);
+        assert_eq!(db.list_sessions(agent.id).unwrap(), vec![session.clone()]);
+        assert_eq!(db.replay_events(session.id, None, 10).unwrap().len(), 2);
+
+        let restored = db.restore_workspace(workspace.id).unwrap().unwrap();
+        assert_eq!(restored.lifecycle, talos_domain::WorkspaceLifecycle::Active);
+        assert_eq!(restored.id, workspace.id);
+        assert_eq!(db.list_sessions(agent.id).unwrap(), vec![session]);
+        assert_eq!(
+            db.archive_workspace(WorkspaceId::new()).unwrap(),
+            WorkspaceArchiveResult::NotFound
+        );
     }
 
     #[test]

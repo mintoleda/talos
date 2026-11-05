@@ -79,6 +79,15 @@ impl Daemon {
             Command::ListWorkspaces => self.list_workspaces().await,
             Command::GetWorkspace { workspace_id } => self.get_workspace(&workspace_id).await,
             Command::CreateWorkspace { name, path } => self.create_workspace(name, path).await,
+            Command::RenameWorkspace { workspace_id, name } => {
+                self.rename_workspace(&workspace_id, name).await
+            }
+            Command::ArchiveWorkspace { workspace_id } => {
+                self.archive_workspace(&workspace_id).await
+            }
+            Command::RestoreWorkspace { workspace_id } => {
+                self.restore_workspace(&workspace_id).await
+            }
             Command::ListProviders => Ok(serialize_provider_diagnostics(
                 &self.service.provider_diagnostics().await,
             )),
@@ -186,6 +195,36 @@ impl Daemon {
         let workspace = self
             .service
             .create_workspace(name, path, WorkspaceKind::Directory)
+            .await
+            .map_err(map_core_error)?;
+        serialize(workspace)
+    }
+
+    async fn rename_workspace(&self, value: &str, name: String) -> Result<Value, RpcError> {
+        let id = parse_id::<WorkspaceId>(value)?;
+        let workspace = self
+            .service
+            .rename_workspace(id, name)
+            .await
+            .map_err(map_core_error)?;
+        serialize(workspace)
+    }
+
+    async fn archive_workspace(&self, value: &str) -> Result<Value, RpcError> {
+        let id = parse_id::<WorkspaceId>(value)?;
+        let workspace = self
+            .service
+            .archive_workspace(id)
+            .await
+            .map_err(map_core_error)?;
+        serialize(workspace)
+    }
+
+    async fn restore_workspace(&self, value: &str) -> Result<Value, RpcError> {
+        let id = parse_id::<WorkspaceId>(value)?;
+        let workspace = self
+            .service
+            .restore_workspace(id)
             .await
             .map_err(map_core_error)?;
         serialize(workspace)
@@ -927,6 +966,11 @@ fn core_error(error: CoreError) -> RpcError {
         CoreError::InvalidWorkspacePath(path) => (
             -32602,
             format!("workspace path is not an existing directory: {path}"),
+        ),
+        CoreError::InvalidWorkspaceName(message) => (-32602, message),
+        CoreError::WorkspaceHasActiveRuns(id) => (
+            -32009,
+            format!("workspace {id} has active runs and cannot be archived"),
         ),
         CoreError::WorkspaceArchived => (
             -32602,
@@ -2341,6 +2385,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded["session"]["lifecycle"], "Archived");
+        bridge.abort();
+        daemon.service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn workspace_lifecycle_commands_preserve_history_and_reject_active_runs() {
+        let (daemon, bridge, temp) = fixture_daemon().await;
+        let session = fixture_session(&daemon, temp.path(), "workspace-lifecycle").await;
+        let original = daemon.service.list_workspaces().await.unwrap().remove(0);
+        let accepted = daemon
+            .command(Command::Prompt {
+                session_id: session.id.to_string(),
+                text: "permission".into(),
+                request_key: None,
+            })
+            .await
+            .unwrap();
+        let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+        let pending = poll_pending(&daemon, 1).await;
+        let error = daemon
+            .command(Command::ArchiveWorkspace {
+                workspace_id: original.id.to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, -32009);
+        assert_eq!(
+            daemon
+                .service
+                .workspace(original.id)
+                .await
+                .unwrap()
+                .lifecycle,
+            talos_domain::WorkspaceLifecycle::Active
+        );
+
+        let renamed = daemon
+            .command(Command::RenameWorkspace {
+                workspace_id: original.id.to_string(),
+                name: "renamed workspace".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(renamed["id"], original.id.to_string());
+        assert_eq!(renamed["name"], "renamed workspace");
+
+        daemon
+            .command(Command::PermissionDecision {
+                permission_id: pending[0]["id"].as_str().unwrap().to_owned(),
+                decision: PermissionDecision::Allow,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            daemon.service.wait_run(run_id).await.unwrap(),
+            RunLifecycle::Succeeded
+        );
+        let history_before_archive = daemon
+            .command(Command::ReplaySession {
+                session_id: session.id.to_string(),
+                after: 0,
+                limit: Some(10),
+            })
+            .await
+            .unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .len();
+        let archived = daemon
+            .command(Command::ArchiveWorkspace {
+                workspace_id: original.id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(archived["lifecycle"], "Archived");
+        let restored = daemon
+            .command(Command::RestoreWorkspace {
+                workspace_id: original.id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(restored["lifecycle"], "Active");
+        assert_eq!(restored["id"], original.id.to_string());
+
+        let loaded = daemon
+            .command(Command::GetSession {
+                session_id: session.id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(loaded["session"]["id"], session.id.to_string());
+        let history = daemon
+            .command(Command::ReplaySession {
+                session_id: session.id.to_string(),
+                after: 0,
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            history["events"].as_array().unwrap().len(),
+            history_before_archive
+        );
+
         bridge.abort();
         daemon.service.shutdown().await;
     }

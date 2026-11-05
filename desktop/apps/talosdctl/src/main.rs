@@ -98,6 +98,16 @@ enum WorkspaceAction {
         name: String,
         path: PathBuf,
     },
+    Rename {
+        id: String,
+        name: String,
+    },
+    Archive {
+        id: String,
+    },
+    Restore {
+        id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -312,6 +322,21 @@ fn workspace_command(action: &WorkspaceAction) -> Result<Command> {
                     .to_owned(),
             })
         }
+        WorkspaceAction::Rename { id, name } => {
+            if name.trim().is_empty() {
+                bail!("workspace name cannot be empty");
+            }
+            Ok(Command::RenameWorkspace {
+                workspace_id: id.clone(),
+                name: name.clone(),
+            })
+        }
+        WorkspaceAction::Archive { id } => Ok(Command::ArchiveWorkspace {
+            workspace_id: id.clone(),
+        }),
+        WorkspaceAction::Restore { id } => Ok(Command::RestoreWorkspace {
+            workspace_id: id.clone(),
+        }),
     }
 }
 
@@ -839,6 +864,38 @@ mod tests {
             command_for(&cli.command).unwrap(),
             Command::GetWorkspace {
                 workspace_id: "w1".into()
+            }
+        );
+
+        let cli = Cli::try_parse_from([
+            "talosdctl",
+            "workspace",
+            "rename",
+            "w1",
+            "Renamed workspace",
+        ])
+        .unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::RenameWorkspace {
+                workspace_id: "w1".into(),
+                name: "Renamed workspace".into(),
+            }
+        );
+
+        let cli = Cli::try_parse_from(["talosdctl", "workspace", "archive", "w1"]).unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::ArchiveWorkspace {
+                workspace_id: "w1".into(),
+            }
+        );
+
+        let cli = Cli::try_parse_from(["talosdctl", "workspace", "restore", "w1"]).unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::RestoreWorkspace {
+                workspace_id: "w1".into(),
             }
         );
 
