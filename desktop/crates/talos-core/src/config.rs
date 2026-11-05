@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use tokio::io::AsyncWriteExt;
+
 use serde::{Deserialize, Serialize};
 use talos_domain::ProviderId;
 use thiserror::Error;
@@ -401,10 +403,31 @@ pub(crate) async fn save(path: &Path, config: &AppConfig) -> Result<(), ConfigEr
         .parent()
         .ok_or_else(|| ConfigError::Invalid("configuration path has no parent".into()))?;
     tokio::fs::create_dir_all(parent).await?;
-    let temporary = path.with_extension(format!("toml.tmp.{}", std::process::id()));
-    tokio::fs::write(&temporary, content).await?;
-    set_private_permissions(&temporary).await?;
-    tokio::fs::rename(temporary, path).await?;
+    let temporary = path.with_extension(format!(
+        "toml.tmp.{}.{}",
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    ));
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await?;
+        set_private_permissions(&temporary).await?;
+        file.write_all(content.as_bytes()).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temporary, path).await?;
+        // Persist the rename itself so a successful return survives a crash.
+        tokio::fs::File::open(parent).await?.sync_all().await?;
+        Ok::<_, std::io::Error>(())
+    }
+    .await;
+    if write_result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    write_result?;
     Ok(())
 }
 
@@ -580,6 +603,28 @@ command = "codex-acp"
         assert!(!old.join("state.sqlite3").exists());
 
         assert!(!home.adopt_from(&old).unwrap());
+    }
+
+    #[tokio::test]
+    async fn invalid_config_does_not_replace_the_last_good_file() {
+        let temp = TestPaths::new();
+        let path = temp.0.join("config.toml");
+        let valid = AppConfig::default();
+        save(&path, &valid).await.unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let mut invalid = valid;
+        invalid.event_capacity = 0;
+        assert!(save(&path, &invalid).await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(&temp.0)
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1,
+            "failed saves must not leave a temporary config behind"
+        );
     }
 
     #[test]
