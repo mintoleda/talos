@@ -13,11 +13,13 @@ import (
 	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/provider"
 	"github.com/mintoleda/talos/internal/provider/anthropic"
+	"github.com/mintoleda/talos/internal/provider/codex"
 	"github.com/mintoleda/talos/internal/provider/openai"
 )
 
-// ListModels lists models from every provider with a configured key.
-// Providers that fail or outlive ctx are skipped.
+// ListModels lists models from every provider with a configured key (or,
+// for OAuth providers, a stored login). Providers that fail or outlive ctx
+// are skipped.
 func ListModels(ctx context.Context, baseDir string) []models.Entry {
 	type result struct {
 		entries []models.Entry
@@ -25,6 +27,21 @@ func ListModels(ctx context.Context, baseDir string) []models.Entry {
 	ch := make(chan result, len(provider.All))
 	var wg sync.WaitGroup
 	for _, kp := range provider.All {
+		if kp.OAuth {
+			if _, ok := config.ReadOAuth(baseDir, kp.Name); !ok {
+				continue
+			}
+			wg.Add(1)
+			go func(kp provider.Known) {
+				defer wg.Done()
+				ids, err := codex.New(kp.BaseURL, baseDir).ListModels(ctx)
+				if err != nil {
+					return
+				}
+				ch <- result{entries: entriesFor(kp.Name, ids)}
+			}(kp)
+			continue
+		}
 		key := config.ResolveKeyFor(baseDir, kp.Name, kp.EnvVar)
 		if key == "" {
 			continue
@@ -42,11 +59,7 @@ func ListModels(ctx context.Context, baseDir string) []models.Entry {
 			if err != nil {
 				return
 			}
-			entries := make([]models.Entry, len(ids))
-			for i, id := range ids {
-				entries[i] = models.Entry{Provider: kp.Name, ID: id}
-			}
-			ch <- result{entries: entries}
+			ch <- result{entries: entriesFor(kp.Name, ids)}
 		}(kp, key)
 	}
 	go func() { wg.Wait(); close(ch) }()
@@ -63,6 +76,14 @@ func ListModels(ctx context.Context, baseDir string) []models.Entry {
 	})
 
 	return all
+}
+
+func entriesFor(providerName string, ids []string) []models.Entry {
+	entries := make([]models.Entry, len(ids))
+	for i, id := range ids {
+		entries[i] = models.Entry{Provider: providerName, ID: id}
+	}
+	return entries
 }
 
 // SwitchModel rebuilds the provider and compactor for cfg (a per-session

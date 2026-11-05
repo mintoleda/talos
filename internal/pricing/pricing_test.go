@@ -62,3 +62,12 @@ func TestUnknownModel(t *testing.T) {
 		t.Errorf("unknown model cost = %v, want 0", got)
 	}
 }
+
+func TestCodexExtras(t *testing.T) {
+	if got := Default.ContextWindow("gpt-6.1-sol"); got != 500000 {
+		t.Fatalf("gpt-6.1-sol context = %d", got)
+	}
+	if got := Default.ContextWindow("openai-codex/gpt-6-luna"); got != 272000 {
+		t.Fatalf("gpt-6-luna context = %d", got)
+	}
+}

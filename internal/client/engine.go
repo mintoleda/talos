@@ -6,6 +6,7 @@
 package client
 
 import (
+	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/tui/dialogs"
@@ -54,6 +55,8 @@ type Engine interface {
 	LoginProviders() ([]dialogs.LoginProvider, error)
 	// Login persists an API key for the given provider.
 	Login(provider, key string) error
+	// SaveOAuth persists credentials from a completed OAuth login.
+	SaveOAuth(provider string, cred config.OAuthCredential) error
 	// MCPStatus returns a human-readable summary of MCP server connections.
 	MCPStatus() (string, error)
 	// MCPCount returns the number of connected MCP servers.

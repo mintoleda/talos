@@ -3,6 +3,7 @@ package rpc
 import (
 	"time"
 
+	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/tui/dialogs"
@@ -22,6 +23,7 @@ const (
 	Stats             = "engine.stats"
 	LoginProviders    = "engine.loginProviders"
 	Login             = "engine.login"
+	SaveOAuth         = "engine.saveOAuth"
 	MCPStatus         = "engine.mcpStatus"
 	MCPCount          = "engine.mcpCount"
 	CancelSubagent    = "engine.cancelSubagent"
@@ -239,6 +241,13 @@ type StatsResult struct {
 type LoginParams struct {
 	Provider string `json:"provider"`
 	Key      string `json:"key"`
+}
+
+// SaveOAuthParams carries credentials from an OAuth login completed on the
+// client side. Tokens travel only over the local engine connection.
+type SaveOAuthParams struct {
+	Provider   string                 `json:"provider"`
+	Credential config.OAuthCredential `json:"credential"`
 }
 
 type StatusResult struct {
