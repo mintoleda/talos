@@ -23,6 +23,8 @@
 ~/.cargo/bin/cargo run -p talosdctl -- session set-mode SESSION_ID MODE_ID
 ~/.cargo/bin/cargo run -p talosdctl -- session set-thinking SESSION_ID high
 ~/.cargo/bin/cargo run -p talosdctl -- session replay --session SESSION_ID --after 0 --limit 100
+~/.cargo/bin/cargo run -p talosdctl -- history search 'connection timeout' --limit 50
+~/.cargo/bin/cargo run -p talosdctl -- history search 'connection timeout' --session SESSION_ID
 
 ~/.cargo/bin/cargo run -p talosdctl -- agent list
 ~/.cargo/bin/cargo run -p talosdctl -- agent list --workspace WORKSPACE_ID
@@ -40,6 +42,8 @@
 ```
 
 `workspace create` aliases `workspace add`. Use `session replay --session ID` for a single timeline or `events replay --cursors '{"SESSION_ID":7}'` for lossless multi-session pagination; pass each response's `session_cursors` into the next page while `has_more` is true. The legacy flat `events --after` and `session replay` without `--session` apply one scalar independently to every session; their maximum `next_cursor` is not a safe global watermark. `events tail --follow` drains all initial replay pages, deduplicates buffered live events by session sequence, and replays after lag/gaps. Transport disconnection ends the command; automatic reconnect is not yet implemented. See [the IPC replay contract](../../docs/architecture/ipc-replay.md). `session new` creates an agent and its first session through `CreateAgent`, so it requires a workspace id, not a workspace path (create the workspace first with `workspace add`).
+
+`history search QUERY` finds durable user and assistant text events, newest first. Use `--session SESSION_ID` to scope results and `--limit N` to raise the default 50 results (maximum 1000); `has_more` indicates additional matches. Search excludes tool payloads, thoughts, permission details, and diagnostics. Queries must be 1–512 UTF-8 bytes after trimming.
 
 `--request-key` provides durable, session-scoped acceptance deduplication: retrying the same key and prompt returns the original `run_id`, while reusing a key with different prompt text fails. This does not guarantee exactly-once model/tool execution. Do not automatically retry an unkeyed prompt after a lost response; see the [durable prompt acceptance contract](../../docs/architecture/prompt-acceptance.md).
 

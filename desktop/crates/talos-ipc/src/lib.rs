@@ -112,6 +112,11 @@ pub enum Command {
         after: std::collections::BTreeMap<String, u64>,
         limit: Option<u32>,
     },
+    SearchTimeline {
+        query: String,
+        session_id: Option<String>,
+        limit: Option<u32>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -743,6 +748,11 @@ mod tests {
             after: [("session-1".into(), 4)].into(),
             limit: Some(10),
         });
+        round_trip(&Command::SearchTimeline {
+            query: "search term".into(),
+            session_id: Some("session-1".into()),
+            limit: Some(25),
+        });
     }
 
     #[test]
@@ -788,6 +798,15 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&Command::Shutdown).unwrap()["method"],
             "shutdown"
+        );
+        assert_eq!(
+            serde_json::to_value(&Command::SearchTimeline {
+                query: "search term".into(),
+                session_id: None,
+                limit: Some(25),
+            })
+            .unwrap()["method"],
+            "search_timeline"
         );
     }
 }
