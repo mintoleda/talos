@@ -144,6 +144,14 @@ impl Daemon {
                 after,
                 limit,
             } => self.replay_session(&session_id, after, limit).await,
+            Command::SearchTimeline {
+                query,
+                session_id,
+                limit,
+            } => {
+                self.search_timeline(query, session_id.as_deref(), limit)
+                    .await
+            }
         }
     }
 
@@ -497,6 +505,39 @@ impl Daemon {
             .map_err(map_core_error)?;
         let next_cursor = events.last().map_or(after, |event| event.sequence);
         Ok(json!({"session_id": id, "events": events, "next_cursor": next_cursor}))
+    }
+
+    async fn search_timeline(
+        &self,
+        query: String,
+        session_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Value, RpcError> {
+        if query.trim().is_empty() {
+            return Err(RpcError::new(
+                -32602,
+                "timeline search query must not be empty",
+            ));
+        }
+        if query.len() > 512 {
+            return Err(RpcError::new(
+                -32602,
+                "timeline search query exceeds 512 bytes",
+            ));
+        }
+        let query = query.trim().to_owned();
+        let session_id = session_id.map(parse_id::<SessionId>).transpose()?;
+        let limit = limit.unwrap_or(50).clamp(1, 1000) as usize;
+        let (events, has_more) = self
+            .service
+            .search_timeline(query.clone(), session_id, limit)
+            .await
+            .map_err(map_core_error)?;
+        Ok(json!({
+            "query": query,
+            "events": events,
+            "has_more": has_more,
+        }))
     }
 
     async fn snapshot(&self) -> Result<Value, RpcError> {
@@ -1688,6 +1729,73 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(invalid.code, -32602);
+        daemon.service.shutdown().await;
+        bridge.abort();
+    }
+
+    #[tokio::test]
+    async fn timeline_search_is_available_over_ipc_and_can_be_session_scoped() {
+        let (daemon, bridge, temp) = fixture_daemon().await;
+        let first = fixture_session(&daemon, temp.path(), "first-search").await;
+        let second = fixture_session(&daemon, temp.path(), "second-search").await;
+        for (session, prompt) in [
+            (&first, "needle belongs to first session"),
+            (&second, "needle belongs to second session"),
+        ] {
+            let run = daemon
+                .service
+                .send_prompt(session.id, prompt)
+                .await
+                .unwrap();
+            daemon.service.wait_run(run).await.unwrap();
+        }
+
+        let page = daemon
+            .command(Command::SearchTimeline {
+                query: "NEEDLE".into(),
+                session_id: None,
+                limit: Some(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(page["query"], "NEEDLE");
+        assert_eq!(page["events"].as_array().unwrap().len(), 1);
+        assert_eq!(page["has_more"], true);
+
+        let scoped = daemon
+            .command(Command::SearchTimeline {
+                query: "needle".into(),
+                session_id: Some(first.id.to_string()),
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(scoped["events"].as_array().unwrap().len(), 1);
+        assert_eq!(scoped["events"][0]["session_id"], first.id.to_string());
+        assert_eq!(
+            scoped["events"][0]["kind"]["UserText"]["text"],
+            "needle belongs to first session"
+        );
+        assert_eq!(scoped["has_more"], false);
+
+        let invalid = daemon
+            .command(Command::SearchTimeline {
+                query: "   ".into(),
+                session_id: None,
+                limit: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, -32602);
+        let invalid_session = daemon
+            .command(Command::SearchTimeline {
+                query: "needle".into(),
+                session_id: Some("not-a-session-id".into()),
+                limit: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(invalid_session.code, -32602);
         daemon.service.shutdown().await;
         bridge.abort();
     }

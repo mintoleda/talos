@@ -1,8 +1,8 @@
 # Local IPC replay and delivery contract
 
-Protocol version remains **1**. `replay_sessions` is an additive command. Older
-servers may reject it; clients must report incompatibility rather than silently
-substitute an unsafe global cursor. Wire types live in
+Protocol version remains **1**. `replay_sessions` and `search_timeline` are
+additive commands. Older servers may reject them; clients must report
+incompatibility rather than silently substitute a different operation. Wire types live in
 `crates/talos-ipc/src/lib.rs`; handlers live in `apps/talosd/src/main.rs`.
 
 ## Identity and ordering
@@ -72,6 +72,8 @@ talosdctl events replay --cursors '{}' --limit 100 --json
 talosdctl events replay --cursors '{"SESSION_ID":7}' --limit 100 --json
 talosdctl session replay --session SESSION_ID --after 7 --json
 talosdctl events tail --follow --limit 100 --json
+talosdctl history search "connection timeout" --limit 50
+talosdctl history search "connection timeout" --session SESSION_ID
 ```
 
 Follow subscribes on connection, drains all replay pages, deduplicates buffered
@@ -80,6 +82,21 @@ live notifications and replays on explicit lag or a sequence gap. Its initial
 sessions start at zero. Transport disconnection still ends the command: callers
 must reconnect with their saved per-session positions; automatic reconnect is
 not claimed.
+
+## History search
+
+```json
+{"method":"search_timeline","params":{"query":"connection timeout","session_id":null,"limit":50}}
+```
+
+The response contains the trimmed `query`, matching `events`, and `has_more`.
+Search is an ASCII case-insensitive substring match over durable `UserText` and
+`AssistantText` events, returned newest first. It does not search tool payloads,
+thoughts, permission details, or diagnostics. `session_id` optionally scopes the
+results to one session. The input query must contain 1–512 UTF-8 bytes before
+trimming; surrounding whitespace is removed. Limits default to 50 and clamp to
+1–1000. `has_more` reports that additional matches exist beyond the requested
+limit; this command does not provide a paging cursor.
 
 ## Evidence
 
@@ -91,4 +108,6 @@ not claimed.
   exactly once and never acknowledge truncated records; unknown session cursor
   rejection; legacy replay cursor truncation regression.
 - CLI parser tests: typed JSON cursor maps, session-specific replay and invalid
-  cursor rejection. Process-level scenarios are tracked in `docs/STATUS.md`.
+  cursor rejection. Search coverage includes text-only filtering, session scope,
+  result bounds, IPC round-trip and CLI mapping. Process-level scenarios are
+  tracked in `docs/STATUS.md`.

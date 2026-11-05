@@ -45,6 +45,11 @@ enum Action {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Search durable conversation text.
+    History {
+        #[command(subcommand)]
+        action: HistoryAction,
+    },
     /// Replay durable timeline events, or tail the live stream.
     Events {
         #[arg(long, default_value_t = 0)]
@@ -202,6 +207,20 @@ enum SessionAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum HistoryAction {
+    /// Search user and assistant text events, newest first.
+    Search {
+        query: String,
+        /// Restrict results to one session ID.
+        #[arg(long)]
+        session: Option<String>,
+        /// Maximum number of matching events to return (default 50, maximum 1000).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum PermissionAction {
     /// List pending permission requests.
     List,
@@ -262,6 +281,7 @@ fn command_for(action: &Action) -> Result<Command> {
         Action::Provider { .. } => Ok(Command::ListProviders),
         Action::Workspace { action } => workspace_command(action),
         Action::Session { action } => session_command(action),
+        Action::History { action } => history_command(action),
         Action::Events {
             after,
             limit,
@@ -445,6 +465,34 @@ fn session_command(action: &SessionAction) -> Result<Command> {
                 limit: *limit,
             },
         }),
+    }
+}
+
+fn history_command(action: &HistoryAction) -> Result<Command> {
+    match action {
+        HistoryAction::Search {
+            query,
+            session,
+            limit,
+        } => {
+            if query.trim().is_empty() {
+                bail!("history search query cannot be empty");
+            }
+            if query.len() > 512 {
+                bail!("history search query cannot exceed 512 bytes");
+            }
+            if session
+                .as_deref()
+                .is_some_and(|session| session.trim().is_empty())
+            {
+                bail!("history search session cannot be empty");
+            }
+            Ok(Command::SearchTimeline {
+                query: query.clone(),
+                session_id: session.clone(),
+                limit: *limit,
+            })
+        }
     }
 }
 
@@ -889,6 +937,32 @@ mod tests {
 
         let cli = Cli::try_parse_from(["talosdctl", "shutdown"]).unwrap();
         assert_eq!(command_for(&cli.command).unwrap(), Command::Shutdown);
+
+        let cli = Cli::try_parse_from([
+            "talosdctl",
+            "history",
+            "search",
+            "important phrase",
+            "--session",
+            "s1",
+            "--limit",
+            "20",
+        ])
+        .unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::SearchTimeline {
+                query: "important phrase".into(),
+                session_id: Some("s1".into()),
+                limit: Some(20),
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["talosdctl", "history", "search", "   "])
+                .map_err(|error| error.to_string())
+                .and_then(|cli| command_for(&cli.command).map_err(|error| error.to_string()))
+                .is_err()
+        );
     }
 
     #[test]
