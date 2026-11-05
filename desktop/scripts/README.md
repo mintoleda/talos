@@ -1,5 +1,25 @@
 # Process-level smoke harness
 
+## Linux packaging acceptance
+
+Run the isolated fresh-home packaging check with:
+
+```sh
+python3 scripts/packaging-acceptance.py --verbose
+```
+
+It creates two temporary fixture release archives, verifies each with
+`sha256sum -c`, confirms a modified archive fails checksum verification, then
+installs version 1, upgrades to version 2, and uninstalls in a temporary
+`HOME`. It checks the installed files and modes, preservation of `.talosd`,
+`.paseo`, and unrelated user files, plus installer/uninstaller refusal of
+symlink destinations. The fixture binaries are stubs: this verifies the
+filesystem and checksum contract, not a compiled release artifact or CLI/UI
+workflow. The test refuses to run as root, matching the user installer.
+
+CI runs this separately as the **Desktop Linux packaging acceptance** job. The
+current workflow does not assemble or upload a release archive.
+
 `talosd-smoke.py` launches the real `talosd`, `talosdctl` and `acp-fixture`
 binaries against temporary Rust-owned homes. It is deterministic, needs no live
 provider, and never reads or writes `~/.talosd`, `~/.paseo`, or a real Talos

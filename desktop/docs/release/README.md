@@ -1,8 +1,11 @@
 # Linux release / installation
 
-CI builds and tests the locked workspace with Rust 1.95.0 on Ubuntu 24.04. Each run uploads a `talos-desktop-linux-x86_64` artifact containing a tarball and a `.sha256` file. This is a Linux x86_64 **build artifact**, not a signed package or an auto-published GitHub release. The tarball includes `talosd`, `talosdctl`, the `talos-desktop` egui app, packaging assets, and this guide.
+CI runs the backend gates with Rust 1.95.0 on Ubuntu 24.04 and a separate Linux packaging acceptance check. The packaging check builds checksum-verified fixture archives with stub executables, then exercises install, upgrade, uninstall, symlink refusal, and data retention in temporary homes. It validates the installer contract; it does not build or upload a release archive or verify compiled application binaries. The current workflow produces no downloadable release artifact.
 
 ## Install (per-user, Linux with systemd user manager)
+
+These steps apply when a release bundle is available; the current CI workflow
+does not produce one.
 
 Download the artifact, verify the archive against its adjacent checksum (`sha256sum -c talos-desktop-linux-x86_64-*.tar.gz.sha256`), and extract it. From the extracted directory:
 
@@ -15,11 +18,21 @@ systemctl --user status talosd.service
 ~/.local/bin/talos-desktop
 ```
 
-Run as the desktop user, **never with sudo**. The installer replaces only `~/.local/bin/{talosd,talosdctl,talos-desktop}`, `~/.config/systemd/user/talosd.service`, and `~/.local/share/applications/talos-desktop.desktop`; it does not start/enable the service or touch daemon data. Re-running it is safe for those destinations; stop `talosd.service` before upgrading running binaries, then restart it after installation. For manual operation without systemd, run `~/.local/bin/talosd` in a terminal, then use `~/.local/bin/talosdctl health` in another.
+Run as the desktop user, **never with sudo**. The installer replaces only `~/.local/bin/{talosd,talosdctl,talos-desktop}`, `~/.config/systemd/user/talosd.service`, and `~/.local/share/applications/talos-desktop.desktop`; it does not start/enable the service or touch daemon data. Re-running it upgrades those destinations. Before upgrading running binaries, stop the service with `systemctl --user stop talosd.service`, install the new files, then start it again. For manual operation without systemd, run `~/.local/bin/talosd` in a terminal, then use `~/.local/bin/talosdctl health` in another.
+
+To uninstall, stop and disable the service, then run the bundle's uninstaller:
+
+```sh
+systemctl --user disable --now talosd.service
+bash packaging/uninstall-user.sh
+systemctl --user daemon-reload
+```
+
+The uninstaller removes only the five installed files listed above. It leaves `~/.talosd`, `~/.paseo`, and containing directories untouched. Both scripts refuse symlink destinations; the uninstaller checks all destinations before removing any file.
 
 The **user** service runs as your account (`systemctl --user`, not `sudo systemctl`) and uses the daemon's default `$HOME/.talosd` for its private state, authentication token, instance lock, and Unix socket. `talosdctl` defaults to the same home/socket; set `TALOSD_HOME` consistently for both processes if using a nondefault home (e.g., via a systemd user drop-in), and use `talosdctl --home PATH health` for a manual override. **Do not point it at `~/.paseo`**: that belongs to the legacy runtime and is not migrated by this installer. The systemd unit uses `%h/.local/bin/talosd` and sends SIGINT for graceful socket/lock cleanup. If a crash leaves a stale lock or socket, verify no daemon is running before removing those files from `.talosd`; automatic stale-file deletion is intentionally disabled.
 
-The desktop launcher resolves `talos-desktop` via the desktop session's `PATH`: ensure `~/.local/bin` is available there, or start the binary by absolute path. The current working tree contains desktop daemon connection/autostart code, but live desktop acceptance has not been established; use `talosdctl` for backend/CLI validation. Talos/ACP is the primary provider and Claude Code the only secondary backend. Desktop integration and visual QA are deferred until the final local-MVP phase. See [../STATUS.md](../STATUS.md) for current evidence and failing workspace gates; this installation guide is not a claim that the current tree is release-ready.
+The desktop launcher resolves `talos-desktop` via the desktop session's `PATH`: ensure `~/.local/bin` is available there, or start the binary by absolute path. The packaging acceptance check uses stub binaries, so it does not establish a real release build, CLI workflow, live desktop integration, or visual QA. See [../STATUS.md](../STATUS.md) for current evidence and failing workspace gates; this installation guide is not a claim that the current tree is release-ready.
 
 ## Build locally
 
