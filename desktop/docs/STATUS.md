@@ -25,14 +25,13 @@ prerequisite that makes the desktop wait indefinitely.
 
 ## Backend implementation pass
 
-Implementation is proceeding through P0/P1, not P2–P4. Desktop remains deferred.
-GPT-6 Luna (`xhigh`) completed the initial core lifecycle/recovery pass. New
-implementation and testing work is primarily assigned to DeepSeek Flash (`high`):
-durable keyed prompt acceptance, process/tool-stream regression coverage, and
-independent migration safety preflight. Luna is reserved for targeted reviews.
-The orchestrator owns cross-stream integration, transport/CLI fixes and docs.
-Migration preflight hardens existing code only; it does not advance or certify P3
-feature parity ahead of the P1 live-provider gate.
+Implementation remains within P0/P1; P2–P4 are deferred, with desktop UI last.
+GPT-6 Luna (`xhigh`) completed the initial lifecycle/recovery pass and targeted
+independent reviews; DeepSeek Flash (`high`) completed keyed-acceptance concurrency
+and process/tool-lifecycle regression work. The orchestrator integrated their work
+and updated evidence below. Migration preflight remains safety hardening only; it
+does not advance or certify P3 feature parity. Fixture results do not close the P1
+live Talos or Claude Code gates.
 
 Initial implementation pass, integrated and regression-tested:
 
@@ -54,7 +53,8 @@ Initial implementation pass, integrated and regression-tested:
 - Startup reconciliation marks orphaned runs `Interrupted`, cancels unresolved
   permissions and resets busy agents without automatically restarting providers.
   Run completion persists cleanup before terminal publication; shutdown joins run
-  writers before store close; create/load are serialized against shutdown.
+  writers and drains accepted lifecycle operations before store close, aborting any
+  work left only after the bounded drain deadline; create/load are serialized.
 - Scoped permission decisions persist outcomes before replying; cancelled/dropped
   callbacks are reconciled before the terminal run event. Provider mutations
   reject values absent from advertised capabilities/options.
@@ -63,8 +63,10 @@ Initial implementation pass, integrated and regression-tested:
   while a permission was pending and shutdown/restart under a pending permission.
   Harness results are not proof of live model/provider parity.
 
-Known limitations remain explicit: `request_key` is echoed correlation metadata,
-not durable idempotency; do not automatically retry prompts after a lost response.
+`request_key` provides durable, session-scoped acceptance deduplication: identical
+key/payload retries return the original run, while conflicting payloads fail. This
+is not exactly-once external execution; do not automatically retry unkeyed prompts
+after a lost response. See [the prompt-acceptance contract](architecture/prompt-acceptance.md).
 Automatic stale lock/socket removal remains intentionally unsupported.
 
 ### Installed Talos probe (no model calls)
@@ -124,17 +126,39 @@ Before the follow-up DeepSeek work:
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Existing desktop lint debt still blocks full workspace |
 
 These are an initial integrated checkpoint, not completion of P1 or the release.
-Follow-up keyed prompt/tool coverage and migration preflight must be verified again.
+
+### P1 keyed-acceptance and lifecycle follow-up (2026-11-05)
+
+The following combined smoke/idempotency changes were applied and verified in an
+isolated integration worktree based on `3487808`; they are not yet committed to
+`main`. Commands run from `desktop/` in that worktree.
+
+| Check | Result | Scope |
+|---|---|---|
+| `cargo fmt --all -- --check` | Pass | Combined backend patch |
+| `cargo test --workspace --exclude talos-desktop --locked --no-fail-fast` | Pass: 115 passed, 0 failed, 1 ignored wrapper | Non-desktop fixtures/unit tests |
+| `cargo clippy --workspace --all-targets --exclude talos-desktop --locked -- -D warnings` | Pass | Non-desktop strict lint gate |
+| `cargo build --locked -p talosd -p talosdctl -p talos-acp --bins` | Pass | Process-harness binaries |
+| `python3 scripts/talosd-smoke.py --timeout 90` | 10 consecutive full-suite passes | Temporary homes and fake ACP provider; no live model/provider |
+| `cargo test -p talosdctl --test daemon_smoke -- --ignored --nocapture` | Pass: 1 test | Opt-in process wrapper |
+| `git diff --check` | Pass | Combined patch |
+
+Independent targeted review found no blocker in the latest lifecycle and keyed
+acceptance changes. Shutdown is bounded: if the lifecycle-drain deadline expires,
+remaining durability tasks are aborted before store close; durable completion is
+verified for successful draining, not after that forced-abort deadline. Live Talos
+resume, Claude Code, desktop acceptance, P3 migration/distribution and full-workspace
+release gates remain unverified.
 
 ## Current implementation inventory
 
 | Area | Status / evidence | Remaining acceptance |
 |---|---|---|
-| Domain and SQLite | Fixture-verified foundation: `crates/talos-domain`, `crates/talos-store`; store tests `persistence_survives_reopen_and_replay_cursor`, `migrations_are_idempotent_and_events_ordered` | Crash/restart recovery across the complete daemon/provider stack |
-| Talos / Claude Code ACP | Fixture-verified transport: `crates/talos-acp/tests/process.rs` covers streaming, permission RPC, cancellation, load replay, malformed/large frames, process exit and redaction | Authenticated live Talos and Claude Code workflows plus provider-native resume after daemon restart |
-| Core orchestration | Fixture-verified initial recovery/shutdown/permission pass: eight core tests plus the process harness prove durable cancellation, orphan reconciliation, concurrency and native fixture resume | Durable keyed prompt idempotency follow-up in progress; authenticated Talos and Claude Code acceptance remain open |
-| Daemon / IPC | Fixture-verified commands and delivery: `apps/talosd/src/main.rs`, `crates/talos-ipc/tests/{protocol,reliability}.rs` cover scoped replay, truncation, clock rollback, fragmented input, lag and auth; `apps/talosd/tests/startup.rs` covers startup safety | Finish process-level lifecycle acceptance and real-provider restart/resume |
-| CLI / provider config | Partial: `apps/talosdctl/src/main.rs` tests cover commands, typed session cursors, multi-page follow and stalled-page rejection; README documents recovery semantics | Complete process harness acceptance; durable idempotency, automatic reconnect and config reload boundary remain open |
+| Domain and SQLite | Fixture-verified foundation: `crates/talos-domain`, `crates/talos-store`; store tests cover reopen, migrations, rollback and `concurrent_prompt_acceptance_is_atomic_across_connections` | Crash/restart recovery across the complete daemon/provider stack |
+| Talos / Claude Code ACP | Fixture-verified transport: `crates/talos-acp/tests/process.rs` covers streaming, ordered event barriers, permission cancellation, load replay, malformed/large frames, process exit and redaction | Authenticated live Talos and Claude Code workflows plus provider-native resume after daemon restart |
+| Core orchestration | Fixture-verified recovery, cancellation-safe lifecycle writes and durable keyed acceptance; core tests cover concurrent conflicts, restart/interrupted retries, dropped callers and shutdown draining | Live authenticated Talos and Claude Code acceptance; forced-abort shutdown after the drain deadline is not covered by the successful-drain guarantee |
+| Daemon / IPC | Fixture-verified commands and delivery: `apps/talosd/src/main.rs`, `crates/talos-ipc/tests/{protocol,reliability}.rs` cover scoped replay, truncation, clock rollback, fragmented input, lag and auth; combined process smoke passed 10/10 | Live-provider restart/resume and post-deadline forced-shutdown behavior |
+| CLI / provider config | Fixture-verified process workflow and keyed retries; CLI tests cover typed session cursors, multi-page follow and stalled-page rejection | Live-provider acceptance, automatic reconnect and config reload boundary remain open |
 | Projects / workspaces | Partial: core and CLI register/list/get workspaces; domain retains workspace kinds | Project CRUD, workspace rename/archive/restore, safe managed-worktree creation/deletion and persisted branch/ownership links |
 | Permissions / trust | Partial: durable timeline plus pending request/decision handlers and scoped fixture tests | Restart/timeout behavior must fail closed; stale decisions must not approve another run |
 | Usage / diagnostics | Partial: summaries and provider diagnostics have daemon fixture tests | Unknown usage/prices versus zero, aggregation/replay deduplication and redaction acceptance |
@@ -169,17 +193,20 @@ Depends on P0. Owners: ACP, core, storage, daemon/IPC, CLI.
   provider and temporary Rust-owned home: `scripts/talosd-smoke.py`, with an opt-in
   Rust wrapper in `apps/talosdctl/tests/daemon_smoke.rs` and a dedicated CI job.
   Individual workflow acceptance below still requires a passing execution.
-- [ ] Register workspace → create Talos-owned session → stream text/tools/usage →
-  follow-up → permission allow/deny → cancel → rename/archive/history. Initial
-  fixture flow passes text/usage/lifecycle; explicit streamed tool lifecycle
-  coverage is being added before checking this whole item.
-- [ ] Make `scripts/talosd-smoke.py` deterministic: on 2026-11-03 it passed 1 of 4
-  runs, failing on tool-event run attribution and on a cancel that never left
-  `CancelRequested`. Investigate the race before relying on the CI job as a gate.
-- [ ] Persist optional prompt request keys transactionally with run acceptance;
-  identical retries return the original run across concurrency/restart, conflicting
-  payloads fail explicitly, and accepted-but-interrupted work is not re-executed.
-  DeepSeek owns implementation and separate process-level regression coverage.
+- [x] Fixture vertical slice: register workspace → create session → stream
+  text/tools/usage → follow-up → permission allow/deny → cancel → rename/archive/
+  history. The full process suite includes these scenarios and passed 10 consecutive
+  times in the combined integration worktree; this is fake-provider fixture evidence,
+  not live Talos acceptance.
+- [x] Make `scripts/talosd-smoke.py` reliable: after fixing delayed provider-event
+  attribution, cancellation sequence races and shutdown-drain ownership, the full
+  suite passed 10/10 consecutive runs at `--timeout 90`; the ignored Rust wrapper
+  also passed. Earlier 2026-11-03 failures are retained above as historical evidence.
+- [x] Persist optional prompt request keys transactionally with run acceptance.
+  Store tests cover cross-connection identical/conflicting races and reopen; core
+  tests cover restart/interrupted retries; the keyed process scenario verifies no
+  duplicate provider invocation/events. This is durable acceptance deduplication,
+  not exactly-once external execution.
 - [x] Fixture acceptance: stop/restart the real daemon, replay ordered history and
   resume the same native fixture session without duplicate creation/replayed
   output (`scripts/talosd-smoke.py`, initial suite passed). Live Talos is separate.
@@ -188,10 +215,11 @@ Depends on P0. Owners: ACP, core, storage, daemon/IPC, CLI.
   (core `concurrent_permission_decisions_are_run_scoped_and_stale_ids_fail_closed`
   and process harness).
 - [x] Fixture acceptance: cancel prompts/permission waits; durably settle requests
-  before terminal state; bounded shutdown joins writers and cleans children.
-  Core `shutdown_joins_run_writers_before_closing_store` and the process harness
-  passed. Startup reconciliation is idempotent; process-level hard-kill stress
-  beyond graceful shutdown/restart is not yet claimed.
+  before terminal state; bounded shutdown joins writers and drains accepted
+  durability operations before store close. Core tests cover dropped cancel,
+  permission-resolution and emission callers plus shutdown draining; process
+  smoke passed 10/10. If the drain deadline expires, remaining operations are
+  aborted; hard-kill stress and durable completion after forced abort are not claimed.
 - [x] Fixture acceptance: disconnected-tail durable replay and one-event pages
   deliver 88 unique records across two sessions; IPC reliability tests force lag
   and signal replay explicitly. Session-local ordering is preserved across clock

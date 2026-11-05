@@ -2,7 +2,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -12,6 +12,7 @@ use talos_acp::{
     AcpClient, AcpError, AcpEvent, ContentBlock, HttpHeader, McpServer, McpTransport,
     PermissionDecision, PermissionFuture, PermissionHandler, ProcessConfig, RpcId,
 };
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 fn fixture(mode: &str) -> ProcessConfig {
@@ -163,6 +164,125 @@ async fn reverse_permission_request_does_not_block_prompt_reader() {
         .expect("prompt completes after permission response");
     assert_eq!(response.stop_reason, "end_turn");
     assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn event_barrier_drains_updates_queued_before_prompt_response() {
+    let client = Arc::new(initialized("stream").await);
+    let session_id = new_session(&client).await;
+    // Drain the create-session command update so only prompt output remains.
+    let _commands = client.next_event().await.expect("initial commands");
+
+    let updates = Arc::new(AtomicUsize::new(0));
+    let barriers = Arc::new(AtomicUsize::new(0));
+    let consumer_client = client.clone();
+    let consumer_updates = updates.clone();
+    let consumer_barriers = barriers.clone();
+    let consumer = tokio::spawn(async move {
+        while let Some(event) = consumer_client.next_event().await {
+            match event {
+                AcpEvent::SessionUpdate(_) => {
+                    consumer_updates.fetch_add(1, Ordering::SeqCst);
+                }
+                AcpEvent::Barrier { ack } => {
+                    consumer_barriers.fetch_add(1, Ordering::SeqCst);
+                    ack.notify_one();
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let response = client
+        .prompt(
+            &session_id,
+            &[ContentBlock::Text {
+                text: "barrier probe".to_owned(),
+                extra: Default::default(),
+            }],
+        )
+        .await
+        .expect("prompt");
+    assert_eq!(response.stop_reason, "end_turn");
+
+    tokio::time::timeout(Duration::from_secs(3), client.event_barrier())
+        .await
+        .expect("barrier timeout")
+        .expect("barrier");
+    // The barrier is acknowledged only after both queued text updates were
+    // processed, even though the prompt response resolved independently.
+    assert_eq!(barriers.load(Ordering::SeqCst), 1);
+    assert_eq!(updates.load(Ordering::SeqCst), 2);
+    consumer.abort();
+}
+
+struct CancelAwarePermission {
+    entered: Arc<Notify>,
+    finished: Arc<AtomicBool>,
+}
+
+impl PermissionHandler for CancelAwarePermission {
+    fn request_permission<'a>(
+        &'a self,
+        _request: talos_acp::PermissionRequest,
+        cancellation: CancellationToken,
+    ) -> PermissionFuture<'a> {
+        self.entered.notify_one();
+        Box::pin(async move {
+            cancellation.cancelled().await;
+            self.finished.store(true, Ordering::SeqCst);
+            PermissionDecision::Cancelled
+        })
+    }
+}
+
+#[tokio::test]
+async fn permission_handler_observes_cancellation_instead_of_being_dropped() {
+    let entered = Arc::new(Notify::new());
+    let finished = Arc::new(AtomicBool::new(false));
+    let client = Arc::new(
+        AcpClient::spawn_with_permission_handler(
+            fixture("scripted"),
+            Arc::new(CancelAwarePermission {
+                entered: entered.clone(),
+                finished: finished.clone(),
+            }),
+        )
+        .await
+        .expect("spawn fixture"),
+    );
+    client.initialize().await.expect("initialize");
+    let session_id = new_session(&client).await;
+    let prompt_client = client.clone();
+    let prompt_session = session_id.clone();
+    let prompt = tokio::spawn(async move {
+        prompt_client
+            .prompt(
+                &prompt_session,
+                &[ContentBlock::Text {
+                    text: "permission cancel wait".to_owned(),
+                    extra: Default::default(),
+                }],
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .expect("permission handler entry timeout");
+    client
+        .cancel_session(&session_id)
+        .await
+        .expect("cancel session");
+    let response = tokio::time::timeout(Duration::from_secs(3), prompt)
+        .await
+        .expect("cancelled prompt timeout")
+        .expect("prompt task")
+        .expect("prompt result");
+    assert_eq!(response.stop_reason, "cancelled");
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "permission handler was dropped before observing cancellation"
+    );
 }
 
 #[tokio::test]
