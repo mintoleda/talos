@@ -51,6 +51,22 @@ jobs:
       - name: Isolated daemon and CLI acceptance
         run: python3 scripts/talosd-smoke.py --verbose --timeout 300
 
+  desktop-packaging:
+    name: Desktop Linux packaging acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate install scripts
+        run: |
+          bash -n packaging/install-user.sh
+          bash -n packaging/uninstall-user.sh
+      - name: Fresh-home install, upgrade, uninstall, checksum, and retention
+        run: python3 scripts/packaging-acceptance.py --verbose
+
   # The full-workspace gates are still known-failing (see desktop/docs/STATUS.md).
   # They run here for signal only until the desktop UI workstream closes them.
   desktop-ui:

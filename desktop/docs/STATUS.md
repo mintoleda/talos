@@ -272,11 +272,16 @@ Depends on P2. Owners: migration/storage and packaging/QA.
   explicitly historical/read-only. Never claim a workspace-only import is parity.
 - [ ] Run corrupt/missing-file, archived/worktree and partial-import fixtures;
   verify source hashes unchanged and no credentials/runtime/plugin execution.
-- [ ] Exercise fresh-home Linux artifact install, CLI workflow, upgrade and
-  uninstall in temporary destinations; verify data retention and checksum.
-- [ ] Update public docs to match tested behavior. The release guide's statement
-  that desktop is demo-only is stale relative to current connection code; desktop
-  live acceptance remains pending, not automatically supported.
+- [x] Add and run `python3 scripts/packaging-acceptance.py --verbose`: pass for
+  checksum-verified fixture archives, fresh install, upgrade, uninstall,
+  `.talosd`/`.paseo` and unrelated-file retention, and symlink refusal. This
+  CI packaging job uses stub executables; it does not test a compiled artifact
+  or real CLI workflow.
+- [ ] Install a compiled Linux release artifact and verify its real CLI workflow;
+  the current CI workflow does not assemble or upload a release archive.
+- [x] Update `docs/release/README.md` and `scripts/README.md` with the tested
+  install/uninstall contract and its limits. Live desktop acceptance remains
+  pending.
 
 Exit: tested non-UI install and migration contract, passing interim gates and
 recorded source-preservation evidence. Ready for desktop integration.
