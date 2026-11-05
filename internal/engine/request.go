@@ -174,6 +174,12 @@ func (e *Engine) HandleRequest(ctx context.Context, method string, params json.R
 			return nil, err
 		}
 		return rpcResult(nil, e.Login(p.Provider, p.Key))
+	case rpc.SaveOAuth:
+		p, err := decodeRPC[rpc.SaveOAuthParams](params)
+		if err != nil {
+			return nil, err
+		}
+		return rpcResult(nil, e.SaveOAuth(p.Provider, p.Credential))
 	case rpc.MCPStatus:
 		status, err := e.MCPStatus()
 		if err != nil {

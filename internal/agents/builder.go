@@ -17,6 +17,7 @@ import (
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/provider"
 	"github.com/mintoleda/talos/internal/provider/anthropic"
+	"github.com/mintoleda/talos/internal/provider/codex"
 	"github.com/mintoleda/talos/internal/provider/openai"
 	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
@@ -175,6 +176,13 @@ func (b *Builder) providerFor(def Definition, thinking string) provider.Provider
 		apiKey = config.ReadAuthKey(b.cfg.BaseDir, provName)
 	}
 
+	if provName == codex.ProviderName {
+		base := ""
+		if provName == b.cfg.Provider && b.cfg.BaseURL != "https://api.deepseek.com" {
+			base = b.cfg.BaseURL
+		}
+		return codex.New(base, b.cfg.BaseDir)
+	}
 	if provName == "anthropic" {
 		base := b.cfg.BaseURL
 		// Don't inherit the caller's generic default for a known provider.

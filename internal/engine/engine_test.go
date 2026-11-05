@@ -12,6 +12,7 @@ import (
 
 	"github.com/mintoleda/talos/internal/client"
 	"github.com/mintoleda/talos/internal/client/rpc"
+	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/loop"
 	"github.com/mintoleda/talos/internal/mcp"
 	"github.com/mintoleda/talos/internal/notify"
@@ -687,5 +688,43 @@ func TestBgRPCs(t *testing.T) {
 	snap := eng.Snapshot()
 	if len(snap.BgProcs) != 0 {
 		t.Fatalf("snapshot should have no bg procs, got %#v", snap.BgProcs)
+	}
+}
+
+func TestEngineSaveOAuthViaRPC(t *testing.T) {
+	eng := engineHarness(t)
+	defer eng.Close()
+
+	cred := config.OAuthCredential{Access: "a", Refresh: "r", Expires: 1, AccountID: "acct"}
+	params, _ := json.Marshal(rpc.SaveOAuthParams{Provider: "openai-codex", Credential: cred})
+	if _, err := eng.HandleRequest(context.Background(), rpc.SaveOAuth, params); err != nil {
+		t.Fatalf("SaveOAuth: %v", err)
+	}
+	if got, ok := config.ReadOAuth(eng.baseDir, "openai-codex"); !ok || got != cred {
+		t.Fatalf("stored = %+v %v", got, ok)
+	}
+
+	providers, err := eng.LoginProviders()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range providers {
+		if p.Name == "openai-codex" {
+			found = true
+			if !p.LoggedIn || !p.OAuth {
+				t.Fatalf("openai-codex = %+v, want logged-in OAuth provider", p)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("openai-codex missing from login providers")
+	}
+
+	if err := eng.Login("openai-codex", "sk-x"); err == nil {
+		t.Fatal("API-key login must be rejected for OAuth providers")
+	}
+	if err := eng.SaveOAuth("openai", cred); err == nil {
+		t.Fatal("SaveOAuth must be rejected for API-key providers")
 	}
 }

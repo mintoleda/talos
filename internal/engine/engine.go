@@ -785,18 +785,42 @@ func (e *Engine) LoginProviders() ([]dialogs.LoginProvider, error) {
 func LoginProvidersForBaseDir(baseDir string) ([]dialogs.LoginProvider, error) {
 	var out []dialogs.LoginProvider
 	for _, kp := range provider.All {
-		key := config.ResolveKeyFor(baseDir, kp.Name, kp.EnvVar)
+		loggedIn := false
+		if kp.OAuth {
+			_, loggedIn = config.ReadOAuth(baseDir, kp.Name)
+		} else {
+			loggedIn = config.ResolveKeyFor(baseDir, kp.Name, kp.EnvVar) != ""
+		}
 		out = append(out, dialogs.LoginProvider{
 			Name:     kp.Name,
 			Label:    kp.Label,
-			LoggedIn: key != "",
+			LoggedIn: loggedIn,
+			OAuth:    kp.OAuth,
 		})
 	}
 	return out, nil
 }
 
 func (e *Engine) Login(provName, key string) error {
+	if kp, ok := provider.ByName(provName); ok && kp.OAuth {
+		return fmt.Errorf("%s uses OAuth login, not an API key", provName)
+	}
 	if err := config.WriteAuthKey(e.baseDir, provName, key); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	e.modelCache = nil
+	e.mu.Unlock()
+	return nil
+}
+
+// SaveOAuth persists credentials from a completed OAuth login (run in the
+// TUI process, where the browser is) to this engine's auth.json.
+func (e *Engine) SaveOAuth(provName string, cred config.OAuthCredential) error {
+	if kp, ok := provider.ByName(provName); !ok || !kp.OAuth {
+		return fmt.Errorf("%s does not support OAuth login", provName)
+	}
+	if err := config.WriteOAuth(e.baseDir, provName, cred); err != nil {
 		return err
 	}
 	e.mu.Lock()

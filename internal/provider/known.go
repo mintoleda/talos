@@ -5,6 +5,9 @@ type Known struct {
 	BaseURL string // BaseURL without /v1 suffix
 	EnvVar  string
 	Label   string
+	// OAuth providers log in through a browser/device flow instead of an
+	// API key, and do not speak the OpenAI-compatible chat/completions API.
+	OAuth bool
 }
 
 // All is the list of providers talos supports out of the box.
@@ -18,6 +21,9 @@ var All = []Known{
 	{Name: "openai", BaseURL: "https://api.openai.com", EnvVar: "OPENAI_API_KEY", Label: "openai.com"},
 	{Name: "anthropic", BaseURL: "https://api.anthropic.com", EnvVar: "ANTHROPIC_API_KEY", Label: "anthropic.com"},
 	{Name: "cloudflare", BaseURL: "", EnvVar: "CLOUDFLARE_API_KEY", Label: "Cloudflare Workers AI"},
+	// OpenAI Codex (legacy): ChatGPT Plus/Pro subscription via OAuth,
+	// served by internal/provider/codex over the Responses API.
+	{Name: "openai-codex", BaseURL: "https://chatgpt.com/backend-api", Label: "chatgpt.com (ChatGPT Plus/Pro)", OAuth: true},
 }
 
 func ByName(name string) (Known, bool) {
