@@ -159,12 +159,12 @@ release gates remain unverified.
 | Core orchestration | Fixture-verified recovery, cancellation-safe lifecycle writes and durable keyed acceptance; core tests cover concurrent conflicts, restart/interrupted retries, dropped callers and shutdown draining | Live authenticated Talos and Claude Code acceptance; forced-abort shutdown after the drain deadline is not covered by the successful-drain guarantee |
 | Daemon / IPC | Fixture-verified commands and delivery: `apps/talosd/src/main.rs`, `crates/talos-ipc/tests/{protocol,reliability}.rs` cover scoped replay, truncation, clock rollback, fragmented input, lag and auth; combined process smoke passed 10/10 | Live-provider restart/resume and post-deadline forced-shutdown behavior |
 | CLI / provider config | Fixture-verified process workflow and keyed retries; CLI tests cover typed session cursors, multi-page follow and stalled-page rejection | Live-provider acceptance, automatic reconnect and config reload boundary remain open |
-| Projects / workspaces | Partial: core and CLI register/list/get workspaces; domain retains workspace kinds | Project CRUD, workspace rename/archive/restore, safe managed-worktree creation/deletion and persisted branch/ownership links |
+| Projects / workspaces | Partial: workspace create/list/get/rename/archive/restore are fixture-verified through domain, SQLite, core, IPC, daemon and CLI; archiving rejects workspaces with active persisted runs and preserves IDs/history | Project CRUD/association, safe managed-worktree creation/deletion and persisted branch/ownership links |
 | Permissions / trust | Partial: durable timeline plus pending request/decision handlers and scoped fixture tests | Restart/timeout behavior must fail closed; stale decisions must not approve another run |
 | Usage / diagnostics | Partial: summaries and provider diagnostics have daemon fixture tests | Unknown usage/prices versus zero, aggregation/replay deduplication and redaction acceptance |
 | Attachments / output | Open beyond JSON CLI output | Image validation, durable storage/reference replay, provider capability rejection and migration integrity |
 | Terminals / scripts | Open PTY backend; script management deferred | Owned PTY lifecycle/input/resize/capture/cleanup with two-workspace isolation |
-| Legacy migration | Partial: `crates/paseo-migrate/src/lib.rs`; read-only dry run and idempotent workspace-subset import tests | Backup/transactional recovery, source-path safety, sessions/history/attachments and interrupted-import coverage; current importer explicitly excludes these |
+| Legacy migration | Partial: `crates/paseo-migrate/src/lib.rs`; 22 tests cover dry-run/idempotent workspace-subset import, overlap/symlink/hardlink guards, WAL-aware snapshots, journaled retry and rollback | Real-data/source-hash workflow and kill/restart crash windows; sessions/history/attachments remain explicitly unsupported |
 | Packaging / settings | Partial: `.github/workflows/ci.yml`, `packaging/`, `docs/release/README.md` | Fresh-home install/upgrade/uninstall and config validation without modifying user data; no signed/cross-platform release claim |
 | Desktop | Deferred, existing code retained in `apps/talos-desktop` | Fix failing test/lints/formatting, then connect verified backend contracts and perform visual/accessibility QA |
 | Remote / schedules / browser-MCP / voice / OS notifications / plugins / usage dashboards | Deferred broader parity | Separate acceptance work after the local release; see parity inventory |
@@ -253,6 +253,25 @@ Depends on P1. Owners: domain/store/core plus daemon/IPC/CLI adapters.
 - [ ] Verify invalid config rejection, atomic persistence, redaction and a
   documented reload-versus-restart boundary.
 
+History search is fixture-verified through SQLite, core, IPC, daemon, and
+`talosdctl history search`. It performs bounded, case-insensitive substring
+search over user/assistant text, supports an optional session and result limit,
+and reports `has_more`; it intentionally excludes tool payloads and has no
+continuation cursor. Usage semantics (unknown versus zero, pricing, and
+aggregation deduplication) remain open.
+
+Workspace lifecycle is fixture-verified through domain, SQLite, core, IPC,
+daemon, and CLI: rename/archive/restore preserve IDs and history, and archive
+rejects persisted active runs. Project association and safe managed-worktree
+creation/deletion remain open.
+
+Current backend verification from `desktop/`: `cargo test --workspace
+--exclude talos-desktop --locked --no-fail-fast` passed (one opt-in smoke test
+ignored); strict non-desktop Clippy and `cargo fmt --all -- --check` passed.
+These exclude the desktop UI only. The workspace UI/release gates have not been
+run as part of this non-UI workstream. Config validation and durable atomic
+writes have focused tests; reload-versus-restart behavior remains open.
+
 Exit: each local MVP requirement in the parity inventory has a non-UI test or
 recorded CLI acceptance result. Script management, forge automation and remote
 features remain separately deferred.
@@ -261,12 +280,14 @@ features remain separately deferred.
 
 Depends on P2. Owners: migration/storage and packaging/QA.
 
-- [ ] Audit source/destination overlap, symlink traversal and legacy-home guards
-  before expanding the importer or running it against real data. Independent
-  DeepSeek preflight is hardening the existing workspace-only importer and its
-  database filename integration now; no real-data import or P3 parity is claimed.
-- [ ] Add dry-run inventory, destination backup and transactional/journaled import
-  recovery; test deterministic reruns after interruption and rollback.
+- [x] Audit source/destination overlap, symlink traversal, hard-linked database
+  files and SQLite sidecars with temporary fixtures; the daemon home guard also
+  rejects the legacy `~/.paseo` destination. No real `~/.paseo` data was read or
+  modified.
+- [x] Add verified online SQLite destination snapshots and journaled retry/rollback
+  for the existing workspace-subset importer. Tests cover WAL snapshots, orphan
+  backup refresh, idempotent rerun, pending-import resume and rollback after a
+  conflicting import. Kill/restart crash-window acceptance remains open.
 - [ ] Preserve projects/workspaces, stable IDs, archives and ownership metadata;
   import sessions/history and hashed attachments or label unsupported records
   explicitly historical/read-only. Never claim a workspace-only import is parity.
