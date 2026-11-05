@@ -17,7 +17,6 @@ import (
 	"github.com/mintoleda/talos/internal/mcp"
 	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/provider"
-	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
 	"github.com/mintoleda/talos/internal/stack"
 	"github.com/mintoleda/talos/internal/version"
@@ -107,16 +106,6 @@ func (a *Agent) handle(ctx context.Context, method string, params json.RawMessag
 			s.close()
 		}
 		return struct{}{}, nil
-	case "session/set_mode":
-		var req SetModeRequest
-		if err := json.Unmarshal(params, &req); err != nil {
-			return nil, invalidParams(err)
-		}
-		s, err := a.session(req.SessionID)
-		if err != nil {
-			return nil, err
-		}
-		return struct{}{}, s.setMode(req.ModeID)
 	case "session/set_model":
 		var req SetModelRequest
 		if err := json.Unmarshal(params, &req); err != nil {
@@ -200,7 +189,7 @@ func (a *Agent) newSession(ctx context.Context, params json.RawMessage) (any, er
 	projectDir := stack.FindRepoRoot(cwd)
 	s := a.addSession(session.NewSession(projectDir).ID, cwd, projectDir, req.MCPServers)
 	resp := NewSessionResponse{SessionID: s.id}
-	resp.Modes, resp.Models, resp.ConfigOptions = s.state(a.modelCatalog(ctx))
+	_, resp.Models, resp.ConfigOptions = s.state(a.modelCatalog(ctx))
 	return afterResponse{resp, s.announceCommands}, nil
 }
 
@@ -248,7 +237,7 @@ func (a *Agent) loadSession(ctx context.Context, params json.RawMessage) (any, e
 	s.replay(history)
 
 	var resp LoadSessionResponse
-	resp.Modes, resp.Models, resp.ConfigOptions = s.state(a.modelCatalog(ctx))
+	_, resp.Models, resp.ConfigOptions = s.state(a.modelCatalog(ctx))
 	return afterResponse{resp, s.announceCommands}, nil
 }
 
@@ -261,7 +250,6 @@ func (a *Agent) addSession(id, cwd, projectDir string, servers []MCPServer) *acp
 		mcp:         toMCPConfigs(servers),
 		provider:    a.cfg.Provider,
 		model:       a.cfg.Model,
-		mode:        a.cfg.PermissionMode,
 		thinking:    a.cfg.ThinkingLevel,
 		allowAlways: map[string]bool{},
 	}
@@ -376,22 +364,6 @@ func toMCPConfigs(servers []MCPServer) []mcp.ServerConfig {
 		out = append(out, c)
 	}
 	return out
-}
-
-// Mode ids exposed to the client; they map 1:1 onto safety modes.
-var sessionModes = []SessionMode{
-	{ID: "ask", Name: "Ask", Description: "Ask before risky shell commands"},
-	{ID: "auto", Name: "Auto", Description: "Run risky commands without asking (catastrophic ones stay blocked)"},
-	{ID: "panic", Name: "Panic", Description: "Block every tool call"},
-}
-
-func parseModeID(id string) (safety.Mode, bool) {
-	for _, m := range sessionModes {
-		if m.ID == id {
-			return safety.ParseMode(id), true
-		}
-	}
-	return 0, false
 }
 
 func thinkingOption(model, current string) ConfigOption {

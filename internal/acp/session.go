@@ -13,15 +13,13 @@ import (
 	"github.com/mintoleda/talos/internal/mcp"
 	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/protocol"
-	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
 	"github.com/mintoleda/talos/internal/skills"
 	"github.com/mintoleda/talos/internal/stack"
 )
 
 // acpSession is one ACP session: a Talos transcript plus a lazily built
-// runtime stack. Settings chosen before the first prompt (mode, model,
-// thinking) are recorded and applied when the stack is built.
+// runtime stack. Model and thinking settings are applied when the stack is built.
 type acpSession struct {
 	agent      *Agent
 	id         string
@@ -39,7 +37,6 @@ type acpSession struct {
 	// boundaries (see applySettings).
 	provider    string
 	model       string
-	mode        safety.Mode
 	thinking    string
 	cancel      context.CancelFunc
 	allowAlways map[string]bool
@@ -50,11 +47,10 @@ func (s *acpSession) update(u SessionUpdate) {
 	_ = s.agent.conn.Notify("session/update", SessionNotification{SessionID: s.id, Update: u})
 }
 
-// state reports modes, models and config options for session/new|load.
+// state reports models and config options for session/new|load.
 func (s *acpSession) state(catalog []models.Entry) (*SessionModes, *SessionModels, []ConfigOption) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	modes := &SessionModes{CurrentModeID: s.mode.String(), AvailableModes: sessionModes}
 	current := s.provider + "/" + s.model
 	ms := &SessionModels{CurrentModelID: current}
 	seen := false
@@ -66,7 +62,7 @@ func (s *acpSession) state(catalog []models.Entry) (*SessionModes, *SessionModel
 	if !seen {
 		ms.AvailableModels = append([]ModelInfo{{ModelID: current, Name: current}}, ms.AvailableModels...)
 	}
-	return modes, ms, []ConfigOption{thinkingOption(s.model, s.thinking)}
+	return nil, ms, []ConfigOption{thinkingOption(s.model, s.thinking)}
 }
 
 // ensureBuilt assembles the runtime on first use. Callers hold turnMu, so
@@ -110,7 +106,6 @@ func (s *acpSession) ensureBuilt(ctx context.Context) (*stack.Built, error) {
 		return nil, errSessionClosed
 	}
 	s.built = b
-	b.Policy.SetMode(s.mode)
 	s.mu.Unlock()
 	return b, s.applySettings(b)
 }
@@ -190,21 +185,6 @@ func (s *acpSession) close() {
 	if b != nil {
 		b.Close()
 	}
-}
-
-func (s *acpSession) setMode(id string) error {
-	m, ok := parseModeID(id)
-	if !ok {
-		return &RPCError{Code: codeInvalidParams, Message: "unknown mode: " + id}
-	}
-	s.mu.Lock()
-	s.mode = m
-	if s.built != nil {
-		s.built.Policy.SetMode(m)
-	}
-	s.mu.Unlock()
-	s.update(SessionUpdate{SessionUpdate: "current_mode_update", CurrentModeID: id})
-	return nil
 }
 
 // setModel accepts "provider/model" or a bare model id on the current

@@ -151,8 +151,6 @@ the status bar update automatically.
 | `/compact [focus]` | compact conversation history |
 | `/model [query]` | switch provider/model |
 | `/thinking` | cycle thinking level (off → minimal → low → medium → high → xhigh) |
-| `/permission` | cycle permission mode (auto → ask → panic → auto) |
-| `/panic` | toggle panic mode (blocks all tool calls) |
 | `/login` | add an api key |
 | `/stats` | token usage and cache hit rate |
 | `/resume [id]` | resume a session |

@@ -752,38 +752,6 @@ func (e *Engine) CurrentThinkingLevel() string {
 	return e.pb.ThinkingLevel()
 }
 
-func (e *Engine) CyclePermissionMode() (string, error) {
-	if e.pol == nil {
-		return "", fmt.Errorf("permission policy not configured")
-	}
-	next := safety.NextMode(e.pol.Mode())
-	e.pol.SetMode(next)
-	return next.String(), nil
-}
-
-// SetPermissionMode sets the policy mode from a string (auto/ask/panic).
-func (e *Engine) SetPermissionMode(mode string) error {
-	if e.pol == nil {
-		return fmt.Errorf("permission policy not configured")
-	}
-	e.pol.SetMode(safety.ParseMode(mode))
-	return nil
-}
-
-func (e *Engine) PermissionMode() string {
-	if e.pol == nil {
-		return "auto"
-	}
-	return e.pol.Mode().String()
-}
-
-func (e *Engine) TogglePanic() (string, error) {
-	if e.pol == nil {
-		return "", fmt.Errorf("permission policy not configured")
-	}
-	return e.pol.TogglePanic().String(), nil
-}
-
 func (e *Engine) Compact(focus string) error {
 	select {
 	case <-e.closed:

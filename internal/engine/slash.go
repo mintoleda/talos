@@ -8,15 +8,12 @@ import (
 	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/provider"
-	"github.com/mintoleda/talos/internal/safety"
 )
 
 // commands is the single source of truth for slash dispatch and listCommands.
 var commands = []rpc.CommandDesc{
 	{Name: "/model", Summary: "Switch provider/model or list available models", Args: "[provider/model]"},
 	{Name: "/thinking", Summary: "Cycle thinking level"},
-	{Name: "/permission", Summary: "Cycle permission mode (auto/ask)"},
-	{Name: "/panic", Summary: "Toggle panic mode (blocks all tools)"},
 	{Name: "/mcp", Summary: "List connected MCP servers and their tools"},
 	{Name: "/subagents", Summary: "Toggle subagent delegation on/off"},
 	{Name: "/compact", Summary: "Compact conversation history", Args: "[focus]"},
@@ -35,7 +32,7 @@ func (e *Engine) ListCommands() []rpc.CommandDesc {
 }
 
 // handleSlash processes slash commands for SubmitText (daemon path).
-// Returns a notice string; may also Emit ModelChanged / PermissionModeChanged.
+// Returns a notice string; may also emit a ModelChanged event.
 func (e *Engine) handleSlash(cmd string) string {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
@@ -104,27 +101,6 @@ func (e *Engine) handleSlash(cmd string) string {
 		return status
 	case "/subagents":
 		return e.ToggleSubagents()
-	case "/permission":
-		if e.pol == nil {
-			return "permission policy not configured"
-		}
-		cur := e.pol.Mode()
-		next := safety.NextMode(cur)
-		e.pol.SetMode(next)
-		modeStr := next.String()
-		e.Emit(protocol.PermissionModeChanged{Mode: modeStr})
-		return fmt.Sprintf("permission mode: %s → %s", cur, modeStr)
-	case "/panic":
-		if e.pol == nil {
-			return "permission policy not configured"
-		}
-		mode := e.pol.TogglePanic()
-		modeStr := mode.String()
-		e.Emit(protocol.PermissionModeChanged{Mode: modeStr})
-		if modeStr == "panic" {
-			return "🔴 panic mode ON"
-		}
-		return "panic mode OFF — restored " + modeStr
 	case "/compact":
 		focus := ""
 		if len(parts) >= 2 {
