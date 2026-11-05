@@ -17,7 +17,6 @@ import (
 	"github.com/mintoleda/talos/internal/notify"
 	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/protocol"
-	"github.com/mintoleda/talos/internal/safety"
 	"github.com/mintoleda/talos/internal/session"
 	"github.com/mintoleda/talos/internal/stack"
 	"github.com/mintoleda/talos/internal/testutil"
@@ -474,10 +473,13 @@ func TestListCommandsNonEmpty(t *testing.T) {
 	for _, c := range cmds {
 		names[c.Name] = true
 	}
-	for _, want := range []string{"/model", "/thinking", "/permission", "/panic", "/mcp", "/subagents", "/compact"} {
+	for _, want := range []string{"/model", "/thinking", "/mcp", "/subagents", "/compact"} {
 		if !names[want] {
 			t.Fatalf("missing command %s", want)
 		}
+	}
+	if names["/permission"] || names["/panic"] {
+		t.Fatal("permission mode commands should not be exposed")
 	}
 
 	eng := engineHarness(t)
@@ -492,32 +494,6 @@ func TestListCommandsNonEmpty(t *testing.T) {
 	}
 	if len(out.Commands) == 0 {
 		t.Fatal("ListCommands result empty")
-	}
-}
-
-func TestSetPermissionMode(t *testing.T) {
-	eng := engineHarness(t)
-	defer eng.Close()
-	eng.pol = safety.NewPolicy(safety.ModeAuto, eng.cwd, safety.NewClassifier(), true)
-
-	if err := eng.SetPermissionMode("ask"); err != nil {
-		t.Fatalf("SetPermissionMode: %v", err)
-	}
-	if got := eng.PermissionMode(); got != "ask" {
-		t.Fatalf("want ask, got %s", got)
-	}
-
-	params, _ := json.Marshal(rpc.SetPermissionModeParams{Mode: "auto"})
-	raw, err := eng.HandleRequest(context.Background(), rpc.SetPermissionMode, params)
-	if err != nil {
-		t.Fatalf("setPermissionMode RPC: %v", err)
-	}
-	var level rpc.LevelResult
-	if err := json.Unmarshal(raw, &level); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if level.Level != "auto" {
-		t.Fatalf("want auto, got %s", level.Level)
 	}
 }
 

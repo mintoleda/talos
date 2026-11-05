@@ -514,18 +514,8 @@ func TestSessionNewStateAndLazyBuild(t *testing.T) {
 		t.Fatal("empty sessionId")
 	}
 
-	if resp.Modes == nil {
-		t.Fatal("no modes")
-	}
-	var ids []string
-	for _, m := range resp.Modes.AvailableModes {
-		ids = append(ids, m.ID)
-	}
-	if strings.Join(ids, ",") != "ask,auto,panic" {
-		t.Errorf("modes = %v", ids)
-	}
-	if resp.Modes.CurrentModeID != "auto" {
-		t.Errorf("currentModeId = %q", resp.Modes.CurrentModeID)
+	if resp.Modes != nil {
+		t.Errorf("permission modes should not be advertised: %+v", resp.Modes)
 	}
 
 	if resp.Models == nil || resp.Models.CurrentModelID != "openai/test-model" {
@@ -775,11 +765,8 @@ func TestPermissionRequest(t *testing.T) {
 				}
 				return map[string]any{"outcome": map[string]any{"outcome": "selected", "optionId": tc.optionID}}
 			}
+			e.cfg.PermissionMode = safety.ModeAsk
 			sid := e.newSession(t).SessionID
-			e.c.call("session/set_mode", SetModeRequest{SessionID: sid, ModeID: "ask"})
-			e.c.waitUpdate("current_mode_update", func(u update) bool {
-				return u.kind() == "current_mode_update" && u.str("currentModeId") == "ask"
-			})
 
 			resp := e.prompt(t, sid, "run it")
 			if resp.StopReason != StopEndTurn {
@@ -892,8 +879,8 @@ func TestSessionLoadReplaysHistory(t *testing.T) {
 
 	// Load response carries session state, and commands follow it.
 	resp := decode[LoadSessionResponse](t, r.Result)
-	if resp.Modes == nil || resp.Models == nil || len(resp.ConfigOptions) == 0 {
-		t.Errorf("load response missing state: %s", r.Result)
+	if resp.Modes != nil || resp.Models == nil || len(resp.ConfigOptions) == 0 {
+		t.Errorf("unexpected load state: %s", r.Result)
 	}
 	c2.waitUpdate("available_commands_update", kindIs("available_commands_update"))
 

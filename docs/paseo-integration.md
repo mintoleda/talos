@@ -254,13 +254,12 @@ The runtime constructor now lives in `internal/stack` (`stack.Build`, `stack.Swi
 | ACP surface | Talos behavior |
 | --- | --- |
 | `initialize` | `loadSession`, `sessionCapabilities.list/close`, image + embedded-context prompts, MCP over stdio/HTTP/SSE |
-| `session/new` | Allocates a session id and returns modes, models and a `thought_level` option. The runtime is built lazily on first use, so Paseo's probe sessions create no transcript, MCP connection or checkpoint. Talos uses the supplied `cwd` as-is and never creates a worktree. |
+| `session/new` | Allocates a session id and returns models and a `thought_level` option (no permission-mode capability). The runtime is built lazily on first use, so Paseo's probe sessions create no transcript, MCP connection or checkpoint. Talos uses the supplied `cwd` as-is and never creates a worktree. |
 | `session/load` | Replays the Talos transcript as `user_message_chunk` / `agent_message_chunk` / `tool_call` / `tool_call_update`, then resumes on the same transcript |
 | `session/list`, `session/close` | Backed by session meta sidecars; close cancels any turn and releases the runtime |
 | `session/prompt` | One turn of the Talos loop. Text and thinking stream as message/thought chunks; tools stream as `tool_call` → `tool_call_update` with ACP kinds (`read`, `edit` with diffs, `search`, `execute`, `fetch`, `think`); context occupancy streams as `usage_update`; the response carries `stopReason` and token usage |
 | `session/cancel` | Cancels the turn context; pending permission prompts resolve as denied; the prompt returns `stopReason: "cancelled"` |
 | `session/request_permission` | Emitted when the safety policy prompts. Options: allow once, always allow (remembered per session, per command), reject |
-| `session/set_mode` | `ask` / `auto` / `panic` map onto Talos permission modes |
 | `session/set_model`, `session/set_config_option` | `provider/model` switching and thinking level, per session |
 | Slash commands | `/compact [focus]`, `/model [provider/model]`, `/mcp`, `/subagents`, plus each skill (rewritten to `skill:<name>`) via `available_commands_update` |
 

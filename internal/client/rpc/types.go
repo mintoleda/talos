@@ -9,37 +9,33 @@ import (
 )
 
 const (
-	NewSession          = "engine.newSession"
-	Resume              = "engine.resume"
-	ListSessions        = "engine.listSessions"
-	DeleteSession       = "engine.deleteSession"
-	ListModels          = "engine.listModels"
-	SwitchModel         = "engine.switchModel"
-	CycleThinking       = "engine.cycleThinking"
-	CurrentThinking     = "engine.currentThinking"
-	CyclePermissionMode = "engine.cyclePermissionMode"
-	PermissionMode      = "engine.permissionMode"
-	TogglePanic         = "engine.togglePanic"
-	WithdrawSteer       = "engine.withdrawSteer"
-	Compact             = "engine.compact"
-	Stats               = "engine.stats"
-	LoginProviders      = "engine.loginProviders"
-	Login               = "engine.login"
-	MCPStatus           = "engine.mcpStatus"
-	MCPCount            = "engine.mcpCount"
-	CancelSubagent      = "engine.cancelSubagent"
-	History             = "engine.history"
-	ListFiles           = "engine.listFiles"
-	ResolveInput        = "engine.resolveInput"
-	ListCommands        = "engine.listCommands"
-	SetPermissionMode   = "engine.setPermissionMode"
-	ListBg              = "engine.listBg"
-	KillBg              = "engine.killBg"
-	BgLog               = "engine.bgLog"
-	DismissBg           = "engine.dismissBg"
-	ListCheckpoints     = "engine.listCheckpoints"
-	RestoreCheckpoint   = "engine.restoreCheckpoint"
-	DiffCheckpoints     = "engine.diffCheckpoints"
+	NewSession        = "engine.newSession"
+	Resume            = "engine.resume"
+	ListSessions      = "engine.listSessions"
+	DeleteSession     = "engine.deleteSession"
+	ListModels        = "engine.listModels"
+	SwitchModel       = "engine.switchModel"
+	CycleThinking     = "engine.cycleThinking"
+	CurrentThinking   = "engine.currentThinking"
+	WithdrawSteer     = "engine.withdrawSteer"
+	Compact           = "engine.compact"
+	Stats             = "engine.stats"
+	LoginProviders    = "engine.loginProviders"
+	Login             = "engine.login"
+	MCPStatus         = "engine.mcpStatus"
+	MCPCount          = "engine.mcpCount"
+	CancelSubagent    = "engine.cancelSubagent"
+	History           = "engine.history"
+	ListFiles         = "engine.listFiles"
+	ResolveInput      = "engine.resolveInput"
+	ListCommands      = "engine.listCommands"
+	ListBg            = "engine.listBg"
+	KillBg            = "engine.killBg"
+	BgLog             = "engine.bgLog"
+	DismissBg         = "engine.dismissBg"
+	ListCheckpoints   = "engine.listCheckpoints"
+	RestoreCheckpoint = "engine.restoreCheckpoint"
+	DiffCheckpoints   = "engine.diffCheckpoints"
 
 	DaemonCreateSession  = "daemon.createSession"
 	DaemonListSessions   = "daemon.listSessions"
@@ -299,10 +295,6 @@ type CommandDesc struct {
 
 type ListCommandsResult struct {
 	Commands []CommandDesc `json:"commands"`
-}
-
-type SetPermissionModeParams struct {
-	Mode string `json:"mode"`
 }
 
 type BgProcInfo struct {
