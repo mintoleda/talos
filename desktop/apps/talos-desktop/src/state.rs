@@ -297,13 +297,26 @@ impl ViewModel {
         match name {
             "UserText" => {
                 self.set_status(session, SessionStatus::Running);
+                // Replace the optimistic local echo with the durable event. The
+                // backend's event ID is canonical, while the optimistic entry
+                // has a local ID; without this reconciliation every sent prompt
+                // is rendered twice once the daemon event arrives.
+                let user_text = text();
+                if let Some(entries) = self.entries.get_mut(session)
+                    && let Some(index) = entries.iter().position(|entry| {
+                        entry.id.starts_with("local-")
+                            && matches!(&entry.kind, EntryKind::User { text } if text == &user_text)
+                    })
+                {
+                    entries.remove(index);
+                }
                 self.push_entry(
                     session,
                     Entry {
                         id: event_id.into(),
                         run,
                         at,
-                        kind: EntryKind::User { text: text() },
+                        kind: EntryKind::User { text: user_text },
                     },
                 );
             }
@@ -1119,7 +1132,13 @@ mod tests {
 
     #[test]
     fn permissions_are_scoped_and_resolved_by_run() {
-        let mut view = ViewModel::default();
+        let mut view = ViewModel {
+            sessions: vec![Session {
+                id: "s".into(),
+                ..Session::default()
+            }],
+            ..ViewModel::default()
+        };
         view.apply_event(&event(
             "a",
             "r1",
@@ -1135,6 +1154,17 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(matches!(&entries[0].kind, EntryKind::Permission { id, .. } if id == "perm-b"));
         assert_eq!(view.attention_count(), 1);
+    }
+
+    #[test]
+    fn durable_user_event_replaces_optimistic_echo() {
+        let mut view = ViewModel::default();
+        view.echo_user_prompt("s", "hello");
+        view.apply_event(&event("e1", "r1", json!({"UserText": {"text": "hello"}})));
+        let entries = &view.entries["s"];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "e1");
+        assert!(matches!(&entries[0].kind, EntryKind::User { text } if text == "hello"));
     }
 
     #[test]

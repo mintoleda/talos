@@ -6,7 +6,7 @@
 
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, Response, RichText, Sense, Stroke,
-    TextWrapMode, UiBuilder, Vec2,
+    UiBuilder, Vec2,
 };
 
 use crate::state::{ProviderSummary, Session, Usage, can_send, draft_lines};
@@ -21,6 +21,7 @@ pub struct ComposerState<'a> {
     pub running: bool,
     pub online: bool,
     pub session: Option<&'a Session>,
+    pub remembered_model: Option<&'a str>,
     pub providers: &'a [ProviderSummary],
     pub usage: Option<&'a Usage>,
     pub motion: bool,
@@ -32,7 +33,6 @@ pub enum ComposerAction {
     Send,
     Stop,
     SetModel { provider: String, model: String },
-    SetMode { mode: String },
     Attach,
     Voice,
 }
@@ -153,7 +153,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<Composer
                         action = Some(ComposerAction::Attach);
                     }
                     model_selector(ui, state, &mut action);
-                    mode_selector(ui, state, &mut action);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let send = send_button(ui, ready, running);
                         if send.clicked() {
@@ -210,9 +209,10 @@ fn model_selector(
         .find(|provider| provider.id == provider_id);
     let model_label = state
         .session
-        .and_then(|session| session.model.clone())
+        .and_then(|session| session.model.as_deref())
         .filter(|model| !model.is_empty())
-        .unwrap_or_else(|| "Default model".into());
+        .or(state.remembered_model)
+        .unwrap_or("Default model");
     let provider_label = provider.map_or(provider_id, |provider| provider.name.as_str());
     let response = chip(
         ui,
@@ -306,75 +306,6 @@ fn model_selector(
                 );
             }
         });
-}
-
-fn mode_selector(
-    ui: &mut egui::Ui,
-    state: &ComposerState<'_>,
-    action: &mut Option<ComposerAction>,
-) {
-    let Some(session) = state.session else {
-        return;
-    };
-    let Some(provider) = state
-        .providers
-        .iter()
-        .find(|provider| provider.id == session.provider)
-    else {
-        return;
-    };
-    if provider.modes.is_empty() {
-        return;
-    }
-    let current = session
-        .mode
-        .clone()
-        .unwrap_or_else(|| provider.modes[0].0.clone());
-    let label = provider
-        .modes
-        .iter()
-        .find(|(id, _)| id == &current)
-        .map_or(current.as_str(), |(_, label)| label.as_str());
-    let shield = if matches!(current.as_str(), "panic" | "plan" | "read-only") {
-        Icon::Shield
-    } else {
-        Icon::ShieldOff
-    };
-    let response = chip(ui, shield, theme::MUTED, label, true);
-    egui::Popup::menu(&response).show(|ui| {
-        ui.set_min_width(220.0);
-        ui.label(
-            RichText::new("PERMISSION MODE")
-                .font(theme::semibold(10.0))
-                .color(theme::FAINT),
-        );
-        for (id, label) in &provider.modes {
-            let selected = id == &current;
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new(format!("{label}{}", if selected { "  ✓" } else { "" }))
-                            .font(theme::ui(12.0))
-                            .color(if selected {
-                                theme::TEXT
-                            } else {
-                                theme::SECONDARY
-                            }),
-                    )
-                    .fill(if selected {
-                        theme::SELECTED
-                    } else {
-                        Color32::TRANSPARENT
-                    })
-                    .corner_radius(7),
-                )
-                .clicked()
-            {
-                *action = Some(ComposerAction::SetMode { mode: id.clone() });
-                ui.close();
-            }
-        }
-    });
 }
 
 /// A small icon + label chip with a smooth hover wash.
