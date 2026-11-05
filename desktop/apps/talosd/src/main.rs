@@ -111,6 +111,15 @@ impl Daemon {
                 text,
                 request_key,
             } => self.prompt(&session_id, text, request_key).await,
+            Command::PromptWithImages {
+                session_id,
+                text,
+                image_paths,
+                request_key,
+            } => {
+                self.prompt_with_images(&session_id, text, image_paths, request_key)
+                    .await
+            }
             Command::Cancel { session_id } => self.cancel(&session_id).await,
             Command::PermissionDecision {
                 permission_id,
@@ -129,12 +138,7 @@ impl Daemon {
                 option_id,
                 value,
             } => self.set_config_option(&session_id, option_id, value).await,
-            Command::ListPendingPermissions => serialize(
-                self.service
-                    .list_pending_permissions()
-                    .await
-                    .map_err(core_error)?,
-            ),
+            Command::ListPendingPermissions => self.list_pending_permissions().await,
             Command::ListModels { provider_id } => self.list_models(&provider_id).await,
             Command::ArchiveSession { session_id } => self.archive_session(&session_id).await,
             Command::RenameSession { session_id, title } => {
@@ -162,6 +166,15 @@ impl Daemon {
                     .await
             }
         }
+    }
+
+    async fn list_pending_permissions(&self) -> Result<Value, RpcError> {
+        serialize(
+            self.service
+                .list_pending_permissions()
+                .await
+                .map_err(core_error)?,
+        )
     }
 
     async fn health(&self) -> Result<Value, RpcError> {
@@ -333,6 +346,32 @@ impl Daemon {
             .await
             .map_err(map_core_error)?;
         Ok(json!({"run_id": run_id, "request_key": Value::Null, "status": "running"}))
+    }
+
+    async fn prompt_with_images(
+        &self,
+        value: &str,
+        text: String,
+        image_paths: Vec<String>,
+        request_key: Option<String>,
+    ) -> Result<Value, RpcError> {
+        let id = parse_id::<SessionId>(value)?;
+        let accepted = self
+            .service
+            .send_prompt_with_images(
+                id,
+                text,
+                image_paths.into_iter().map(PathBuf::from).collect(),
+                request_key.clone(),
+            )
+            .await
+            .map_err(map_core_error)?;
+        Ok(json!({
+            "run_id": accepted.run_id,
+            "request_key": request_key,
+            "status": run_status(&accepted.state),
+            "restored": accepted.restored,
+        }))
     }
 
     async fn cancel(&self, value: &str) -> Result<Value, RpcError> {
@@ -951,6 +990,12 @@ fn core_error(error: CoreError) -> RpcError {
             -32010,
             format!("provider {provider} does not support {feature}"),
         ),
+        CoreError::ImagePromptUnsupported => {
+            (-32010, "provider does not support image prompts".into())
+        }
+        CoreError::InvalidImage(message) | CoreError::InvalidWorkspaceName(message) => {
+            (-32602, message)
+        }
         CoreError::Provider(error) => (-32011, error.to_string()),
         CoreError::ProviderNotRegistered(provider) => {
             (-32010, format!("provider {provider} is not registered"))
@@ -967,7 +1012,6 @@ fn core_error(error: CoreError) -> RpcError {
             -32602,
             format!("workspace path is not an existing directory: {path}"),
         ),
-        CoreError::InvalidWorkspaceName(message) => (-32602, message),
         CoreError::WorkspaceHasActiveRuns(id) => (
             -32009,
             format!("workspace {id} has active runs and cannot be archived"),
@@ -1223,7 +1267,7 @@ mod tests {
     use talos_acp::{ConfigOption, ConfigOptionValue};
     use talos_core::{
         AgentProvider, PermissionHandler, ProviderDiagnostic, ProviderError, ProviderEvent,
-        ProviderModel, ProviderPermissionDecision, ProviderPermissionOption,
+        ProviderImage, ProviderModel, ProviderPermissionDecision, ProviderPermissionOption,
         ProviderPermissionRequest, ProviderPromptResult, ProviderSession, ProviderThinkingOption,
     };
     use talos_domain::{
@@ -1254,6 +1298,7 @@ mod tests {
                     available: true,
                     capabilities: Capabilities {
                         streaming: true,
+                        images: true,
                         tools: true,
                         modes: true,
                         model_selection: true,
@@ -1324,6 +1369,7 @@ mod tests {
         fn capabilities(&self) -> Capabilities {
             Capabilities {
                 streaming: true,
+                images: true,
                 tools: true,
                 modes: true,
                 model_selection: true,
@@ -1462,6 +1508,15 @@ mod tests {
                 stop_reason: stop_reason.into(),
                 usage: None,
             })
+        }
+
+        async fn prompt_with_images(
+            &self,
+            text: &str,
+            _images: &[ProviderImage],
+            cancellation: &CancellationToken,
+        ) -> Result<ProviderPromptResult, ProviderError> {
+            self.prompt(text, cancellation).await
         }
 
         async fn cancel(&self) -> Result<(), ProviderError> {
@@ -1965,6 +2020,62 @@ mod tests {
         let persisted = reopened.replay_events(session.id, None, 64).await.unwrap();
         assert_eq!(persisted.len(), timeline.len());
         reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn image_prompt_is_routed_over_ipc_and_stored_as_a_durable_reference() {
+        let (daemon, bridge, temp) = fixture_daemon().await;
+        let session = fixture_session(&daemon, temp.path(), "image-prompt").await;
+        let image_path = temp.path().join("input.png");
+        let image_bytes = b"\x89PNG\r\n\x1a\nfixture image";
+        tokio::fs::write(&image_path, image_bytes).await.unwrap();
+
+        let response = daemon
+            .command(Command::PromptWithImages {
+                session_id: session.id.to_string(),
+                text: "describe the image".into(),
+                image_paths: vec![image_path.to_string_lossy().into_owned()],
+                request_key: Some("image-request".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response["restored"], false);
+        let run_id: RunId = response["run_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            daemon.service.wait_run(run_id).await.unwrap(),
+            RunLifecycle::Succeeded
+        );
+
+        let snapshot = daemon
+            .service
+            .session_snapshot(session.id, 32)
+            .await
+            .unwrap();
+        let attachment = snapshot
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                TimelineEventKind::Attachment(attachment) => Some(attachment),
+                _ => None,
+            })
+            .expect("IPC image prompt persists attachment metadata");
+        assert_eq!(attachment.mime_type, "image/png");
+        assert_eq!(
+            tokio::fs::read(
+                daemon
+                    .home
+                    .join("attachments")
+                    .join(&attachment.storage_key)
+            )
+            .await
+            .unwrap(),
+            image_bytes
+        );
+        let timeline_json = serde_json::to_string(&snapshot.events).unwrap();
+        assert!(!timeline_json.contains("iVBORw0KGgo="));
+
+        bridge.abort();
+        daemon.service.shutdown().await;
     }
 
     #[tokio::test]

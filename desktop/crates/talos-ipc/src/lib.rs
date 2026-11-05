@@ -68,6 +68,14 @@ pub enum Command {
         text: String,
         request_key: Option<String>,
     },
+    /// Image prompt variant keeps the original text-only prompt wire shape
+    /// stable for existing desktop clients.
+    PromptWithImages {
+        session_id: String,
+        text: String,
+        image_paths: Vec<String>,
+        request_key: Option<String>,
+    },
     Cancel {
         session_id: String,
     },
@@ -773,6 +781,12 @@ mod tests {
             session_id: Some("session-1".into()),
             limit: Some(25),
         });
+        round_trip(&Command::PromptWithImages {
+            session_id: "session-1".into(),
+            text: "Describe these".into(),
+            image_paths: vec!["/tmp/image.png".into()],
+            request_key: Some("image-request".into()),
+        });
     }
 
     #[test]
@@ -809,6 +823,16 @@ mod tests {
             })
             .unwrap()["method"],
             "list_models"
+        );
+        assert_eq!(
+            serde_json::to_value(&Command::PromptWithImages {
+                session_id: "s".into(),
+                text: "look".into(),
+                image_paths: vec!["/tmp/a.png".into()],
+                request_key: None,
+            })
+            .unwrap()["method"],
+            "prompt_with_images"
         );
         assert_eq!(
             serde_json::to_value(&Command::ArchiveSession {
