@@ -40,6 +40,7 @@ macro_rules! id_type {
 }
 id_type!(
     WorkspaceId,
+    ProjectId,
     AgentId,
     SessionId,
     RunId,
@@ -144,6 +145,40 @@ pub struct ProviderDescriptor {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Project {
+    pub id: ProjectId,
+    pub name: String,
+    pub root_path: String,
+    pub metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+impl Project {
+    pub fn new(
+        name: impl Into<String>,
+        root_path: impl Into<String>,
+    ) -> Result<Self, ValidationError> {
+        let name = nonempty(name.into(), 256)?;
+        let root_path = nonempty(root_path.into(), 4096)?;
+        let now = Utc::now();
+        Ok(Self {
+            id: ProjectId::new(),
+            name,
+            root_path,
+            metadata: serde_json::json!({}),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn rename(&mut self, name: impl Into<String>) -> Result<(), ValidationError> {
+        self.name = nonempty(name.into(), 256)?;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkspaceKind {
     Directory,
     LocalCheckout,
@@ -172,6 +207,8 @@ impl WorkspaceLifecycle {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: WorkspaceId,
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
     pub name: String,
     pub path: String,
     pub kind: WorkspaceKind,
@@ -191,6 +228,7 @@ impl Workspace {
         let now = Utc::now();
         Ok(Self {
             id: WorkspaceId::new(),
+            project_id: None,
             name,
             path,
             kind,
@@ -366,7 +404,7 @@ impl Session {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,

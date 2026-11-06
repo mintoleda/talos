@@ -35,10 +35,25 @@ enum Action {
         #[command(subcommand)]
         action: ProviderAction,
     },
+    /// Create and remove Talos-owned Git worktrees.
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+    /// Manage projects.
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
     /// Manage workspaces.
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
+    },
+    /// Manage owned pseudo-terminals.
+    Terminal {
+        #[command(subcommand)]
+        action: TerminalAction,
     },
     /// Manage agent sessions.
     Session {
@@ -58,6 +73,11 @@ enum Action {
         limit: Option<u32>,
         #[command(subcommand)]
         command: Option<EventsCommand>,
+    },
+    /// Summarize known provider-reported usage.
+    Usage {
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Inspect agents (the title-bearing owners of sessions).
     Agent {
@@ -106,6 +126,74 @@ enum WorkspaceAction {
         id: String,
     },
     Restore {
+        id: String,
+    },
+    SetProject {
+        id: String,
+        /// Project ID, or `none` to clear the association.
+        project: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectAction {
+    List,
+    Create { name: String, root: PathBuf },
+    Show { id: String },
+    Rename { id: String, name: String },
+    Delete { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorktreeAction {
+    Create {
+        project: String,
+        name: String,
+        branch: String,
+        base_ref: String,
+    },
+    Delete {
+        workspace: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TerminalAction {
+    Create {
+        workspace: String,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long, default_value = "sh")]
+        program: String,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        #[arg(long, default_value_t = 24)]
+        rows: u16,
+        #[arg(long, default_value_t = 80)]
+        cols: u16,
+    },
+    List {
+        workspace: String,
+    },
+    Input {
+        workspace: String,
+        id: String,
+        data: String,
+    },
+    Resize {
+        workspace: String,
+        id: String,
+        rows: u16,
+        cols: u16,
+    },
+    Capture {
+        workspace: String,
+        id: String,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    Kill {
+        workspace: String,
         id: String,
     },
 }
@@ -292,14 +380,20 @@ fn command_for(action: &Action) -> Result<Command> {
         Action::Health => Ok(Command::Health),
         Action::Status => Ok(Command::Snapshot),
         Action::Provider { .. } => Ok(Command::ListProviders),
+        Action::Project { action } => project_command(action),
+        Action::Worktree { action } => worktree_command(action),
         Action::Workspace { action } => workspace_command(action),
         Action::Session { action } => session_command(action),
+        Action::Terminal { action } => terminal_command(action),
         Action::History { action } => history_command(action),
         Action::Events {
             after,
             limit,
             command,
         } => Ok(events_command(*after, *limit, command.as_ref())),
+        Action::Usage { session } => Ok(Command::UsageSummary {
+            session_id: session.clone(),
+        }),
         Action::Agent { action } => Ok(agent_command(action)),
         Action::Model { action } => Ok(model_command(action)),
         Action::Shutdown => Ok(Command::Shutdown),
@@ -339,6 +433,127 @@ fn workspace_command(action: &WorkspaceAction) -> Result<Command> {
         }),
         WorkspaceAction::Restore { id } => Ok(Command::RestoreWorkspace {
             workspace_id: id.clone(),
+        }),
+        WorkspaceAction::SetProject { id, project } => Ok(Command::SetWorkspaceProject {
+            workspace_id: id.clone(),
+            project_id: (project != "none").then(|| project.clone()),
+        }),
+    }
+}
+
+fn terminal_command(action: &TerminalAction) -> Result<Command> {
+    match action {
+        TerminalAction::Create {
+            workspace,
+            cwd,
+            program,
+            args,
+            rows,
+            cols,
+        } => Ok(Command::CreateTerminal {
+            workspace_id: workspace.clone(),
+            cwd: cwd
+                .as_ref()
+                .map(|path| path.to_str().context("terminal cwd must be valid UTF-8"))
+                .transpose()?
+                .map(str::to_owned),
+            program: program.clone(),
+            args: args.clone(),
+            rows: *rows,
+            cols: *cols,
+        }),
+        TerminalAction::List { workspace } => Ok(Command::ListTerminals {
+            workspace_id: workspace.clone(),
+        }),
+        TerminalAction::Input {
+            workspace,
+            id,
+            data,
+        } => Ok(Command::TerminalInput {
+            workspace_id: workspace.clone(),
+            terminal_id: id.clone(),
+            data: data.clone(),
+        }),
+        TerminalAction::Resize {
+            workspace,
+            id,
+            rows,
+            cols,
+        } => Ok(Command::ResizeTerminal {
+            workspace_id: workspace.clone(),
+            terminal_id: id.clone(),
+            rows: *rows,
+            cols: *cols,
+        }),
+        TerminalAction::Capture {
+            workspace,
+            id,
+            limit,
+        } => Ok(Command::CaptureTerminal {
+            workspace_id: workspace.clone(),
+            terminal_id: id.clone(),
+            limit: *limit,
+        }),
+        TerminalAction::Kill { workspace, id } => Ok(Command::KillTerminal {
+            workspace_id: workspace.clone(),
+            terminal_id: id.clone(),
+        }),
+    }
+}
+
+fn project_command(action: &ProjectAction) -> Result<Command> {
+    match action {
+        ProjectAction::List => Ok(Command::ListProjects),
+        ProjectAction::Create { name, root } => {
+            if name.trim().is_empty() {
+                bail!("project name cannot be empty");
+            }
+            Ok(Command::CreateProject {
+                name: name.clone(),
+                root_path: root
+                    .to_str()
+                    .context("project root must be valid UTF-8")?
+                    .to_owned(),
+            })
+        }
+        ProjectAction::Show { id } => Ok(Command::GetProject {
+            project_id: id.clone(),
+        }),
+        ProjectAction::Rename { id, name } => {
+            if name.trim().is_empty() {
+                bail!("project name cannot be empty");
+            }
+            Ok(Command::RenameProject {
+                project_id: id.clone(),
+                name: name.clone(),
+            })
+        }
+        ProjectAction::Delete { id } => Ok(Command::DeleteProject {
+            project_id: id.clone(),
+        }),
+    }
+}
+
+fn worktree_command(action: &WorktreeAction) -> Result<Command> {
+    match action {
+        WorktreeAction::Create {
+            project,
+            name,
+            branch,
+            base_ref,
+        } => {
+            if name.trim().is_empty() || branch.trim().is_empty() || base_ref.trim().is_empty() {
+                bail!("worktree name, branch, and base ref must not be empty");
+            }
+            Ok(Command::CreateManagedWorktree {
+                project_id: project.clone(),
+                name: name.clone(),
+                branch: branch.clone(),
+                base_ref: base_ref.clone(),
+            })
+        }
+        WorktreeAction::Delete { workspace } => Ok(Command::DeleteManagedWorktree {
+            workspace_id: workspace.clone(),
         }),
     }
 }
@@ -1051,6 +1266,14 @@ mod tests {
         let cli = Cli::try_parse_from(["talosdctl", "shutdown"]).unwrap();
         assert_eq!(command_for(&cli.command).unwrap(), Command::Shutdown);
 
+        let cli = Cli::try_parse_from(["talosdctl", "usage", "--session", "s1"]).unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::UsageSummary {
+                session_id: Some("s1".into())
+            }
+        );
+
         let cli = Cli::try_parse_from([
             "talosdctl",
             "history",
@@ -1075,6 +1298,111 @@ mod tests {
                 .map_err(|error| error.to_string())
                 .and_then(|cli| command_for(&cli.command).map_err(|error| error.to_string()))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn project_commands_and_workspace_association_map_to_ipc() {
+        let cli =
+            Cli::try_parse_from(["talosdctl", "project", "create", "Repo", "/tmp/repo"]).unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::CreateProject {
+                name: "Repo".into(),
+                root_path: "/tmp/repo".into(),
+            }
+        );
+        let cli = Cli::try_parse_from(["talosdctl", "project", "delete", "p1"]).unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::DeleteProject {
+                project_id: "p1".into()
+            }
+        );
+        let cli = Cli::try_parse_from([
+            "talosdctl",
+            "worktree",
+            "create",
+            "p1",
+            "Feature",
+            "feature/test",
+            "HEAD",
+        ])
+        .unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::CreateManagedWorktree {
+                project_id: "p1".into(),
+                name: "Feature".into(),
+                branch: "feature/test".into(),
+                base_ref: "HEAD".into(),
+            }
+        );
+        let cli =
+            Cli::try_parse_from(["talosdctl", "workspace", "set-project", "w1", "none"]).unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::SetWorkspaceProject {
+                workspace_id: "w1".into(),
+                project_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_commands_map_to_workspace_scoped_ipc() {
+        let cli = Cli::try_parse_from([
+            "talosdctl",
+            "terminal",
+            "create",
+            "w1",
+            "--program",
+            "sh",
+            "--arg=-i",
+            "--rows",
+            "40",
+            "--cols",
+            "100",
+        ])
+        .unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::CreateTerminal {
+                workspace_id: "w1".into(),
+                cwd: None,
+                program: "sh".into(),
+                args: vec!["-i".into()],
+                rows: 40,
+                cols: 100,
+            }
+        );
+        let cli =
+            Cli::try_parse_from(["talosdctl", "terminal", "input", "w1", "t1", "hello"]).unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::TerminalInput {
+                workspace_id: "w1".into(),
+                terminal_id: "t1".into(),
+                data: "hello".into(),
+            }
+        );
+        let cli = Cli::try_parse_from([
+            "talosdctl",
+            "terminal",
+            "capture",
+            "w1",
+            "t1",
+            "--limit",
+            "2048",
+        ])
+        .unwrap();
+        assert_eq!(
+            command_for(&cli.command).unwrap(),
+            Command::CaptureTerminal {
+                workspace_id: "w1".into(),
+                terminal_id: "t1".into(),
+                limit: Some(2048),
+            }
         );
     }
 
