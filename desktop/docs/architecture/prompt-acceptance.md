@@ -1,8 +1,9 @@
 # Durable prompt acceptance
 
 The IPC v1 `prompt` command accepts an optional `request_key`. Keyed requests use
-SQLite schema v2; existing v1 databases are upgraded transactionally. Databases
-with a newer, unsupported schema version are rejected rather than silently used.
+Keyed request support was introduced in SQLite schema v2; current store schema is
+v3, with v1/v2 databases upgraded transactionally. Databases with a newer,
+unsupported schema version are rejected rather than silently used.
 
 ```json
 {"method":"prompt","params":{"session_id":"SESSION_ID","text":"Summarize this project","request_key":"summary-001"}}

@@ -62,8 +62,12 @@ be in flight; reconnect before issuing another request.
 Daemon client tasks are tracked and capped at 64. Handshake and individual frame
 writes have five-second deadlines; shutdown drains clients for at most 500 ms
 before aborting remaining tasks and shutting down the core. Frame size remains
-bounded at 1 MiB. After a crash, stale lock/socket removal remains an explicit
-operator action after checking that no daemon is running.
+bounded at 1 MiB. After a crash, daemon startup removes a regular lock marker
+only when its recorded PID is confirmed absent, then removes a Unix socket only
+when a connection is refused. Unknown/importer markers, live or unverifiable
+PIDs, active or unresponsive sockets, and non-socket paths fail closed. A
+persistent private guard file serializes concurrent daemon recovery while
+preserving the create-new lock contract used by the importer.
 
 ## CLI
 
