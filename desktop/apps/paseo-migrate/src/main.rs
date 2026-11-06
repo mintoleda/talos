@@ -13,6 +13,9 @@ struct Args {
     /// Perform the import. Without this flag the command is strictly dry-run.
     #[arg(long)]
     apply: bool,
+    /// Explicit legacy session/transcript tree to import as archived history. Never inferred.
+    #[arg(long)]
+    sessions_source: Option<PathBuf>,
 }
 fn home_dir() -> PathBuf {
     directories::UserDirs::new()
@@ -26,7 +29,12 @@ fn default_destination() -> PathBuf {
 }
 fn main() {
     let args = Args::parse();
-    match paseo_migrate::migrate(&args.source, &args.destination, args.apply) {
+    match paseo_migrate::migrate_with_sessions(
+        &args.source,
+        &args.destination,
+        args.apply,
+        args.sessions_source.as_deref(),
+    ) {
         Ok(report) => println!(
             "{}",
             serde_json::to_string_pretty(&report).expect("report serializes")
