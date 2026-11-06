@@ -249,6 +249,7 @@ impl Backend {
             connection_error: None,
         }
     }
+    #[allow(clippy::needless_pass_by_value)]
     pub fn submit(&mut self, action: Action) -> bool {
         if !self.view.online && !matches!(action, Action::Refresh | Action::ValidateImages { .. }) {
             self.view.error = Some(
@@ -275,6 +276,7 @@ impl Backend {
         self.busy += 1;
         true
     }
+    #[allow(clippy::needless_pass_by_value)]
     pub fn send(&mut self, session: &str, text: String, images: Vec<String>) -> bool {
         self.next_key += 1;
         let action = Action::Prompt {
@@ -344,7 +346,6 @@ impl Backend {
             Action::Load(session) => {
                 self.loading.remove(&session);
                 self.load_errors.remove(&session);
-                self.ready.insert(session.clone());
                 self.submit(Action::LoadTimeline { session, after: 0 });
             }
             Action::LoadTimeline { session, after } => {
@@ -360,9 +361,7 @@ impl Backend {
                             .and_then(|event| event["sequence"].as_u64())
                     })
                     .unwrap_or(after);
-                let has_more = value["has_more"]
-                    .as_bool()
-                    .unwrap_or_else(|| events.is_some_and(|events| events.len() == 128));
+                let has_more = events.is_some_and(|events| events.len() == 128);
                 if has_more && next > after {
                     self.submit(Action::LoadTimeline {
                         session,
@@ -511,6 +510,7 @@ impl Backend {
             }
         }
     }
+    #[allow(clippy::needless_pass_by_value)]
     fn apply_failure(&mut self, action: Action, error: String) {
         match &action {
             Action::Load(session) | Action::LoadTimeline { session, .. } => {
@@ -645,7 +645,7 @@ fn parse_providers(value: Option<&Value>) -> Vec<ProviderSummary> {
                     })
                 })
                 .collect();
-            let modes = item
+            let mode_options = item
                 .get("modes")
                 .and_then(Value::as_array)
                 .into_iter()
@@ -673,7 +673,7 @@ fn parse_providers(value: Option<&Value>) -> Vec<ProviderSummary> {
                 id,
                 name,
                 models,
-                modes,
+                modes: mode_options,
                 capabilities: item["capabilities"].clone(),
             })
         })
@@ -697,21 +697,21 @@ fn parse_sessions(
                 .flatten()
                 .find(|agent| agent.get("id") == session.get("agent_id"));
             if let Some(agent) = agent {
-                parsed.title = agent
+                agent
                     .get("title")
                     .and_then(Value::as_str)
                     .unwrap_or("Agent")
-                    .to_owned();
-                parsed.provider = agent
+                    .clone_into(&mut parsed.title);
+                agent
                     .get("provider")
                     .and_then(Value::as_str)
                     .unwrap_or("talos")
-                    .to_owned();
-                parsed.workspace = agent
+                    .clone_into(&mut parsed.provider);
+                agent
                     .get("workspace_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_owned();
+                    .clone_into(&mut parsed.workspace);
                 parsed.detail = parsed.provider.clone();
                 parsed.model = agent
                     .get("model")

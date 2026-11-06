@@ -782,10 +782,24 @@ class Harness:
             self.check(dirty_remove.returncode != 0, "dirty managed worktree was removed")
             self.check((worktree_path / "untracked.txt").read_text(encoding="utf-8") == "preserve me", "dirty worktree data was lost")
             (worktree_path / "untracked.txt").unlink()
-            self.ctl(daemon, "worktree", "delete", worktree["id"])
-            self.check(not worktree_path.exists(), "managed worktree path survived delete")
-            missing_restore = self.run_ctl(daemon, ["workspace", "restore", worktree["id"]])
-            self.check(missing_restore.returncode != 0, "deleted managed worktree was restored without a checkout")
+            archived = self.ctl(daemon, "worktree", "delete", worktree["id"])
+            quarantine_path = Path(archived["path"])
+            self.check(archived.get("lifecycle") == "Archived", f"managed worktree was not archived: {archived}")
+            self.check(not worktree_path.exists(), "original managed worktree path survived quarantine")
+            self.check(quarantine_path.is_dir(), "quarantined managed worktree path was not preserved")
+            self.check(
+                (quarantine_path / "tracked.txt").read_text(encoding="utf-8") == "fixture\\n",
+                "tracked worktree content was lost during quarantine",
+            )
+            restored = self.ctl(daemon, "workspace", "restore", worktree["id"])
+            self.check(
+                Path(restored["path"]) == quarantine_path and quarantine_path.is_dir(),
+                f"archived managed worktree was not restored from quarantine: {restored}",
+            )
+            self.check(
+                (quarantine_path / "tracked.txt").read_text(encoding="utf-8") == "fixture\\n",
+                "tracked worktree content was lost during restore",
+            )
             workspace = self.ctl(daemon, "workspace", "add", "Inside", str(workspace_path))
             outside = self.ctl(daemon, "workspace", "add", "Outside", str(outside_path))
             self.ctl(daemon, "workspace", "set-project", workspace["id"], project["id"])

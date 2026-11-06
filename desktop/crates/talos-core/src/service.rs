@@ -4209,9 +4209,18 @@ mod tests {
         );
         std::fs::remove_file(Path::new(&workspace.path).join("untracked.txt")).unwrap();
 
-        let removed = service.delete_managed_worktree(workspace.id).await.unwrap();
-        assert_eq!(removed.lifecycle, WorkspaceLifecycle::Archived);
+        let preserved = service.delete_managed_worktree(workspace.id).await.unwrap();
+        assert_eq!(preserved.lifecycle, WorkspaceLifecycle::Archived);
         assert!(!Path::new(&workspace.path).exists());
+        assert_ne!(preserved.path, workspace.path);
+        assert_eq!(preserved.metadata["managedWorktree"]["preserved"], true);
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&preserved.path).join("tracked.txt")).unwrap(),
+            "clean\\n"
+        );
+        let restored = service.restore_workspace(workspace.id).await.unwrap();
+        assert_eq!(restored.lifecycle, WorkspaceLifecycle::Active);
+        assert_eq!(restored.path, preserved.path);
         let unmanaged_path = home.root.join("unmanaged-worktree");
         std::fs::create_dir(&unmanaged_path).unwrap();
         let unmanaged = service

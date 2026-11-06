@@ -257,7 +257,10 @@ pub(super) fn merge(
         Issue {
             path: archive_path.to_string_lossy().into_owned(),
             category: "folded_archive_merged".into(),
-            message: format!("{folds} fold records merged; {raw_records} records retained raw; {} repeated occurrences retained as provenance references; exact chronology and cross-segment identity are not asserted", merger.reused),
+            message: format!(
+                "{folds} fold records merged; {raw_records} records retained raw; {} repeated occurrences retained as provenance references; exact chronology and cross-segment identity are not asserted",
+                merger.reused
+            ),
         },
     );
     if raw_records > 0 {
