@@ -235,6 +235,7 @@ func FromBuilt(ctx context.Context, b *stack.Built) *Engine {
 func (e *Engine) runInput(inCh <-chan []protocol.ContentBlock, intCh <-chan struct{}) {
 	defer e.wg.Done()
 	for blocks := range inCh {
+		e.rememberModel()
 		if e.cp != nil {
 			_, _ = e.cp.Snapshot("before-run")
 		}
@@ -707,7 +708,8 @@ func ListModelsForBaseDir(baseDir string) ([]models.Entry, error) {
 }
 
 // SwitchModel recreates the LLM provider on this engine's cfg copy.
-// It does NOT call config.SaveProviderModel — per-session only.
+// The session sidecar remembers the selection for future sessions in this
+// directory, without changing the global config.
 func (e *Engine) SwitchModel(pName, pModel string) error {
 	if e.cfg == nil {
 		return fmt.Errorf("switch provider not configured")
@@ -721,10 +723,17 @@ func (e *Engine) SwitchModel(pName, pModel string) error {
 	}
 	e.providerName = e.cfg.Provider
 	e.modelName = e.cfg.Model
+	e.rememberModel()
 	e.mu.Lock()
 	e.modelCache = nil
 	e.mu.Unlock()
 	return nil
+}
+
+func (e *Engine) rememberModel() {
+	if id := e.SessionID(); id != "" {
+		session.EnsureSessionMeta(session.SessionAt(e.projectDir, id), e.cwd, e.projectDir, e.providerName, e.modelName)
+	}
 }
 
 func (e *Engine) CycleThinking() (string, error) {
