@@ -36,13 +36,13 @@ const MAX_SESSION_EVENTS: usize = 100_000;
 const MAX_IMAGES_PER_SESSION: usize = 32;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SESSION_IMAGE_BYTES: usize = 32 * 1024 * 1024;
-const MAX_SESSION_PLAN_SOURCE_BYTES: u64 = 65 * 1024 * 1024;
-const MAX_SESSION_EVENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SESSION_PLAN_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SESSION_EVENT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PREPARED_SESSIONS: usize = 128;
-const MAX_PREPARED_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_PREPARED_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_PREPARED_EVENTS: usize = 200_000;
-const MAX_PREPARED_EVENT_BYTES: usize = 128 * 1024 * 1024;
-const MAX_PREPARED_BLOB_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PREPARED_EVENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PREPARED_BLOB_BYTES: usize = 32 * 1024 * 1024;
 const MAX_REPORTED_ISSUES: usize = 4_096;
 const ATTACHMENTS_DIR_NAME: &str = "attachments";
 
@@ -244,8 +244,18 @@ pub(super) fn import_sessions(
     let destination_root = normalize_lexical(&absolute_path(destination)?);
     reject_symlink_components(&destination_root)?;
     let journal_path = destination_root.join(JOURNAL_FILE_NAME);
-    validate_destination_file(&journal_path)?;
-    let journal = load_journal(&journal_path)?;
+    let db_path = destination_root.join(DATABASE_FILE_NAME);
+    let _import_lock = if apply {
+        create_destination(&destination_root)?;
+        validate_destination_file(&journal_path)?;
+        validate_database_file(&db_path)?;
+        let lock = acquire_import_lock(&destination_root)?;
+        validate_database_file(&db_path)?;
+        Some(lock)
+    } else {
+        None
+    };
+    let mut journal = load_journal(&journal_path)?;
 
     let snapshot = snapshot_source(&source_root)?;
     report.sessions_source_fingerprint = Some(snapshot.fingerprint.clone());
