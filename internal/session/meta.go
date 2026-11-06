@@ -133,6 +133,42 @@ func ListAllSessionMetas() ([]SessionMeta, error) {
 	return out, nil
 }
 
+// LastModelForDir returns the most recently active session with a recorded
+// provider/model in this exact working directory, not its repository siblings.
+func LastModelForDir(dir string) (SessionMeta, error) {
+	metas, err := ListAllSessionMetas()
+	if err != nil {
+		return SessionMeta{}, err
+	}
+	canonical := func(path string) string {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return filepath.Clean(path)
+		}
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			return resolved
+		}
+		return abs
+	}
+	wanted := canonical(dir)
+	var latest SessionMeta
+	for _, meta := range metas {
+		if meta.Dir == "" || meta.Provider == "" || meta.Model == "" || canonical(meta.Dir) != wanted {
+			continue
+		}
+		if meta.LastActive.IsZero() {
+			meta.LastActive = meta.CreatedAt
+		}
+		if latest.ID == "" || meta.LastActive.After(latest.LastActive) {
+			latest = meta
+		}
+	}
+	if latest.ID == "" {
+		return SessionMeta{}, fmt.Errorf("no model recorded for directory: %s", dir)
+	}
+	return latest, nil
+}
+
 // TouchSessionMeta updates LastActive on an existing meta file.
 func TouchSessionMeta(id string) error {
 	meta, err := FindSessionMeta(id)
@@ -146,8 +182,10 @@ func TouchSessionMeta(id string) error {
 // EnsureSessionMeta creates the meta sidecar if missing (touching LastActive
 // when present) so sessions started outside the daemon still get listed.
 func EnsureSessionMeta(sess Session, dir, projectDir, providerName, model string) {
-	if _, err := os.Stat(MetaPath(sess.Path)); err == nil {
-		_ = TouchSessionMeta(sess.ID)
+	if meta, err := ReadSessionMeta(MetaPath(sess.Path)); err == nil {
+		meta.Provider, meta.Model = providerName, model
+		meta.LastActive = time.Now()
+		_ = WriteSessionMeta(meta)
 		return
 	}
 	now := time.Now()

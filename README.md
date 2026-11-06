@@ -49,6 +49,10 @@ model    = "gpt-5.5"
 permission_mode = "auto"
 ```
 
+New sessions reuse the last provider/model used in that working directory.
+`--model` and `--provider` override this; directories without model history use
+the configured defaults. Model selections do not rewrite the global config.
+
 see [docs/configuration.md](docs/configuration.md) for the full config reference.
 
 ## run

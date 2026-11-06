@@ -292,6 +292,42 @@ func TestEngineSwitchModel(t *testing.T) {
 	}
 }
 
+func TestSwitchModelIsRememberedForDirectoryAfterRestart(t *testing.T) {
+	home, dir := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	cfg := &config.Config{
+		BaseDir: filepath.Join(home, ".talos"), Provider: "openai",
+		Model: "default", BaseURL: "http://127.0.0.1:1", APIKey: "x",
+	}
+	built, err := stack.Build(context.Background(), stack.BuildOpts{Cfg: cfg, Dir: dir, NoTools: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := FromBuilt(context.Background(), built)
+	if err := eng.SwitchModel("openai-codex", "remembered"); err != nil {
+		eng.Close()
+		t.Fatal(err)
+	}
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "")
+	if err := eng.SwitchModel("cloudflare", "invalid"); err == nil {
+		eng.Close()
+		t.Fatal("expected a switch without a Cloudflare account to fail")
+	}
+	eng.Close()
+
+	restarted, err := stack.Build(context.Background(), stack.BuildOpts{Cfg: cfg, Dir: dir, NoTools: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if restarted.Cfg.Provider != "openai-codex" || restarted.Cfg.Model != "remembered" {
+		t.Fatalf("restart model = %s/%s", restarted.Cfg.Provider, restarted.Cfg.Model)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.BaseDir, "config.toml")); !os.IsNotExist(err) {
+		t.Fatal("model selection must not rewrite global config")
+	}
+}
+
 func TestEngineClose(t *testing.T) {
 	eng := engineHarness(t)
 

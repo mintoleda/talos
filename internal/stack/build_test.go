@@ -6,10 +6,55 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mintoleda/talos/internal/config"
 	"github.com/mintoleda/talos/internal/session"
 )
+
+func TestBuildRestoresDirectoryModelUnlessExplicitlyOverridden(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project, dir, other := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := session.WriteSessionMeta(session.SessionMeta{
+		ID: "previous", Dir: dir, ProjectDir: project,
+		Provider: "openai-codex", Model: "remembered", LastActive: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		BaseDir: filepath.Join(home, ".talos"), Provider: "openai",
+		Model: "default", BaseURL: "http://127.0.0.1:1", APIKey: "x",
+	}
+	for _, tc := range []struct {
+		name, dir, provider, model, wantProvider, wantModel string
+	}{
+		{"remembered", dir, "", "", "openai-codex", "remembered"},
+		{"other directory", other, "", "", "openai", "default"},
+		{"explicit model", dir, "", "explicit", "openai", "explicit"},
+		{"explicit provider", dir, "openai", "", "openai", "default"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			built, err := Build(context.Background(), BuildOpts{
+				Cfg: cfg, Dir: tc.dir, ProjectDir: project, NoTools: true,
+				Provider: tc.provider, Model: tc.model,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer built.Close()
+			if built.Cfg.Provider != tc.wantProvider || built.Cfg.Model != tc.wantModel {
+				t.Fatalf("model = %s/%s, want %s/%s", built.Cfg.Provider, built.Cfg.Model, tc.wantProvider, tc.wantModel)
+			}
+			if tc.wantProvider != cfg.Provider && built.Cfg.BaseURL == cfg.BaseURL {
+				t.Fatal("remembered provider inherited another provider's endpoint")
+			}
+		})
+	}
+	if cfg.Provider != "openai" || cfg.Model != "default" || cfg.BaseURL != "http://127.0.0.1:1" {
+		t.Fatalf("shared config mutated: %+v", cfg)
+	}
+}
 
 func TestBuildSessionUsesProjectDir(t *testing.T) {
 	home := t.TempDir()

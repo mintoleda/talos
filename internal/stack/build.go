@@ -80,16 +80,6 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 
 	cfgCopy := *o.Cfg
 	cfg := &cfgCopy
-	if o.Provider != "" && o.Provider != cfg.Provider {
-		// A configured base URL belongs to the configured provider; keep it
-		// and its key away from a different one (matches SwitchModel).
-		cfg.BaseURL = ""
-		cfg.OverrideProvider(o.Provider)
-	}
-	if o.Model != "" {
-		cfg.Override("", o.Model, "")
-	}
-
 	dir := o.Dir
 	projectDir := o.ProjectDir
 	if projectDir == "" {
@@ -119,6 +109,32 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 	default:
 		sess = session.NewSession(projectDir)
 	}
+	// Explicit model/provider overrides win. Otherwise resume the session's
+	// model, or inherit the last model used in this exact directory for a new
+	// session. Never change the shared config or another directory's default.
+	if o.Provider == "" && o.Model == "" {
+		meta, metaErr := session.ReadSessionMeta(session.MetaPath(sess.Path))
+		if metaErr != nil || meta.Provider == "" || meta.Model == "" {
+			meta, metaErr = session.LastModelForDir(dir)
+		}
+		if metaErr == nil {
+			if meta.Provider != cfg.Provider {
+				cfg.BaseURL = ""
+				cfg.OverrideProvider(meta.Provider)
+			}
+			cfg.Model = meta.Model
+		}
+	}
+	if o.Provider != "" && o.Provider != cfg.Provider {
+		// A configured base URL belongs to the configured provider; keep it
+		// and its key away from a different one (matches SwitchModel).
+		cfg.BaseURL = ""
+		cfg.OverrideProvider(o.Provider)
+	}
+	if o.Model != "" {
+		cfg.Override("", o.Model, "")
+	}
+
 	if _, statErr := os.Stat(sess.Path); statErr == nil {
 		tx, err = session.Load(sess.Path)
 	} else {
