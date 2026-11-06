@@ -55,7 +55,6 @@ type Config struct {
 	DreamerBaseURL            string
 	DreamerAPIKey             string
 	KillBgOnInterrupt         bool
-	ServerListen              string        // empty/unix default, or tcp host:port
 	ServerToken               string        // auth token for network listeners
 	ServerIdleTimeout         time.Duration // multi-session daemon idle exit; 0 = no timeout when set
 	ServerIdleTimeoutSet      bool          // true when server_idle_timeout was present in config
@@ -177,7 +176,6 @@ type fileConfig struct {
 	DreamerModel              string  `toml:"dreamer_model"`
 	DreamerBaseURL            string  `toml:"dreamer_base_url"`
 	DreamerAPIKey             string  `toml:"dreamer_api_key"`
-	ServerListen              string  `toml:"server_listen"`
 	ServerToken               string  `toml:"server_token"`
 	ServerIdleTimeout         string  `toml:"server_idle_timeout"` // duration string, e.g. "30m"
 
@@ -246,7 +244,6 @@ type memoryFileConfig struct {
 }
 
 type serverFileConfig struct {
-	Listen      string `toml:"listen"`
 	Token       string `toml:"token"`
 	IdleTimeout string `toml:"idle_timeout"` // duration string, e.g. "30m"
 }
@@ -345,9 +342,6 @@ func mergeSectionedConfig(fc *fileConfig, sc sectionedConfig) {
 	}
 	if fc.DreamerAPIKey == "" {
 		fc.DreamerAPIKey = sc.Memory.DreamerAPIKey
-	}
-	if fc.ServerListen == "" {
-		fc.ServerListen = sc.Server.Listen
 	}
 	if fc.ServerToken == "" {
 		fc.ServerToken = sc.Server.Token
@@ -465,9 +459,6 @@ func loadFile(path string, cfg *Config) error {
 	}
 	if fc.DreamerAPIKey != "" {
 		cfg.DreamerAPIKey = fc.DreamerAPIKey
-	}
-	if fc.ServerListen != "" {
-		cfg.ServerListen = fc.ServerListen
 	}
 	if fc.ServerToken != "" {
 		cfg.ServerToken = fc.ServerToken

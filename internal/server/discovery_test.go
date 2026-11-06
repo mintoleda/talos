@@ -23,7 +23,6 @@ func TestWriteReadDiscovery(t *testing.T) {
 	want := Discovery{
 		PID:       os.Getpid(),
 		Socket:    sockPath,
-		WS:        "127.0.0.1:7461",
 		Token:     "deadbeef",
 		Version:   "0.2.0",
 		StartedAt: time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC),
@@ -44,7 +43,7 @@ func TestWriteReadDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDiscovery: %v", err)
 	}
-	if got.PID != want.PID || got.Socket != want.Socket || got.WS != want.WS ||
+	if got.PID != want.PID || got.Socket != want.Socket ||
 		got.Token != want.Token || got.Version != want.Version {
 		t.Fatalf("mismatch:\n  got  %+v\n  want %+v", got, want)
 	}
@@ -96,11 +95,10 @@ func TestRemoveDiscovery(t *testing.T) {
 }
 
 func TestDiscoveryJSONShape(t *testing.T) {
-	// Golden shape eyeballed against the plan / TS consumers.
+	// Discovery advertises only the Unix socket and authentication metadata.
 	d := Discovery{
 		PID:       1234,
 		Socket:    "/home/u/.talos/daemon.sock",
-		WS:        "127.0.0.1:7461",
 		Token:     "abc",
 		Version:   "0.2.0",
 		StartedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
@@ -113,7 +111,10 @@ func TestDiscoveryJSONShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"pid", "socket", "ws", "token", "version", "started_at"} {
+	if _, ok := m["ws"]; ok {
+		t.Fatalf("obsolete WebSocket endpoint in discovery: %s", raw)
+	}
+	for _, key := range []string{"pid", "socket", "token", "version", "started_at"} {
 		if _, ok := m[key]; !ok {
 			t.Fatalf("missing key %q in %s", key, raw)
 		}

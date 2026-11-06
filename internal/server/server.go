@@ -6,18 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/url"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	"golang.org/x/net/websocket"
 
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/transport"
@@ -50,10 +45,7 @@ type Server struct {
 	pidPath     string
 	idleTimeout time.Duration
 	requests    RequestHandler
-	network     string
-	address     string
 	token       string
-	webDir      string // path to static web assets (empty = no static serving)
 
 	mu            sync.Mutex
 	subscribers   map[int]func(protocol.Event)
@@ -72,8 +64,6 @@ func New(engine Engine, sockPath, pidPath string, idleTimeout time.Duration) *Se
 		sockPath:     sockPath,
 		pidPath:      pidPath,
 		idleTimeout:  idleTimeout,
-		network:      "unix",
-		address:      sockPath,
 		subscribers:  make(map[int]func(protocol.Event)),
 		lastActivity: time.Now(),
 	}
@@ -83,17 +73,8 @@ func New(engine Engine, sockPath, pidPath string, idleTimeout time.Duration) *Se
 	return s
 }
 
-func (s *Server) SetListen(network, address string) {
-	s.network = network
-	s.address = address
-}
-
 func (s *Server) SetToken(token string) {
 	s.token = token
-}
-
-func (s *Server) SetWebDir(dir string) {
-	s.webDir = dir
 }
 
 func (s *Server) SetRequestHandler(h RequestHandler) {
@@ -114,45 +95,19 @@ func (s *Server) broadcast(e protocol.Event) {
 	}
 }
 
-// Start listens on the Unix socket (so attach and `server list` work) and
-// serves clients until ctx is done or the idle timeout fires with no clients
-// connected. If a ws listener was configured via SetListen, the web server
-// runs alongside the Unix socket.
+// Start listens on the Unix socket and serves clients until ctx is done or
+// the idle timeout fires with no clients connected.
 func (s *Server) Start(ctx context.Context) error {
-	if s.network == "" {
-		s.network = "unix"
+	_ = os.Remove(s.sockPath)
+	if err := os.MkdirAll(filepath.Dir(s.sockPath), 0o755); err != nil {
+		return err
 	}
-	if s.address == "" {
-		s.address = s.sockPath
-	}
-
-	network, address := s.network, s.address
-	if network == "ws" {
-		wsCtx, wsCancel := context.WithCancel(ctx)
-		defer wsCancel()
-		go func() {
-			if err := s.startWebSocket(wsCtx); err != nil {
-				fmt.Fprintf(os.Stderr, "[web] error: %v\n", err)
-			}
-		}()
-		// The web listener runs in the background; the main loop below
-		// still serves the Unix socket for attach/list/kill.
-		network, address = "unix", s.sockPath
-	}
-
-	if network == "unix" {
-		_ = os.Remove(address)
-		if err := os.MkdirAll(filepath.Dir(address), 0o755); err != nil {
-			return err
-		}
-	}
-	ln, err := net.Listen(network, address)
+	ln, err := net.Listen("unix", s.sockPath)
 	if err != nil {
-		return fmt.Errorf("listen %s %s: %w", network, address, err)
+		return fmt.Errorf("listen unix %s: %w", s.sockPath, err)
 	}
-	if network == "unix" {
-		defer os.Remove(address)
-	}
+	defer ln.Close()
+	defer os.Remove(s.sockPath)
 
 	if err := writePID(s.pidPath); err != nil {
 		return err
@@ -193,136 +148,6 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		go s.handleConn(ctx, conn)
 	}
-}
-
-func (s *Server) startWebSocket(ctx context.Context) error {
-	mux := http.NewServeMux()
-	mux.Handle("/ws", wsHandler(func() string { return s.address }, func(conn *websocket.Conn) {
-		s.handleConn(ctx, conn)
-	}))
-	if s.webDir != "" {
-		mux.Handle("/", http.FileServer(http.Dir(s.webDir)))
-	}
-
-	ln, err := listenWithFallback(s.address)
-	if err != nil {
-		return err
-	}
-	actualAddr := ln.Addr().String()
-	s.address = actualAddr
-
-	url := "http://" + displayAddr(actualAddr)
-	if s.token != "" {
-		url += "/?token=" + s.token
-	}
-	fmt.Fprintf(os.Stderr, "\n  web ui:  %s\n\n", url)
-
-	srv := &http.Server{Handler: mux}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
-	err = srv.Serve(ln)
-	if err == http.ErrServerClosed {
-		return nil
-	}
-	return err
-}
-
-// listenWithFallback listens on addr; if the port is busy it scans upward
-// (up to 20 ports) so a second server can start alongside a first.
-func listenWithFallback(addr string) (net.Listener, error) {
-	host, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, fmt.Errorf("bad listen address %q: %w", addr, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, fmt.Errorf("bad port in %q: %w", addr, err)
-	}
-	if port == 0 {
-		port = 8080
-	}
-	for i := 0; i < 20; i++ {
-		ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port+i)))
-		if err == nil {
-			return ln, nil
-		}
-	}
-	return nil, fmt.Errorf("no free port in %d-%d on %s", port, port+19, host)
-}
-
-// displayAddr rewrites wildcard/loopback IPs to something clickable.
-func displayAddr(addr string) string {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr
-	}
-	if host == "" || host == "::" || host == "0.0.0.0" || host == "127.0.0.1" || host == "::1" {
-		host = "localhost"
-	}
-	return net.JoinHostPort(host, port)
-}
-
-// isLocalhost returns true if addr is a loopback address or empty.
-func isLocalhost(addr string) bool {
-	if addr == "" {
-		return true
-	}
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
-}
-
-// wsHandler wraps handle in a websocket.Server whose handshake applies our
-// origin policy. The default websocket.Handler handshake 403s any request
-// without a parseable Origin header, which rejects every non-browser client
-// (Go, Node ws); token auth is the real barrier, so missing origins are fine.
-func wsHandler(addr func() string, handle func(*websocket.Conn)) http.Handler {
-	return websocket.Server{
-		Handshake: func(_ *websocket.Config, req *http.Request) error {
-			a := addr()
-			if isLocalhost(a) {
-				return nil
-			}
-			origin := req.Header.Get("Origin")
-			if origin == "" {
-				origin = req.Header.Get("Sec-WebSocket-Origin")
-			}
-			if !originAllowed(origin, a) {
-				return fmt.Errorf("origin not allowed")
-			}
-			return nil
-		},
-		Handler: handle,
-	}
-}
-
-// originAllowed checks if a browser origin is permitted to connect. Token
-// auth is the real barrier; this is defense-in-depth against cross-site
-// WebSocket connections. Non-browser clients send no Origin header and are
-// allowed; browser origins must target this server's host or loopback.
-func originAllowed(origin, addr string) bool {
-	if origin == "" {
-		return true
-	}
-	u, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-	oh := u.Hostname()
-	if oh == "localhost" || oh == "127.0.0.1" || oh == "::1" {
-		return true
-	}
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	return oh == host
 }
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
@@ -377,7 +202,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		s.mu.Unlock()
 	}()
 
-	// Send a snapshot of the engine's current state so the newly-attached
+	// Send a snapshot of the engine's current state so the newly-connected
 	// client sees any in-progress turn (busy indicator, streamed text, tools,
 	// or a pending permission prompt).
 	if snap := s.engine.Snapshot(); snap.Busy || snap.StreamedText != "" || len(snap.ActiveTools) > 0 || snap.PendingPermission != nil {

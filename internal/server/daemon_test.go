@@ -278,7 +278,7 @@ func TestDaemonRestoresMissingDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discovery not restored: %v", err)
 	}
-	if restored.Token != orig.Token || restored.WS != orig.WS || restored.PID != orig.PID {
+	if restored.Token != orig.Token || restored.Socket != orig.Socket || restored.PID != orig.PID {
 		t.Fatalf("restored discovery differs: %+v vs %+v", restored, orig)
 	}
 
