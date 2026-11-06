@@ -7,6 +7,9 @@ Type=simple
 # SIGINT lets talosd remove its Unix socket and instance lock on shutdown.
 ExecStart=%h/.local/bin/talosd
 KillSignal=SIGINT
+# PTY descendants share the service cgroup and are removed even after a daemon crash.
+KillMode=control-group
+TimeoutStopSec=15s
 Restart=on-failure
 RestartSec=3s
 
