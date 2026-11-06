@@ -184,8 +184,8 @@ impl SqliteStore {
                 if matches!(outcome, WorktreeOperationOutcome::DeletePreserved) {
                     let preserved_path = operation.preserved_path.as_ref().ok_or_else(conflict)?;
                     workspace.path.clone_from(preserved_path);
-                    workspace.metadata["managedWorktree"]["path"] = json!(preserved_path);
-                    workspace.metadata["managedWorktree"]["preserved"] = json!(true);
+                    workspace.metadata["managedWorktree"]["path"] = serde_json::json!(preserved_path);
+                    workspace.metadata["managedWorktree"]["preserved"] = serde_json::json!(true);
                 }
                 workspace.lifecycle = if matches!(
                     outcome,
