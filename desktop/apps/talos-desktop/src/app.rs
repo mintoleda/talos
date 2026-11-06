@@ -1,7 +1,11 @@
 //! Desktop application shell: panels, routing, keyboard map and dialogs.
 
+mod management;
+use management::Management;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use talos_ipc::Command;
 
 use eframe::egui::{
     self, Align, Color32, Layout, Margin, RichText, Sense, Stroke, TextWrapMode, Vec2,
@@ -27,6 +31,9 @@ enum SettingsTab {
     Permissions,
     Diagnostics,
     About,
+    Workspaces,
+    History,
+    Terminal,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -87,7 +94,6 @@ pub struct Desktop {
     drafts: HashMap<String, String>,
     stick: HashMap<String, bool>,
     caches: HashMap<String, MarkdownCache>,
-    loaded: HashMap<String, bool>,
     sidebar_open: bool,
     workspace_filter: Option<String>,
     settings: Option<SettingsTab>,
@@ -106,13 +112,20 @@ pub struct Desktop {
     pending_clipboard: Option<String>,
     preview: bool,
     last_size: Vec2,
+    manage: Management,
+    images: HashMap<String, Vec<Value>>,
+    attachment_dialog: Option<(String, String)>,
+    confirmation: Option<(String, Action)>,
+    session_actions: bool,
+    show_archived: bool,
+    pending_start_session: Option<String>,
 }
 
 impl Desktop {
     pub fn new(ctx: egui::Context, preview: bool) -> Self {
         theme::install(&ctx, false);
         ctx.set_zoom_factor(1.0);
-        let mut backend = Backend::new(ctx);
+        let mut backend = Backend::new(ctx, preview);
         if preview {
             backend.view = ViewModel::demo();
             backend.view.online = true;
@@ -124,7 +137,6 @@ impl Desktop {
             drafts: HashMap::new(),
             stick: HashMap::new(),
             caches: HashMap::new(),
-            loaded: HashMap::new(),
             sidebar_open: true,
             workspace_filter: None,
             settings: None,
@@ -143,6 +155,13 @@ impl Desktop {
             pending_clipboard: None,
             preview,
             last_size: Vec2::ZERO,
+            manage: Management::default(),
+            images: HashMap::new(),
+            attachment_dialog: None,
+            confirmation: None,
+            session_actions: false,
+            show_archived: false,
+            pending_start_session: None,
         }
     }
 
@@ -203,6 +222,33 @@ impl Desktop {
 
     fn take_backend_events(&mut self) {
         self.backend.drain();
+        for (session, images) in std::mem::take(&mut self.backend.validated_images) {
+            self.images
+                .insert(session, images.as_array().cloned().unwrap_or_default());
+            self.attachment_dialog = None;
+        }
+        for action in std::mem::take(&mut self.backend.completed) {
+            match action {
+                Action::CreateWorkspace { .. } => self.new_workspace.open = false,
+                Action::CreateAgent { .. } => self.new_agent.open = false,
+                Action::Rename { .. } => self.rename = None,
+                Action::Rpc(Command::CreateProject { .. }) => {
+                    self.manage.project_name.clear();
+                    self.manage.project_root.clear();
+                }
+                Action::SetModel { session, .. }
+                    if self.pending_start_session.as_ref() == Some(&session) =>
+                {
+                    if let Some(text) = self.pending_prompt.take() {
+                        self.drafts.insert(session.clone(), text);
+                        self.selected = Some(session);
+                        self.send();
+                    }
+                    self.pending_start_session = None;
+                }
+                _ => {}
+            }
+        }
         if let Some((session, text)) = self.backend.failed_prompt.take() {
             let draft = self.drafts.entry(session).or_default();
             if draft.is_empty() {
@@ -211,8 +257,10 @@ impl Desktop {
         }
         if let Some(id) = self.backend.created_session.take() {
             self.selected = Some(id.clone());
-            self.loaded.remove(&id);
             self.composer_focus = true;
+            if let Some(images) = self.images.remove(NEW_CONVERSATION) {
+                self.images.insert(id.clone(), images);
+            }
             let provider = self
                 .view()
                 .session(&id)
@@ -223,15 +271,20 @@ impl Desktop {
                 .take()
                 .map(|(_, model)| model)
                 .or_else(|| self.last_model(&provider, Some(&id)));
+            let model_pending = model.is_some();
             if let Some(model) = model {
                 self.backend.submit(Action::SetModel {
                     session: id.clone(),
                     model,
                 });
             }
-            if let Some(text) = self.pending_prompt.take() {
-                if self.backend.send(&id, text) {
-                    self.stick.insert(id.clone(), true);
+            if self.pending_prompt.is_some() {
+                if model_pending {
+                    self.pending_start_session = Some(id.clone());
+                } else if let Some(text) = self.pending_prompt.take() {
+                    self.drafts.insert(id.clone(), text);
+                    self.drafts.remove(NEW_CONVERSATION);
+                    self.send();
                 }
             }
         }
@@ -265,11 +318,14 @@ impl Desktop {
         let Some(id) = self.session_id() else {
             return;
         };
-        let loaded = self.loaded.get(&id).copied().unwrap_or(false);
-        if !loaded && self.view().online {
-            if self.backend.submit(Action::Load(id.clone())) {
-                self.loaded.insert(id, true);
-            }
+        if !self.preview
+            && self.view().online
+            && !self.backend.ready.contains(&id)
+            && !self.backend.loading.contains(&id)
+            && !self.backend.load_errors.contains_key(&id)
+            && self.session().is_some_and(|s| !s.archived)
+        {
+            self.backend.submit(Action::Load(id));
         }
     }
 
@@ -277,13 +333,10 @@ impl Desktop {
         if self.selected.as_deref() != Some(id) {
             self.selected = Some(id.to_owned());
             self.composer_focus = true;
-            self.settings = None;
-            let loaded = self.loaded.get(id).copied().unwrap_or(false);
-            if !loaded && self.view().online {
-                if self.backend.submit(Action::Load(id.to_owned())) {
-                    self.loaded.insert(id.to_owned(), true);
-                }
-            }
+        }
+        self.settings = None;
+        if layout_for_width(self.last_size.x) != Breakpoint::Wide {
+            self.sidebar_open = false;
         }
     }
 
@@ -292,11 +345,16 @@ impl Desktop {
             self.warn("Create an agent before sending a prompt.");
             return false;
         };
-        let Some(draft) = self.drafts.get(&id) else {
-            return false;
-        };
+        let draft = self.drafts.get(&id).cloned().unwrap_or_default();
         let text = draft.trim_end_matches(['\n', ' ']).trim().to_owned();
-        if text.is_empty() {
+        let images: Vec<String> = self
+            .images
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i["path"].as_str().map(str::to_owned))
+            .collect();
+        if text.is_empty() && images.is_empty() {
             return false;
         }
         if self.preview {
@@ -307,10 +365,25 @@ impl Desktop {
             self.warn("Daemon is offline; the prompt was kept as a draft.");
             return false;
         }
-        if self.backend.send(&id, text) {
+        if self
+            .backend
+            .retry_prompt
+            .as_ref()
+            .is_some_and(|a| matches!(a, Action::Prompt {session, ..} if session == &id))
+        {
+            self.warn(
+                "Resolve the previous submission using Retry or Keep draft before sending again.",
+            );
+            return false;
+        }
+        if !self.backend.ready.contains(&id) || self.view().running(&id) {
+            return false;
+        }
+        if self.backend.send(&id, text, images) {
             if let Some(draft) = self.drafts.get_mut(&id) {
                 draft.clear();
             }
+            self.images.remove(&id);
             self.stick.insert(id.clone(), true);
             true
         } else {
@@ -339,13 +412,7 @@ impl Desktop {
     // -- keyboard ------------------------------------------------------------
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let (command, pressed) = ctx.input(|input| {
-            (
-                input.modifiers.command,
-                egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K),
-            )
-        });
-        let _ = pressed;
+        let command = ctx.input(|input| input.modifiers.command);
         if command && ctx.input(|input| input.key_pressed(egui::Key::K)) {
             self.palette.open = true;
             self.palette.focus = true;
@@ -461,7 +528,7 @@ impl Desktop {
     }
 
     fn sidebar(&mut self, root: &mut egui::Ui, breakpoint: Breakpoint) {
-        if breakpoint == Breakpoint::Minimal || !self.sidebar_open {
+        if breakpoint != Breakpoint::Wide || !self.sidebar_open {
             return;
         }
         let width = if breakpoint == Breakpoint::Compact {
@@ -484,6 +551,15 @@ impl Desktop {
     }
 
     fn sidebar_contents(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.small_button("Manage workspaces").clicked() {
+                self.settings = Some(SettingsTab::Workspaces);
+                self.backend.submit(Action::Rpc(Command::ListProjects));
+            }
+            if ui.small_button("History").clicked() {
+                self.settings = Some(SettingsTab::History);
+            }
+        });
         // Workspace picker.
         let current = self
             .workspace_filter
@@ -552,7 +628,7 @@ impl Desktop {
                     ui.close();
                 }
                 let workspaces = self.view().workspaces.clone();
-                for workspace in workspaces {
+                for workspace in workspaces.into_iter().filter(|w| !w.archived) {
                     let selected = self.workspace_filter.as_deref() == Some(workspace.id.as_str());
                     if ui
                         .add(
@@ -644,6 +720,7 @@ impl Desktop {
         }
         search.on_hover_text("Search agents and commands · ⌘K");
 
+        ui.checkbox(&mut self.show_archived, "Archived conversations");
         ui.add_space(12.0);
         widgets::divider(ui);
         ui.add_space(4.0);
@@ -656,6 +733,7 @@ impl Desktop {
                     .view()
                     .sessions_for(self.workspace_filter.as_deref())
                     .into_iter()
+                    .filter(|session| session.archived == self.show_archived)
                     .cloned()
                     .collect();
                 let attention: Vec<&Session> = sessions
@@ -888,8 +966,7 @@ impl Desktop {
     }
 
     fn open_session_menu(&mut self) {
-        // Actions that need daemon support are hidden rather than shown broken.
-        self.notify("More actions: rename and archive arrive with the next daemon build.");
+        self.session_actions = true;
     }
 
     fn copy_conversation(&mut self) {
@@ -941,23 +1018,35 @@ impl Desktop {
             .cloned()
             .unwrap_or_default();
         let prompt = draft.trim().to_owned();
-        if prompt.is_empty() {
+        let has_images = self
+            .images
+            .get(NEW_CONVERSATION)
+            .is_some_and(|images| !images.is_empty());
+        if prompt.is_empty() && !has_images {
             return false;
         }
-        let title = truncate(prompt.lines().next().unwrap_or("New agent"), 52);
+        let title = truncate(
+            prompt
+                .lines()
+                .next()
+                .filter(|line| !line.trim().is_empty())
+                .unwrap_or("Image request"),
+            52,
+        );
         let provider = self
             .pending_model
             .as_ref()
             .map(|(provider, _)| provider.clone());
+        if self.pending_prompt.is_some() {
+            return false;
+        }
         if self.backend.submit(Action::CreateAgent {
             workspace,
             provider,
             title: Some(title),
         }) {
             self.pending_prompt = Some(prompt);
-            if let Some(draft) = self.drafts.get_mut(NEW_CONVERSATION) {
-                draft.clear();
-            }
+
             true
         } else {
             false
@@ -965,7 +1054,8 @@ impl Desktop {
     }
 
     fn central(&mut self, root: &mut egui::Ui, breakpoint: Breakpoint) {
-        let has_inspector = self.inspector && breakpoint == Breakpoint::Wide;
+        let has_inspector =
+            self.inspector && root.available_width() >= 850.0 && breakpoint == Breakpoint::Wide;
         if has_inspector {
             egui::Panel::right("inspector")
                 .exact_size(300.0)
@@ -1017,12 +1107,11 @@ impl Desktop {
             .map_or(provider, |provider| provider.name.clone());
         let motion = !self.reduced_motion;
         let actions = {
-            let entries = entries;
             let mut state = TimelineState {
+                session_id: &id,
                 entries: &entries,
                 running,
                 motion,
-                pending: &self.view().pending,
                 cache: &mut cache,
                 stick: &mut stick,
                 provider: &provider_name,
@@ -1034,15 +1123,13 @@ impl Desktop {
         for action in actions {
             match action {
                 TimelineAction::Decide {
+                    session,
                     id: permission,
                     allow,
                 } => {
-                    let Some(session) = self.session_id() else {
-                        continue;
-                    };
                     if self.backend.submit(Action::Decision {
                         id: permission.clone(),
-                        session: session.clone(),
+                        session,
                         allow,
                     }) {
                         self.backend
@@ -1103,7 +1190,7 @@ impl Desktop {
                 ui.add_space(22.0);
                 ui.label(
                     RichText::new(
-                        "Daemon offline. The shell is showing a preview; start talosd to go live.",
+                        "Connect to the local daemon to create agents. Your drafts stay here.",
                     )
                     .font(theme::ui(11.5))
                     .color(theme::AMBER),
@@ -1122,7 +1209,12 @@ impl Desktop {
         let has_session = self.session_id().is_some();
         let mut draft = self.drafts.remove(&id).unwrap_or_default();
         let width = root.available_width();
-        let target = composer::height(&draft, width.min(theme::COMPOSER_MAX));
+        let attachments = self.images.get(&id).cloned().unwrap_or_default();
+        let target = composer::height_with_attachments(
+            &draft,
+            width.min(theme::COMPOSER_MAX),
+            attachments.len(),
+        );
         let height = if self.reduced_motion {
             target
         } else {
@@ -1130,13 +1222,44 @@ impl Desktop {
                 .animate_value_with_time(egui::Id::unique("composer-height"), target, 0.12)
         };
         let session = self.session().cloned();
+        let provider_id = session
+            .as_ref()
+            .map(|session| session.provider.as_str())
+            .or_else(|| {
+                self.pending_model
+                    .as_ref()
+                    .map(|(provider, _)| provider.as_str())
+            })
+            .unwrap_or("talos")
+            .to_owned();
         let remembered_model = (!has_session)
-            .then(|| self.last_model("talos", None))
+            .then(|| {
+                self.pending_model
+                    .as_ref()
+                    .map(|(_, model)| model.clone())
+                    .or_else(|| self.last_model("talos", None))
+            })
             .flatten();
         let usage = self.view().usage.get(&id).cloned();
         let providers = self.view().providers.clone();
         let running = has_session && self.view().running(&id);
-        let online = self.view().online;
+        let online = self.view().online
+            && (self.preview
+                || !has_session
+                || (self.backend.ready.contains(&id)
+                    && session.as_ref().is_some_and(|s| !s.archived)))
+            && self.pending_prompt.is_none()
+            && !self
+                .backend
+                .retry_prompt
+                .as_ref()
+                .is_some_and(|a| matches!(a, Action::Prompt {session, ..} if session == &id));
+        let config_options = self
+            .view()
+            .config_options
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
         let motion = !self.reduced_motion;
         if self.composer_focus {
             root.ctx().memory_mut(|memory| {
@@ -1155,6 +1278,7 @@ impl Desktop {
                 ui.set_max_width(ui.available_width());
                 let mut state = ComposerState {
                     session_id: &id,
+                    provider_id: &provider_id,
                     draft: &mut draft,
                     running,
                     online,
@@ -1163,6 +1287,8 @@ impl Desktop {
                     providers: &providers,
                     usage: usage.as_ref(),
                     motion,
+                    attachments: &attachments,
+                    config_options: &config_options,
                 };
                 let action = composer::show(ui, &mut state);
                 let _ = breakpoint;
@@ -1180,7 +1306,6 @@ impl Desktop {
                     }
                     Some(ComposerAction::Stop) => {
                         self.backend.submit(Action::Cancel(id.clone()));
-                        self.backend.view.run.insert(id.clone(), false);
                     }
                     Some(ComposerAction::SetModel { provider, model }) => {
                         if has_session {
@@ -1198,10 +1323,30 @@ impl Desktop {
                         }
                     }
                     Some(ComposerAction::Attach) => {
-                        self.notify("Attachments reach the daemon in the next build.");
+                        self.attachment_dialog = Some((id.clone(), String::new()));
                     }
-                    Some(ComposerAction::Voice) => {
-                        self.notify("Dictation isn't wired to the Rust daemon yet.");
+                    Some(ComposerAction::RemoveAttachment(index)) => {
+                        if let Some(images) = self.images.get_mut(&id)
+                            && index < images.len()
+                        {
+                            images.remove(index);
+                        }
+                        if self.images.get(&id).is_some_and(Vec::is_empty) {
+                            self.images.remove(&id);
+                        }
+                    }
+                    Some(ComposerAction::SetMode(mode)) => {
+                        self.backend.submit(Action::Rpc(Command::SetMode {
+                            session_id: id.clone(),
+                            mode_id: mode,
+                        }));
+                    }
+                    Some(ComposerAction::SetConfig { option, value }) => {
+                        self.backend.submit(Action::SetConfig {
+                            session: id.clone(),
+                            option,
+                            value,
+                        });
                     }
                     None => {}
                 }
@@ -1228,13 +1373,9 @@ impl Desktop {
                     );
                     ui.add(
                         egui::Label::new(
-                            RichText::new(if online {
-                                self.view().status.clone()
-                            } else {
-                                "Preview · daemon offline".to_owned()
-                            })
-                            .font(theme::ui(10.5))
-                            .color(theme::FAINT),
+                            RichText::new(self.view().status.clone())
+                                .font(theme::ui(10.5))
+                                .color(theme::FAINT),
                         )
                         .truncate(),
                     );
@@ -1299,6 +1440,7 @@ impl Desktop {
                 "Provider",
                 provider_label(self.view(), &session.provider).to_owned(),
             ),
+            ("Agent ID", session.agent_id.clone()),
             ("Model", session.model_label()),
             ("Workspace", session.workspace.clone()),
             ("Directory", compact_path(&session.cwd)),
@@ -1378,6 +1520,9 @@ impl Desktop {
                     (SettingsTab::Permissions, "Permissions"),
                     (SettingsTab::Diagnostics, "Diagnostics"),
                     (SettingsTab::About, "About"),
+                    (SettingsTab::Workspaces, "Workspaces"),
+                    (SettingsTab::History, "History search"),
+                    (SettingsTab::Terminal, "Terminal"),
                 ] {
                     let selected = tab == item;
                     if ui
@@ -1414,6 +1559,9 @@ impl Desktop {
                     SettingsTab::Permissions => self.settings_permissions(ui),
                     SettingsTab::Diagnostics => self.settings_diagnostics(ui),
                     SettingsTab::About => self.settings_about(ui),
+                    SettingsTab::Workspaces => self.workspace_settings(ui),
+                    SettingsTab::History => self.history_settings(ui),
+                    SettingsTab::Terminal => self.terminal_settings(ui),
                 }
             });
         });
@@ -1435,7 +1583,7 @@ impl Desktop {
         settings_heading(ui, "Interface scale");
         let mut zoom = self.zoom;
         if ui
-            .add(egui::Slider::new(&mut zoom, 0.85..=1.35).text("Zoom"))
+            .add(egui::Slider::new(&mut zoom, 0.85..=2.0).text("Zoom"))
             .changed()
         {
             self.zoom = zoom;
@@ -1499,7 +1647,10 @@ impl Desktop {
                 )
                 .clicked()
             {
-                self.backend.submit(Action::Refresh);
+                self.backend
+                    .submit(Action::Rpc(Command::ProviderDiagnostics {
+                        provider_id: None,
+                    }));
             }
             if ui
                 .add(
@@ -1614,7 +1765,7 @@ impl Desktop {
             if ui
                 .add(
                     egui::Button::new(
-                        RichText::new("Open log")
+                        RichText::new("Copy log path")
                             .font(theme::medium(12.0))
                             .color(theme::SECONDARY),
                     )
@@ -1651,11 +1802,13 @@ impl Desktop {
                 ))
                 .corner_radius(8),
             )
-            .on_hover_text("Pending permissions are preserved; nothing is auto-approved.")
+            .on_hover_text("Interrupts active runs and cancels pending permissions.")
             .clicked()
         {
-            self.backend.submit(Action::Shutdown);
-            self.warn("Shutdown requested.");
+            self.confirmation = Some((
+                "Stop the daemon and interrupt active runs?".into(),
+                Action::Shutdown,
+            ));
         }
     }
 
@@ -1696,8 +1849,9 @@ impl Desktop {
         self.new_agent_dialog(ctx);
         self.new_workspace_dialog(ctx);
         self.rename_dialog(ctx);
+        self.management_overlays(ctx);
         self.toast_overlay(ctx);
-        if breakpoint == Breakpoint::Minimal && self.sidebar_open && self.settings.is_none() {
+        if breakpoint != Breakpoint::Wide && self.sidebar_open && self.settings.is_none() {
             self.drawer(ctx);
         }
     }
@@ -2112,7 +2266,15 @@ impl Desktop {
                     }
                 }
                 ui.add_space(14.0);
-                let ready = self.new_agent.workspace.is_some();
+                let ready = self.view().online
+                    && self.backend.busy == 0
+                    && self.new_agent.workspace.is_some()
+                    && self
+                        .new_agent
+                        .provider
+                        .as_deref()
+                        .and_then(|id| self.view().provider(id))
+                        .is_some_and(|p| p.available);
                 if ui
                     .add_enabled(
                         ready,
@@ -2126,16 +2288,14 @@ impl Desktop {
                         .min_size(Vec2::new(120.0, 32.0)),
                     )
                     .clicked()
+                    && let Some(workspace) = self.new_agent.workspace.clone()
                 {
-                    if let Some(workspace) = self.new_agent.workspace.clone() {
-                        let title = self.new_agent.title.trim().to_owned();
-                        self.backend.submit(Action::CreateAgent {
-                            workspace,
-                            provider: self.new_agent.provider.clone(),
-                            title: (!title.is_empty()).then_some(title),
-                        });
-                        self.new_agent.open = false;
-                    }
+                    let title = self.new_agent.title.trim().to_owned();
+                    self.backend.submit(Action::CreateAgent {
+                        workspace,
+                        provider: self.new_agent.provider.clone(),
+                        title: (!title.is_empty()).then_some(title),
+                    });
                 }
             });
         self.new_agent.open &= open;
@@ -2174,7 +2334,9 @@ impl Desktop {
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(12.0);
-                let ready = !self.new_workspace.name.trim().is_empty()
+                let ready = self.view().online
+                    && self.backend.busy == 0
+                    && !self.new_workspace.name.trim().is_empty()
                     && self.new_workspace.path.starts_with('/');
                 if ui
                     .add_enabled(
@@ -2193,7 +2355,6 @@ impl Desktop {
                         name: self.new_workspace.name.trim().to_owned(),
                         path: self.new_workspace.path.trim().to_owned(),
                     });
-                    self.new_workspace.open = false;
                 }
             });
         self.new_workspace.open &= open;
@@ -2327,6 +2488,10 @@ impl eframe::App for Desktop {
         self.header(root, breakpoint);
         self.status_bar(root);
         self.composer_panel(root, breakpoint);
+        self.permission_panel(root);
+        self.recovery_panel(root);
+        self.attachment_panel(root);
+        self.handle_dropped_files(&ctx);
         self.central(root, breakpoint);
         self.overlays(&ctx, breakpoint);
     }
@@ -2448,12 +2613,12 @@ fn header_icon(ui: &mut egui::Ui, icon: Icon, tip: &str) -> bool {
 }
 
 fn status_chip(ui: &mut egui::Ui, status: SessionStatus, motion: bool) {
-    let (color, label) = match status {
-        SessionStatus::Running => (theme::BLUE, "Running"),
-        SessionStatus::Attention => (theme::AMBER, "Needs you"),
-        SessionStatus::Error => (theme::RED, "Error"),
-        SessionStatus::Offline => (theme::FAINT, "Offline"),
-        SessionStatus::Idle => (theme::GREEN, "Ready"),
+    let color = match status {
+        SessionStatus::Running => theme::BLUE,
+        SessionStatus::Attention => theme::AMBER,
+        SessionStatus::Error => theme::RED,
+        SessionStatus::Offline => theme::FAINT,
+        SessionStatus::Idle => theme::GREEN,
     };
     widgets::status_dot(
         ui,
@@ -2462,7 +2627,11 @@ fn status_chip(ui: &mut egui::Ui, status: SessionStatus, motion: bool) {
         motion,
         egui::Id::unique("header-status"),
     );
-    ui.label(RichText::new(label).font(theme::ui(11.0)).color(color));
+    ui.label(
+        RichText::new(status.label())
+            .font(theme::ui(11.0))
+            .color(color),
+    );
     ui.add_space(4.0);
 }
 
@@ -2678,10 +2847,10 @@ fn compact_path(path: &str) -> String {
     if path.is_empty() {
         return String::new();
     }
-    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
-        if let Ok(rest) = std::path::Path::new(path).strip_prefix(&home) {
-            return format!("~/{}", rest.display());
-        }
+    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+        && let Ok(rest) = std::path::Path::new(path).strip_prefix(&home)
+    {
+        return format!("~/{}", rest.display());
     }
     path.to_owned()
 }
@@ -2733,5 +2902,39 @@ mod tests {
         assert_eq!(hue_for("abc"), hue_for("abc"));
         let (r, g, b) = hue_for("abc");
         assert!(r > 0 && g > 0 && b > 0);
+    }
+
+    #[test]
+    fn preview_shell_renders_headlessly_at_responsive_sizes() {
+        for (width, height) in [
+            (1600.0, 900.0),
+            (1280.0, 800.0),
+            (900.0, 650.0),
+            (720.0, 520.0),
+        ] {
+            let context = egui::Context::default();
+            let mut desktop = Desktop::new(context.clone(), true);
+            desktop.selected = Some("demo-1".into());
+            desktop
+                .backend
+                .view
+                .pending
+                .insert("perm-1".into(), PendingState::Idle);
+            let mut frame = eframe::Frame::_new_kittest();
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, height),
+            ));
+
+            let output = context.run_ui(input, |ui| {
+                eframe::App::ui(&mut desktop, ui, &mut frame);
+            });
+            assert!(
+                !output.shapes.is_empty(),
+                "no UI shapes at {width}×{height}"
+            );
+            output.drop_without_applying_deltas();
+        }
     }
 }
