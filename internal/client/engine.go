@@ -1,8 +1,5 @@
-// Package client defines the client-facing Engine interface that abstracts
-// over local (in-process) and remote (server-attach) loop interaction.
-//
-// The concrete local implementation lives in internal/engine; this package
-// keeps the TUI-facing interface and RemoteEngine.
+// Package client defines the TUI-facing Engine interface and daemon RPC client.
+// The concrete in-process engine implementation lives in internal/engine.
 package client
 
 import (
@@ -13,7 +10,7 @@ import (
 )
 
 // Engine captures every capability the TUI needs to drive a conversation loop.
-// engine.Engine and RemoteEngine both satisfy it.
+// engine.Engine satisfies it.
 type Engine interface {
 	// Submit sends user content blocks to the engine for processing.
 	Submit(blocks []protocol.ContentBlock)
@@ -63,7 +60,7 @@ type Engine interface {
 	MCPCount() int
 	// CancelSubagent cancels a running subagent by ID.
 	CancelSubagent(id string)
-	// History returns the current transcript backlog for newly attached clients.
+	// History returns the current transcript backlog.
 	History() ([]protocol.FrozenMessage, error)
 	// ListFiles returns file-picker candidates for @ completion.
 	ListFiles(prefix string) ([]string, error)

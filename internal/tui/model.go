@@ -1233,9 +1233,6 @@ func (m Model) renderCompletions() string {
 func (m Model) handleEvent(e protocol.Event) Model {
 	switch ev := e.(type) {
 	case protocol.UserInput:
-		if _, ok := m.cfg.Engine.(*client.RemoteEngine); ok && !strings.HasPrefix(ev.Text, "/") {
-			break
-		}
 		m.chat = m.chat.AppendUserBlocks(protocol.TextBlocks(ev.Text))
 	case protocol.ModelChanged:
 		m.cfg.Provider = ev.Provider

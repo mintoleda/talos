@@ -29,14 +29,13 @@ This preserves what is valuable about Paseo—session management, multiple agent
 
 ```text
 talos/
-├── cmd/talos/        Go CLI: TUI, `serve`, `attach`, `acp`
+├── cmd/talos/        Go CLI: TUI, `serve`, `acp`
 ├── internal/         Go runtime: loop, providers, tools, safety, sessions, MCP
 │   ├── acp/          ACP v1 server used by the desktop
 │   └── stack/        runtime constructor shared by TUI, daemon and ACP
-├── app/              Electron app (legacy; to be replaced by desktop/)
 ├── desktop/          Rust workspace: egui app, talosd, talosdctl, store, ACP client
 ├── docs/
-└── Makefile          `talos`, `app*`, `desktop*` targets
+└── Makefile          `talos`, `desktop*` targets
 ```
 
 The only interface between the two languages is the `talos acp` process
@@ -56,8 +55,10 @@ is no FFI, shared database or shared session store. Consequences:
   backend acceptance job on every push; full-workspace desktop UI gates are
   non-blocking until `desktop/docs/STATUS.md` closes them.
 
-`talos serve` and the Electron app keep working unchanged while the desktop
-reaches parity; they are not used by the desktop.
+The legacy Electron app and TUI attach client have been removed. The standalone
+TUI still supports saved-session resume. `talos serve` retains its Unix-socket
+RPC API for programmatic clients, but is not used by the desktop. The legacy
+WebSocket transport and web UI have been removed.
 
 ## Why
 
@@ -122,7 +123,7 @@ The Paseo-oriented Talos runtime is more than `internal/loop`. A reliable runtim
 Once Paseo integration is working, the slim Talos branch does not need its own:
 
 - Bubble Tea TUI
-- Electron application (superseded by `desktop/`)
+- Electron application (removed; superseded by `desktop/`)
 - Project rail
 - Attach client
 - User-facing multi-session daemon
@@ -200,10 +201,13 @@ The same principle applies to any Codex subscription or other harness-specific a
 
 All work happens on `main`. The original plan kept a `talos-full` snapshot and a
 slim `talos` integration branch; that was dropped once the headless ACP path and
-the Rust desktop moved into this repository alongside the existing TUI, daemon
-and Electron app. The pre-ACP standalone state is `aaccca2` in `main`'s history.
+the Rust desktop moved into this repository alongside the existing TUI and daemon.
+The pre-ACP standalone state is `aaccca2` in `main`'s history; the legacy Electron
+app has since been removed.
 
-Do not delete UI code before the headless path works. First add `talos acp`, connect it to the desktop, and verify sessions, tools, permissions, cancellation, compaction, and resume. Then retire redundant product layers (starting with the Electron app) on `main`.
+The headless `talos acp` path and the native desktop now replace the Electron
+layer. The standalone TUI and Unix-socket daemon APIs remain available; retiring further
+product layers requires verifying their replacements independently.
 
 Avoid maintaining two independent copies of the agent loop. Runtime fixes should have one clear source of truth.
 

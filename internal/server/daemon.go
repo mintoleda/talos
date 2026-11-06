@@ -7,15 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	"golang.org/x/net/websocket"
 
 	"github.com/mintoleda/talos/internal/client/rpc"
 	"github.com/mintoleda/talos/internal/config"
@@ -27,7 +24,7 @@ import (
 	"github.com/mintoleda/talos/internal/version"
 )
 
-// Daemon is the multi-session talos server: one unix socket + localhost ws,
+// Daemon is the multi-session talos server: one Unix socket,
 // SessionManager-backed, with per-connection subscribe routing.
 type Daemon struct {
 	cfg         *config.Config
@@ -37,8 +34,6 @@ type Daemon struct {
 	pidPath     string
 	idleTimeout time.Duration // 0 = never idle-exit
 	token       string
-	wsListen    string // host:port; empty => 127.0.0.1:0
-	webDir      string
 	startedAt   time.Time
 
 	mu            sync.Mutex
@@ -74,17 +69,8 @@ func NewDaemon(cfg *config.Config, idleTimeout time.Duration) *Daemon {
 		pidPath:      filepath.Join(baseDir, "daemon.pid"),
 		idleTimeout:  idleTimeout,
 		token:        cfg.ServerToken,
-		wsListen:     "127.0.0.1:0",
 		lastActivity: time.Now(),
 		conns:        make(map[int]*daemonConn),
-	}
-	if cfg.ServerListen != "" {
-		addr := cfg.ServerListen
-		addr = strings.TrimPrefix(addr, "ws:")
-		addr = strings.TrimPrefix(addr, "tcp:")
-		if addr != "" {
-			d.wsListen = addr
-		}
 	}
 	d.manager.SetStatusFn(func(st protocol.SessionStatus) {
 		d.broadcastStatus(st)
@@ -114,11 +100,9 @@ func (d *Daemon) listModels() ([]models.Entry, error) {
 	return entries, nil
 }
 
-func (d *Daemon) SetWebDir(dir string) { d.webDir = dir }
-
 func (d *Daemon) SetToken(token string) { d.token = token }
 
-// Start listens on unix + websocket until ctx cancel or idle exit.
+// Start listens on the Unix socket until ctx cancel or idle exit.
 func (d *Daemon) Start(ctx context.Context) error {
 	d.startedAt = time.Now()
 	if d.token == "" {
@@ -162,41 +146,20 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 	defer os.Remove(d.pidPath)
 
-	wsLn, err := net.Listen("tcp", d.wsListen)
-	if err != nil {
-		return fmt.Errorf("listen ws %s: %w", d.wsListen, err)
-	}
-	wsAddr := wsLn.Addr().String()
-
 	discoveryPath := DiscoveryPath(d.baseDir)
 	discovery := Discovery{
 		PID:       os.Getpid(),
 		Socket:    d.sockPath,
-		WS:        "ws://" + displayAddr(wsAddr) + "/ws",
 		Token:     d.token,
 		Version:   version.VERSION,
 		StartedAt: d.startedAt,
 	}
 	if err := WriteDiscovery(discoveryPath, discovery); err != nil {
-		_ = wsLn.Close()
 		return err
 	}
 	defer RemoveDiscovery(discoveryPath)
 
 	fmt.Fprintf(os.Stderr, "[daemon] unix %s\n", d.sockPath)
-	url := "http://" + displayAddr(wsAddr)
-	if d.token != "" {
-		url += "/?token=" + d.token
-	}
-	fmt.Fprintf(os.Stderr, "[daemon] web ui: %s\n", url)
-
-	wsCtx, wsCancel := context.WithCancel(ctx)
-	defer wsCancel()
-	go func() {
-		if err := d.serveWeb(wsCtx, wsLn); err != nil && wsCtx.Err() == nil {
-			fmt.Fprintf(os.Stderr, "[daemon] web: %v\n", err)
-		}
-	}()
 
 	var idle *time.Ticker
 	if d.idleTimeout > 0 {
@@ -272,28 +235,6 @@ func (d *Daemon) shouldIdleExit() bool {
 		return false
 	}
 	return time.Since(last) >= d.idleTimeout
-}
-
-func (d *Daemon) serveWeb(ctx context.Context, ln net.Listener) error {
-	mux := http.NewServeMux()
-	mux.Handle("/ws", wsHandler(func() string { return ln.Addr().String() }, func(conn *websocket.Conn) {
-		d.handleConn(ctx, conn)
-	}))
-	if d.webDir != "" {
-		mux.Handle("/", http.FileServer(http.Dir(d.webDir)))
-	}
-	srv := &http.Server{Handler: mux}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
-	err := srv.Serve(ln)
-	if err == http.ErrServerClosed {
-		return nil
-	}
-	return err
 }
 
 func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
