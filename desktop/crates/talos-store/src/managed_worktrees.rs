@@ -34,7 +34,6 @@ pub struct ManagedWorktreeOperation {
 pub enum WorktreeOperationOutcome {
     Created,
     CreateAbsent,
-    Deleted,
     DeleteCancelled,
     DeletePreserved,
 }
@@ -120,7 +119,10 @@ impl SqliteStore {
         let Some(mut workspace) = workspace_on(&tx, id)? else {
             return Ok(WorkspaceArchiveResult::NotFound);
         };
-        if operation.kind != WorktreeOperationKind::Delete || workspace != operation.workspace {
+        if operation.kind != WorktreeOperationKind::Delete
+            || workspace != operation.workspace
+            || operation.preserved_path.is_none()
+        {
             return Err(conflict());
         }
         if workspace_has_active_runs_on(&tx, id)? {
@@ -166,8 +168,7 @@ impl SqliteStore {
             (WorktreeOperationKind::Create, WorktreeOperationOutcome::CreateAbsent) => None,
             (
                 WorktreeOperationKind::Delete,
-                WorktreeOperationOutcome::Deleted
-                | WorktreeOperationOutcome::DeleteCancelled
+                WorktreeOperationOutcome::DeleteCancelled
                 | WorktreeOperationOutcome::DeletePreserved,
             ) => {
                 let mut workspace = workspace_on(&tx, id)?.ok_or_else(conflict)?;
@@ -184,17 +185,16 @@ impl SqliteStore {
                 if matches!(outcome, WorktreeOperationOutcome::DeletePreserved) {
                     let preserved_path = operation.preserved_path.as_ref().ok_or_else(conflict)?;
                     workspace.path.clone_from(preserved_path);
-                    workspace.metadata["managedWorktree"]["path"] = serde_json::json!(preserved_path);
+                    workspace.metadata["managedWorktree"]["path"] =
+                        serde_json::json!(preserved_path);
                     workspace.metadata["managedWorktree"]["preserved"] = serde_json::json!(true);
                 }
-                workspace.lifecycle = if matches!(
-                    outcome,
-                    WorktreeOperationOutcome::Deleted | WorktreeOperationOutcome::DeletePreserved
-                ) {
-                    WorkspaceLifecycle::Archived
-                } else {
-                    original.lifecycle.clone()
-                };
+                workspace.lifecycle =
+                    if matches!(outcome, WorktreeOperationOutcome::DeletePreserved) {
+                        WorkspaceLifecycle::Archived
+                    } else {
+                        original.lifecycle.clone()
+                    };
                 workspace.updated_at = Utc::now();
                 update_workspace_row(&tx, &workspace)?;
                 Some(workspace)
@@ -274,6 +274,7 @@ mod tests {
         let id = operation.workspace.id;
         db.save_workspace(&operation.workspace).unwrap();
         operation.kind = WorktreeOperationKind::Delete;
+        operation.preserved_path = Some("/tmp/managed/.talos-preserved-feature".into());
         db.connection.execute_batch("CREATE TRIGGER fail_archive BEFORE UPDATE ON workspaces BEGIN SELECT RAISE(ABORT,'injected archive failure'); END;").unwrap();
         assert!(db.begin_worktree_delete(&operation).is_err());
         assert_eq!(db.pending_worktree_operations().unwrap().len(), 0);
@@ -327,6 +328,7 @@ mod tests {
         let mut db = SqliteStore::open_in_memory().unwrap();
         let mut operation = operation(&mut db);
         operation.kind = WorktreeOperationKind::Delete;
+        operation.preserved_path = Some("/tmp/managed/.talos-preserved-feature".into());
         let workspace = &operation.workspace;
         db.save_workspace(workspace).unwrap();
         let agent = Agent::new(workspace.id, ProviderId::new("talos").unwrap(), "Fixture").unwrap();

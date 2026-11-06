@@ -50,7 +50,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut TimelineState<'_>) -> Vec<TimelineAct
         .auto_shrink([false, false])
         .stick_to_bottom(*state.stick)
         .show(ui, |ui| {
-            ui.add_space(26.0);
+            ui.add_space(16.0);
             ui.vertical_centered(|ui| {
                 ui.set_max_width(theme::READING_MAX + 24.0);
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
@@ -78,7 +78,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut TimelineState<'_>) -> Vec<TimelineAct
                     if state.running {
                         working_indicator(ui, state.motion);
                     }
-                    ui.add_space(28.0);
+                    ui.add_space(18.0);
                 });
             });
         });
@@ -130,25 +130,24 @@ fn entry_block(
             assistant_block(ui, text, *streaming, state.provider, state.cache);
         }
         EntryKind::Thought { text, streaming } => thought_block(ui, text, *streaming),
-        EntryKind::Permission { .. } => {}
         EntryKind::Notice { message, .. } => notice_block(ui, message),
         EntryKind::Error { message, .. } => error_block(ui, message),
         EntryKind::Attachment { name, mime, size } => notice_block(
             ui,
             &format!("Image · {name} · {mime} · {} KiB", size / 1024),
         ),
-        EntryKind::Tool { .. } => {}
+        EntryKind::Permission { .. } | EntryKind::Tool { .. } => {}
     });
 }
 
 fn user_block(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(18.0);
+    ui.add_space(16.0);
     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
         egui::Frame::new()
             .fill(theme::SURFACE)
             .stroke(Stroke::new(1.0, theme::LINE))
-            .corner_radius(CornerRadius::same(16))
-            .inner_margin(Margin::symmetric(16, 11))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::symmetric(14, 9))
             .show(ui, |ui| {
                 ui.set_max_width((theme::READING_MAX * 0.78).max(220.0));
                 ui.add(
@@ -163,49 +162,16 @@ fn user_block(ui: &mut egui::Ui, text: &str) {
 fn assistant_block(
     ui: &mut egui::Ui,
     text: &str,
-    streaming: bool,
-    provider: &str,
+    _streaming: bool,
+    _provider: &str,
     cache: &mut MarkdownCache,
 ) {
-    ui.add_space(16.0);
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-        paint_agent_mark(ui, rect);
-        ui.add_space(2.0);
-        ui.label(
-            RichText::new(provider.to_uppercase())
-                .font(theme::semibold(10.0))
-                .color(theme::MUTED),
-        );
-        if streaming {
-            ui.label(
-                RichText::new("writing")
-                    .font(theme::ui(10.5))
-                    .color(theme::FAINT),
-            );
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("Copy")
-                            .font(theme::ui(10.5))
-                            .color(theme::FAINT),
-                    )
-                    .frame(false),
-                )
-                .clicked()
-            {
-                ui.ctx().copy_text(text.to_owned());
-            }
-        });
-    });
-    ui.add_space(6.0);
+    ui.add_space(14.0);
     ui.scope(|ui| {
         ui.style_mut().visuals.hyperlink_color = theme::BLUE;
         cache.show(ui, text);
     });
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 }
 
 fn thought_block(ui: &mut egui::Ui, text: &str, streaming: bool) {
@@ -382,7 +348,7 @@ pub fn pending_requests(
             && pending.contains_key(id)
         {
             ui.push_id(id, |ui| {
-                permission_block(ui, session, pending, online, entry, &mut actions)
+                permission_block(ui, session, pending, online, entry, &mut actions);
             });
         }
     }
