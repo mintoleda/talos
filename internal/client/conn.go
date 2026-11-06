@@ -9,8 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"golang.org/x/net/websocket"
-
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/transport"
 	"github.com/mintoleda/talos/internal/version"
@@ -129,15 +127,6 @@ func RunClientNetwork(ctx context.Context, network, address, token string) (*Cli
 	conn, err := net.Dial(network, address)
 	if err != nil {
 		return nil, nil, fmt.Errorf("no daemon at %s — start with 'talos serve': %w", address, err)
-	}
-	return runClientConn(ctx, conn, token)
-}
-
-// RunClientWebSocket dials a websocket URL.
-func RunClientWebSocket(ctx context.Context, url, token string) (*ClientConn, <-chan protocol.Event, error) {
-	conn, err := websocket.Dial(url, "", "http://localhost/")
-	if err != nil {
-		return nil, nil, fmt.Errorf("no websocket server at %s: %w", url, err)
 	}
 	return runClientConn(ctx, conn, token)
 }

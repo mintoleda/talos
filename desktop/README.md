@@ -7,7 +7,7 @@ The native Rust desktop for Talos: a polished `egui` interface and a provider-ne
 - **Talos is the primary backend**, launched as `talos acp` and driven over Agent Client Protocol (ACP).
 - **Claude Code is the only secondary provider**, connected through the official Claude Agent ACP adapter.
 - The desktop app, daemon, CLI, storage, provider supervision, and UI are implemented in Rust. The agent loop, tools, transcripts and safety policy stay in Go.
-- This app is intended to replace the Electron app in `../app/`; both coexist until the desktop reaches parity.
+- This is the desktop UI. The legacy Electron app has been removed; Node.js and npm are not required.
 - Existing `~/.paseo` data is treated as read-only until an explicit migration is run.
 
 See [`docs/PLAN.md`](docs/PLAN.md) for the backend-first, UI-last delivery sequence,

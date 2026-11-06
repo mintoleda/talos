@@ -13,7 +13,6 @@ import (
 type Discovery struct {
 	PID       int       `json:"pid"`
 	Socket    string    `json:"socket"`
-	WS        string    `json:"ws"`
 	Token     string    `json:"token"`
 	Version   string    `json:"version"`
 	StartedAt time.Time `json:"started_at"`

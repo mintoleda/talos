@@ -3,11 +3,11 @@
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                     cmd/talos                                  │
-│  main.go ── CLI flags, daemon mode, attach, one-shot          │
+│  main.go ── CLI flags, daemon mode, one-shot                  │
 │  app.go  ── session mgmt, Build(), engine wiring, MCP startup│
 └──────────┬───────────────────────────────────────────────────┘
            │
-           │  client.Engine interface (local or RemoteEngine)
+           │  client.Engine interface (in-process engine)
            │
 ┌──────────▼───────────────────────────────────────────────────┐
 │                      internal/tui                              │
@@ -46,7 +46,7 @@
                     │  server)     │
                     │ unix-socket  │
                     │ daemon       │
-                    │ attach client│
+                    │ RPC clients  │
                     └──────────────┘
 ```
 
@@ -54,7 +54,7 @@
 
 1. **`cmd/talos/`** wires everything together: parses CLI flags, loads config and auth, creates the provider, executor, MCP manager, engine, and session, then hands control to the TUI, one-shot renderer, or server.
 
-2. **`internal/tui/`** — Bubble Tea TUI with a chat pane (markdown rendering), tools pane, subagents pane, skill-completion support, and dialogs for login, confirm, plan review, model picking, and session picking. Communicates with the engine through the `client.Engine` interface. Worktree merge-back review lives in the Electron app (`merge.*` RPCs), not the TUI.
+2. **`internal/tui/`** — Bubble Tea TUI with a chat pane (markdown rendering), tools pane, subagents pane, skill-completion support, and dialogs for login, confirm, plan review, model picking, and session picking. Communicates with the engine through the `client.Engine` interface. The Go daemon retains worktree merge-back APIs (`merge.*` RPCs), but the legacy Electron merge-review UI has been removed; it is not part of the TUI.
 
 3. **`internal/loop/`** — drives the LLM conversation: builds requests from the system prompt + tool schemas + transcript via `PromptBuilder`, streams responses from the provider, assembles tool results back into messages, and compacts when context is near capacity.
 
@@ -66,11 +66,11 @@
 
 7. **`internal/session/`** — persists conversations as append-only JSONL transcripts with automatic compaction when the context window is nearly full.
 
-8. **`internal/server/`** — runs the loop as a Unix-socket daemon, allowing remote TUI clients to attach.
+8. **`internal/server/`** — runs the loop as a Unix-socket daemon for programmatic RPC clients. The TUI runs in-process; daemon attach and WebSocket transport have been removed.
 
 9. **`internal/engine/`** — the `Engine` struct that wraps `loop.Loop`, `Provider`, `Policy`, `MCPManager`, and `ClientManager` to expose the `client.Engine` interface. The central coordinator for both local TUI and daemon sessions.
 
-10. **`internal/client/`** — client-facing `Engine` interface and `RemoteEngine` (socket-backed) implementation, plus file resolution helpers (`ResolveInput`, `ListFiles`).
+10. **`internal/client/`** — TUI-facing `Engine` interface, Unix-socket daemon RPC client, and file resolution helpers (`ResolveInput`, `ListFiles`).
 
 11. **`internal/config/`** — file-based configuration (CORE.md, config.toml, auth.json, SYSTEM_PROMPT.md). no environment variables.
 
@@ -99,9 +99,9 @@
 | `internal/executor` | tool execution + permission gating |
 | `internal/tui` | Bubble Tea TUI (model, panes, dialogs, styles, markdown) |
 | `internal/engine` | Engine struct — wraps loop, provider, policy, MCP; satisfies client.Engine |
-| `internal/client` | client.Engine interface + RemoteEngine (socket-backed), file resolution |
+| `internal/client` | client.Engine interface, daemon RPC client, file resolution |
 | `internal/agents` | subagent definitions, builder, spawn (scout, researcher, worker) |
-| `internal/server` | unix-socket daemon, session manager, WebSocket |
+| `internal/server` | Unix-socket daemon, session manager |
 | `internal/mcp` | MCP protocol types, stdio/SSE transports, manager, tool bridge |
 | `internal/transport` | client/server wire message types |
 | `internal/config` | file-based config (CORE.md, config.toml, auth.json, SYSTEM_PROMPT.md) |

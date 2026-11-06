@@ -64,34 +64,18 @@ see [docs/configuration.md](docs/configuration.md) for the full config reference
 ./talos -r                       # pick a session to resume
 ./talos serve                    # multi-session daemon (foreground)
 ./talos serve -d                 # multi-session daemon (background)
-./talos attach                   # attach TUI to a running daemon
-./talos attach <session-id>      # attach to a specific session
 ./talos server list              # list running daemon
 ./talos server kill              # kill the daemon
 ./talos server help              # show server management commands
 ```
-
-### desktop app (Electron)
-
-The React UI lives under `app/renderer` (formerly `web/`). The Electron shell
-auto-discovers or spawns `talos serve -d`, then connects over WebSocket.
-
-```bash
-make talos          # build the Go binary
-cd app && npm install
-make app-dev        # electron-vite dev (builds ./talos first)
-make app            # production renderer/main bundles → app/out/
-```
-
-`talos serve` still serves the static UI from `app/out/renderer` when present
-(browser byproduct). The daemon keeps running after you quit the Electron window.
 
 ### native desktop (Rust, egui)
 
 `desktop/` is a Rust workspace containing a native `egui` desktop app, a local
 daemon/CLI, and storage. It drives Talos headlessly through `talos acp` (Agent
 Client Protocol over stdio), with Claude Code as the only secondary provider.
-It is intended to replace the Electron app once it reaches parity.
+It is the desktop UI; the legacy Electron app has been removed. Node.js and npm
+are not required for development.
 
 ```bash
 make desktop          # build ./talos, then run the desktop UI
@@ -108,38 +92,15 @@ See [desktop/README.md](desktop/README.md) and
 ./talos acp           # ACP v1 on stdio, for the desktop or any ACP client
 ```
 
-## server / attach workflow
+## sessions and daemon
 
-Run a long-lived daemon, then detach/reattach from any terminal:
+The TUI runs its engine in-process. Use `./talos -c` to continue the latest saved
+session or `./talos -r` to select one; attaching a TUI to a running daemon is no
+longer supported.
 
-```bash
-# Terminal 1: start the server (keeps your session + cache warm)
-./talos server &
-disown
-
-# Terminal 2, 3, ...: attach with the full TUI
-./talos attach
-
-# List or kill servers from anywhere
-./talos server list
-./talos server kill-all
-```
-
-The server auto-shuts down after 30 minutes of inactivity with no clients attached.
-Multi-client is fully supported — all attached clients see the same conversation
-and receive each others' inputs.
-
-### slash commands in attach mode
-
-Slash commands like `/model`, `/thinking`, and `/model <provider/model>`
-are forwarded to the server and executed there. All attached clients see
-the status bar update automatically.
-
-```
-/model                           # list available models
-/model opencode-go/deepseek-v4-flash # switch directly
-/thinking                        # cycle thinking level
-```
+`talos serve` retains the Go daemon's Unix-socket RPC API for programmatic
+clients. It has no WebSocket listener or web UI. The native desktop uses its own
+Rust daemon (`talosd`) and `talos acp`, not `talos serve`.
 
 ## slash commands
 

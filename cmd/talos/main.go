@@ -19,7 +19,6 @@ import (
 	"github.com/mintoleda/talos/internal/engine"
 	"github.com/mintoleda/talos/internal/jsonutil"
 	"github.com/mintoleda/talos/internal/memory"
-	"github.com/mintoleda/talos/internal/pricing"
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/provider"
 	"github.com/mintoleda/talos/internal/server"
@@ -92,11 +91,7 @@ func run() error {
 		case "serve":
 			return runServe(cfg, args[1:])
 		case "attach":
-			sid := ""
-			if len(args) > 1 {
-				sid = args[1]
-			}
-			return runAttach(context.Background(), cfg, sid)
+			return fmt.Errorf("attach has been removed; use -c or -r to resume a saved session, or use the native desktop")
 		case "server":
 			return runServerCmd(cfg, args[1:])
 		case "sessions":
@@ -351,14 +346,8 @@ func runDaemon(cfg *config.Config) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	if cfg.ServerListen == "" {
-		cfg.ServerListen = "ws:127.0.0.1:0"
-	}
 	idle := server.ResolveIdleTimeout(cfg)
 	d := server.NewDaemon(cfg, idle)
-	if webDir := findWebDist(); webDir != "" {
-		d.SetWebDir(webDir)
-	}
 	fmt.Fprintf(os.Stderr, "[daemon] idle timeout %v (0=never)\n", idle)
 	return d.Start(ctx)
 }
@@ -429,166 +418,6 @@ func dialDaemon(ctx context.Context, cfg *config.Config) (*client.ClientConn, <-
 	return client.RunClientNetwork(ctx, "unix", disc.Socket, token)
 }
 
-func runAttach(ctx context.Context, cfg *config.Config, sessionID string) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	clientConn, events, err := dialDaemon(ctx, cfg)
-	if err != nil {
-		return err
-	}
-
-	if sessionID == "" {
-		sessionID, err = pickDaemonSession(ctx, clientConn)
-		if err != nil {
-			return err
-		}
-	}
-	clientConn.Session = sessionID
-	if err := clientConn.Subscribe(sessionID); err != nil {
-		return fmt.Errorf("subscribe: %w", err)
-	}
-
-	prices := pricing.Load(cfg.BaseDir)
-	eng := client.NewRemoteEngine(clientConn, events)
-	eng.Session = sessionID
-	initialHistory, _ := eng.History()
-	inputTokens, outputTokens, cacheMiss, _, _, seedCost, _ := eng.Stats()
-
-	provider, model := cfg.Provider, cfg.Model
-	if listed, err := listSessionsRPC(ctx, clientConn); err == nil {
-		for _, s := range listed {
-			if s.ID == sessionID {
-				if s.Provider != "" {
-					provider = s.Provider
-				}
-				if s.Model != "" {
-					model = s.Model
-				}
-				break
-			}
-		}
-	}
-
-	initialCfg := tui.Config{
-		SessionID:      sessionID,
-		Mode:           tui.ModeSingleAgent,
-		InitialHistory: initialHistory,
-		Engine:         eng,
-		Shutdown:       cancel,
-		Provider:       provider,
-		Model:          model,
-		Pricing:        prices,
-		SeedStats: struct {
-			InputTokens  int
-			OutputTokens int
-			CacheMiss    int
-			Cost         float64
-		}{
-			InputTokens:  inputTokens,
-			OutputTokens: outputTokens,
-			CacheMiss:    cacheMiss,
-			Cost:         seedCost,
-		},
-	}
-
-	return tui.RunTabs(ctx, initialCfg, events, attachNewTab(ctx, cfg, sessionID, prices))
-}
-
-func listSessionsRPC(ctx context.Context, conn *client.ClientConn) ([]rpc.SessionInfo, error) {
-	raw, err := conn.Request(ctx, rpc.DaemonListSessions, nil)
-	if err != nil {
-		return nil, err
-	}
-	var listed rpc.ListSessionsResult
-	if err := json.Unmarshal(raw, &listed); err != nil {
-		return nil, err
-	}
-	return listed.Sessions, nil
-}
-
-func pickDaemonSession(ctx context.Context, conn *client.ClientConn) (string, error) {
-	sessions, err := listSessionsRPC(ctx, conn)
-	if err != nil {
-		return "", err
-	}
-	if len(sessions) == 0 {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return "", err
-		}
-		resp, err := conn.Request(ctx, rpc.DaemonCreateSession, rpc.CreateSessionParams{Dir: cwd})
-		if err != nil {
-			return "", fmt.Errorf("create session: %w", err)
-		}
-		var created rpc.CreateSessionResult
-		if err := json.Unmarshal(resp, &created); err != nil {
-			return "", err
-		}
-		fmt.Fprintf(os.Stderr, "[created session %s for %s]\n", created.Session.ID, cwd)
-		return created.Session.ID, nil
-	}
-	if len(sessions) == 1 {
-		return sessions[0].ID, nil
-	}
-	fmt.Fprintln(os.Stderr, "Sessions:")
-	for i, s := range sessions {
-		live := "unloaded"
-		if s.Live {
-			live = s.State
-		}
-		fmt.Fprintf(os.Stderr, "  %d: %s  %s  %s\n", i+1, s.ID, live, s.Dir)
-	}
-	fmt.Fprint(os.Stderr, "Pick a session [1]: ")
-	var choice int
-	if _, err := fmt.Scanln(&choice); err != nil || choice < 1 || choice > len(sessions) {
-		choice = 1
-	}
-	return sessions[choice-1].ID, nil
-}
-
-// attachNewTab opens a fresh daemon connection subscribed to the same session.
-func attachNewTab(ctx context.Context, cfg *config.Config, sessionID string, prices *pricing.Table) tui.NewTabFunc {
-	return func(tabCtx context.Context, tabID int) (tui.Config, <-chan protocol.Event, func(), error) {
-		tabCtx, cancel := context.WithCancel(tabCtx)
-		conn, evs, err := dialDaemon(tabCtx, cfg)
-		if err != nil {
-			cancel()
-			return tui.Config{}, nil, nil, err
-		}
-		conn.Session = sessionID
-		if err := conn.Subscribe(sessionID); err != nil {
-			cancel()
-			return tui.Config{}, nil, nil, err
-		}
-		eng := client.NewRemoteEngine(conn, evs)
-		eng.Session = sessionID
-		history, _ := eng.History()
-		in, out, miss, _, _, cost, _ := eng.Stats()
-		return tui.Config{
-			SessionID:      sessionID,
-			Mode:           tui.ModeSingleAgent,
-			Engine:         eng,
-			Shutdown:       cancel,
-			Provider:       cfg.Provider,
-			Model:          cfg.Model,
-			Pricing:        prices,
-			InitialHistory: history,
-			SeedStats: struct {
-				InputTokens  int
-				OutputTokens int
-				CacheMiss    int
-				Cost         float64
-			}{
-				InputTokens:  in,
-				OutputTokens: out,
-				CacheMiss:    miss,
-				Cost:         cost,
-			},
-		}, evs, cancel, nil
-	}
-}
-
 // pickSession lists this project's sessions and lets the user choose one,
 // falling back to the latest on empty input.
 func pickSession(cwd string) (session.Session, error) {
@@ -606,32 +435,6 @@ func pickSession(cwd string) (session.Session, error) {
 		return session.LatestSession(cwd)
 	}
 	return sessions[choice-1], nil
-}
-
-func findWebDist() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return ""
-	}
-	exe, err = filepath.EvalSymlinks(exe)
-	if err != nil {
-		return ""
-	}
-	dir := filepath.Dir(exe)
-	candidates := []string{
-		filepath.Join(dir, "app", "out", "renderer"),
-		filepath.Join(dir, "..", "app", "out", "renderer"),
-		filepath.Join(dir, "..", "..", "app", "out", "renderer"),
-		filepath.Join(dir, "app", "renderer", "dist"),
-		filepath.Join(dir, "..", "app", "renderer", "dist"),
-		filepath.Join(dir, "..", "..", "app", "renderer", "dist"),
-	}
-	for _, c := range candidates {
-		if info, err := os.Stat(filepath.Join(c, "index.html")); err == nil && !info.IsDir() {
-			return c
-		}
-	}
-	return ""
 }
 
 func runDream(cfg *config.Config, args []string) error {
