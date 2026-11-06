@@ -25,13 +25,14 @@ prerequisite that makes the desktop wait indefinitely.
 
 ## Backend implementation pass
 
-Implementation remains within P0/P1; P2–P4 are deferred, with desktop UI last.
-GPT-6 Luna (`xhigh`) completed the initial lifecycle/recovery pass and targeted
-independent reviews; DeepSeek Flash (`high`) completed keyed-acceptance concurrency
-and process/tool-lifecycle regression work. The orchestrator integrated their work
-and updated evidence below. Migration preflight remains safety hardening only; it
-does not advance or certify P3 feature parity. Fixture results do not close the P1
-live Talos or Claude Code gates.
+P0/P1 remain the acceptance baseline; non-UI P2 backend parity and part of P3
+migration/distribution have been implemented and fixture-verified. P4 desktop UI
+remains explicitly excluded. GPT-6 Luna (`xhigh`) completed scoped implementation
+and independent reviews; DeepSeek Flash (`high`) completed keyed-acceptance
+concurrency and process/tool-lifecycle regression work. The orchestrator integrated
+their work and updated evidence below. Project/workspace migration now advances a
+subset of P3, but does not certify complete migration parity. Fixture results do
+not close the P1 live Talos or Claude Code gates.
 
 Initial implementation pass, integrated and regression-tested:
 
@@ -67,7 +68,10 @@ Initial implementation pass, integrated and regression-tested:
 key/payload retries return the original run, while conflicting payloads fail. This
 is not exactly-once external execution; do not automatically retry unkeyed prompts
 after a lost response. See [the prompt-acceptance contract](architecture/prompt-acceptance.md).
-Automatic stale lock/socket removal remains intentionally unsupported.
+Daemon startup now recovers only a regular lock marker whose PID returns `ESRCH`
+and a Unix socket whose connection is refused; unknown/importer markers and live
+or unverifiable paths remain fail-closed. The persistent `talosd.guard` inode
+serializes concurrent starts without removing the importer's create-new marker.
 
 ### Installed Talos probe (no model calls)
 
@@ -150,6 +154,43 @@ verified for successful draining, not after that forced-abort deadline. Live Tal
 resume, Claude Code, desktop acceptance, P3 migration/distribution and full-workspace
 release gates remain unverified.
 
+### Explicit archival session-import follow-up (2026-11-05)
+
+Run from `desktop/`. The optional `--sessions-source` has no inferred default;
+the importer snapshots selected source files as bytes and never repairs or writes
+them. Supported message text and uniquely paired tool calls are imported into
+archived records; unknown/malformed records remain raw extensions, and validated
+inline PNG/JPEG/GIF/WebP payloads are copied by SHA-256 into private content-
+addressed storage. Folded archive messages are merged in archive order, then
+unmatched current-transcript order. Canonical JSON identity ignores whitespace
+and object-key order when removing pinned copies; per-source repeat counts remain
+intact, while identical turns across folds are recorded as ambiguous. Every
+physical archive/current record is retained byte-for-byte as base64 with raw
+SHA-256, line and byte offset provenance. Unknown and malformed archive records
+remain raw-only. Oversized or over-budget sessions are left wholly unimported.
+Imported sessions have no native provider handle or run IDs, and archived agents
+are rejected by both cached and provider-loading session paths.
+
+| Check | Result | Scope |
+|---|---|---|
+| `cargo test -p paseo-migrate -p paseo-migrate-cli --locked` | Pass: 57 tests | Migration fixtures, malformed/oversize bounds, canonical deduplication, provenance, source preservation and CLI kill/recovery/idempotency |
+| `cargo test -p talos-core -p talos-store --locked` | Pass: 67 tests | Core archived-agent refusal and store historical-import invariants, plus regressions |
+| `cargo test --workspace --locked` | Blocked by unrelated desktop compile errors | Missing `apps/talos-desktop/src/app/management.rs`, an existing backend pattern-match error and UI API errors |
+| `cargo test --workspace --exclude talos-desktop --locked` | Pass: 204 passed, 1 ignored | Full non-UI Rust workspace; Unix-socket daemon fixtures ran outside the sandbox |
+| `python3 scripts/talosd-smoke.py --timeout 120` | Pass | Fake-provider daemon/CLI process scenarios; temporary fixture state only |
+| Temporary `paseo-migrate` CLI apply twice | Pass: first imported 1 session; rerun imported 0 | Explicit temporary source/destination fixture; no real home |
+| `cargo clippy --workspace --all-targets --exclude talos-desktop --locked -- -D warnings` | Pass | Strict non-UI lint gate |
+| `rustfmt --edition 2024 --check` on migration sources and the CLI fixture | Pass | Formatting for this follow-up |
+| `cargo fmt --all -- --check` | Blocked by missing desktop module and formatting differences in other dirty files | Workspace-wide formatting check |
+| `git diff --check` | Pass | Current combined patch |
+
+No real legacy sessions source was available at the standard location, so no real
+data dry-run was performed. No provider, installed runtime or UI was accessed.
+The fixture acceptance does not verify every transcript variant, precise
+per-message timestamps, provider runtime state, non-inline attachments, legacy
+worktree reconstruction/state, plugins, or kill points beyond the covered journal
+and database recovery windows.
+
 ## Current implementation inventory
 
 | Area | Status / evidence | Remaining acceptance |
@@ -159,13 +200,13 @@ release gates remain unverified.
 | Core orchestration | Fixture-verified recovery, cancellation-safe lifecycle writes and durable keyed acceptance; core tests cover concurrent conflicts, restart/interrupted retries, dropped callers and shutdown draining | Live authenticated Talos and Claude Code acceptance; forced-abort shutdown after the drain deadline is not covered by the successful-drain guarantee |
 | Daemon / IPC | Fixture-verified commands and delivery: `apps/talosd/src/main.rs`, `crates/talos-ipc/tests/{protocol,reliability}.rs` cover scoped replay, truncation, clock rollback, fragmented input, lag and auth; combined process smoke passed 10/10 | Live-provider restart/resume and post-deadline forced-shutdown behavior |
 | CLI / provider config | Fixture-verified process workflow and keyed retries; CLI tests cover typed session cursors, multi-page follow and stalled-page rejection | Live-provider acceptance, automatic reconnect and config reload boundary remain open |
-| Projects / workspaces | Partial: workspace create/list/get/rename/archive/restore are fixture-verified through domain, SQLite, core, IPC, daemon and CLI; archiving rejects workspaces with active persisted runs and preserves IDs/history | Project CRUD/association, safe managed-worktree creation/deletion and persisted branch/ownership links |
+| Projects / workspaces | Partial: project CRUD/association and Talos-owned worktree create/delete are fixture-verified through SQLite, core, IPC, daemon and CLI; invalid names are rejected before Git creation, project ownership markers and dirty/untracked refusal are tested | Crash/interruption recovery around Git/store boundaries and actual systemd-user runtime acceptance |
 | Permissions / trust | Partial: durable timeline plus pending request/decision handlers and scoped fixture tests | Restart/timeout behavior must fail closed; stale decisions must not approve another run |
-| Usage / diagnostics | Partial: summaries and provider diagnostics have daemon fixture tests | Unknown usage/prices versus zero, aggregation/replay deduplication and redaction acceptance |
-| Attachments / output | Fixture-verified image prompt slice: MIME/path/size validation, content-addressed private storage, timeline references across restart, keyed retries and ACP capability gating through CLI/IPC | Attachment retrieval/display and legacy migration integrity; no UI work is included |
-| Terminals / scripts | Open PTY backend; script management deferred | Owned PTY lifecycle/input/resize/capture/cleanup with two-workspace isolation |
-| Legacy migration | Partial: `crates/paseo-migrate/src/lib.rs`; 22 tests cover dry-run/idempotent workspace-subset import, overlap/symlink/hardlink guards, WAL-aware snapshots, journaled retry and rollback | Real-data/source-hash workflow and kill/restart crash windows; sessions/history/attachments remain explicitly unsupported |
-| Packaging / settings | Partial: `.github/workflows/ci.yml`, `packaging/`, `docs/release/README.md` | Fresh-home install/upgrade/uninstall and config validation without modifying user data; no signed/cross-platform release claim |
+| Usage / diagnostics | Partial: provider usage remains nullable, CLI/IPC summary preserves unknown versus known zero, and cumulative snapshots are merged per run; summary is lifetime provider-reported subtotal, not an invoice or locally priced estimate | Coverage metadata for sessions without usage, provider-specific price tables, cross-provider billing semantics, and redaction acceptance |
+| Attachments / output | Fixture-verified image prompt slice: MIME/path/size validation, content-addressed private storage, timeline references across restart, keyed retries and ACP capability gating through CLI/IPC; validated inline historical images are fixture-tested | Attachment retrieval/display and non-inline legacy payload migration remain open; no UI work is included |
+| Terminals / scripts | Partial: owned PTY backend, workspace-scoped IPC/CLI, graceful cleanup, child cleanup after hard daemon death, and compiled-artifact stale lock/socket restart are fixture-verified | Runtime systemd-user cgroup acceptance and script management (deferred) |
+| Legacy migration | Partial: `crates/paseo-migrate` imports projects/workspaces plus explicitly selected `--sessions-source` history as archived agents/sessions; fixtures cover text, ordered tool pairing, inline-image hashes, canonical folded-history deduplication with raw provenance, bounded malformed/oversize handling, idempotency, source mutation/symlinks and process-kill recovery | No real home or provider was accessed; unsupported transcript/runtime state, non-inline attachments, legacy worktrees, plugins and desktop state remain unimported; other crash windows are open |
+| Packaging / settings | Fixture and local compiled-artifact acceptance cover fresh install, upgrade replacement, uninstall retention, stale daemon restart, symlink refusal, and packaged systemd directives in temporary homes | Live systemd-user manager acceptance and release archive publication; no signed/cross-platform release claim |
 | Desktop | Deferred, existing code retained in `apps/talos-desktop` | Fix failing test/lints/formatting, then connect verified backend contracts and perform visual/accessibility QA |
 | Remote / schedules / browser-MCP / voice / OS notifications / plugins / usage dashboards | Deferred broader parity | Separate acceptance work after the local release; see parity inventory |
 
@@ -240,17 +281,32 @@ and CLI can complete the vertical slice without the desktop.
 
 Depends on P1. Owners: domain/store/core plus daemon/IPC/CLI adapters.
 
-- [ ] Implement/verify project and workspace CRUD/archive/restore and managed
-  worktree ownership checks; never delete dirty or unmanaged checkouts.
+- [ ] Complete project/workspace parity. Projects have SQLite schema v3 CRUD and
+  durable workspace association; deletion refuses linked projects and association
+  paths are checked. Managed worktrees are created only under the Rust-owned daemon
+  home, retain project/repo/branch ownership metadata, validate Git roots/branches/
+  commits, refuse dirty or untracked deletion, and use non-forced `git worktree
+  remove`; active-run checks flow through workspace archive. Unit and compiled CLI
+  smoke fixtures pass. Crash interruption between Git and SQLite persistence and
+  restart reconciliation remain open; do not claim crash-safe worktree ownership.
 - [ ] Finish capability-driven model/mode/thinking controls and provider metadata
   round-trip, including explicit unsupported/unavailable errors.
 - [x] Implement image MIME/size/path checks, content-addressed durable storage,
   timeline-reference replay, keyed acceptance and provider capability rejection
   through CLI/IPC/ACP. Retrieval/display of stored files remains for UI integration.
-- [ ] Add owned PTY creation/list/input/resize/capture/kill; prove two-workspace
-  isolation and child cleanup without relying on a desktop terminal widget.
-- [ ] Expose history/search and basic usage through CLI/IPC; test unknown usage,
-  unknown prices and reconnect aggregation without double counting.
+- [x] Owned PTY backend and acceptance. `apps/talosd/src/terminal.rs` bounds
+  capture/input/dimensions, canonicalizes workspace-contained CWDs, and exposes
+  list/input/resize/capture/kill over workspace-scoped IPC/CLI. Unit and daemon
+  tests cover IO, resize, truncation, isolation, process-group kill and graceful
+  shutdown. Debug CLI smoke and the compiled release artifact acceptance both
+  verified descendant cleanup; the latter SIGKILLs the installed release daemon
+  and confirms its PTY child exits. The systemd service also explicitly uses
+  `KillMode=control-group`; actual systemd-user manager behavior is not exercised.
+- [ ] Complete usage parity. History/search and `talosdctl usage [--session ID]` are
+  exposed through CLI/IPC; absent provider metrics and prices remain JSON `null`,
+  never fabricated zeroes. Usage snapshots are consolidated per run before
+  aggregation, and repeated durable queries do not double count. Provider price
+  tables and cross-provider billed-cost semantics remain open.
 - [ ] Verify invalid config rejection, atomic persistence, redaction and a
   documented reload-versus-restart boundary.
 
@@ -258,21 +314,31 @@ History search is fixture-verified through SQLite, core, IPC, daemon, and
 `talosdctl history search`. It performs bounded, case-insensitive substring
 search over user/assistant text, supports an optional session and result limit,
 and reports `has_more`; it intentionally excludes tool payloads and has no
-continuation cursor. Usage semantics (unknown versus zero, pricing, and
-aggregation deduplication) remain open.
+continuation cursor. Usage summary is available through CLI/IPC. Unknown token
+counts/costs serialize as `null`, known zero as `0`; a missing metric in any
+usage-bearing run invalidates that aggregate rather than exposing a partial
+subtotal. Cumulative same-run snapshots are merged before totals, and repeated
+summary queries replay durable events without double counting. Costs are not
+estimated from an unverified pricing source; provider price tables remain open.
 
 Workspace lifecycle is fixture-verified through domain, SQLite, core, IPC,
 daemon, and CLI: rename/archive/restore preserve IDs and history, and archive
-rejects persisted active runs. Project association and safe managed-worktree
-creation/deletion remain open.
+rejects persisted active runs. Project CRUD and project/workspace association now
+have SQLite/core/IPC/CLI fixtures plus the compiled CLI scenario `python3
+scripts/talosd-smoke.py --scenario projects --verbose --timeout 90`; association
+outside a project root, deletion while linked, dirty/untracked worktree removal,
+and unmanaged checkout deletion are refused. Worktree create/delete and persistence
+boundaries still need interruption/restart recovery acceptance.
 
-Current backend verification from `desktop/`: `cargo test --workspace
---exclude talos-desktop --locked --no-fail-fast` passed (one opt-in smoke test
-ignored); strict non-desktop Clippy and `cargo fmt --all -- --check` passed after
-workspace, migration, search and image-attachment changes.
-These exclude the desktop UI only. The workspace UI/release gates have not been
-run as part of this non-UI workstream. Config validation and durable atomic
-writes have focused tests; reload-versus-restart behavior remains open.
+Current backend verification from `desktop/`: the non-UI workspace suite passes
+204 tests with one opt-in smoke test ignored, and strict non-desktop Clippy passes.
+`cargo fmt --all -- --check` remains blocked by the missing desktop management
+module and formatting differences in other dirty files; the migration sources
+and CLI fixture pass targeted `rustfmt --check`. Compiled release packaging
+acceptance and CLI projects/terminal scenarios are recorded under P3. The desktop
+UI/release gates have not been run as part of this non-UI workstream. Config
+validation and durable atomic writes have focused tests; reload-versus-restart
+behavior remains open.
 
 Exit: each local MVP requirement in the parity inventory has a non-UI test or
 recorded CLI acceptance result. Script management, forge automation and remote
@@ -287,21 +353,53 @@ Depends on P2. Owners: migration/storage and packaging/QA.
   rejects the legacy `~/.paseo` destination. No real `~/.paseo` data was read or
   modified.
 - [x] Add verified online SQLite destination snapshots and journaled retry/rollback
-  for the existing workspace-subset importer. Tests cover WAL snapshots, orphan
-  backup refresh, idempotent rerun, pending-import resume and rollback after a
-  conflicting import. Kill/restart crash-window acceptance remains open.
-- [ ] Preserve projects/workspaces, stable IDs, archives and ownership metadata;
-  import sessions/history and hashed attachments or label unsupported records
-  explicitly historical/read-only. Never claim a workspace-only import is parity.
-- [ ] Run corrupt/missing-file, archived/worktree and partial-import fixtures;
-  verify source hashes unchanged and no credentials/runtime/plugin execution.
-- [x] Add and run `python3 scripts/packaging-acceptance.py --verbose`: pass for
-  checksum-verified fixture archives, fresh install, upgrade, uninstall,
-  `.talosd`/`.paseo` and unrelated-file retention, and symlink refusal. This
-  CI packaging job uses stub executables; it does not test a compiled artifact
-  or real CLI workflow.
-- [ ] Install a compiled Linux release artifact and verify its real CLI workflow;
-  the current CI workflow does not assemble or upload a release archive.
+  for project/workspace inventory import. Tests cover WAL snapshots, orphan backup
+  refresh, idempotent rerun, old-journal compatibility, pending-import resume,
+  conflict rollback and source preservation. Kill/restart crash-window acceptance
+  remains open.
+- [x] Preserve projects/workspaces, stable IDs, workspace associations, archive
+  state and allowlisted worktree metadata. Legacy ownership markers remain provenance
+  only and never authorize deletion. Fixture tests verify source files remain
+  unchanged.
+- [x] Import supported session history only through explicit `--sessions-source`:
+  text, unique tool pairs, raw extension fallbacks and validated inline images are
+  fixture-tested as archived records with no native handles or runs. A pending
+  session journal resumes after database commit, and reruns remain idempotent.
+  Legacy agent configuration, provider/runtime state, unsupported transcript
+  semantics and non-inline attachments remain unimported.
+- [x] Exercise cross-process kill/restart recovery during session import with the
+  CLI fixture: kill after the pending session journal is durable while a SQLite
+  writer blocks the batch, then rerun and verify one archived session, one image,
+  preserved source bytes and an idempotent second run. Other kill points remain
+  open. No credentials/runtime/provider/plugin state is copied or executed.
+- [x] Run corrupt/missing-file, archived/worktree and partial-import fixtures;
+  verify fixture source hashes unchanged and no credentials/runtime/plugin execution.
+- [x] `python3 scripts/packaging-acceptance.py --verbose` passes checksum-verified
+  fixture install/upgrade/uninstall, data retention and symlink refusal. The
+  additional compiled release path described below validates real binaries and
+  CLI workflow locally; CI still runs fixture stubs.
+- [x] Build the current `talosd` and `talosdctl` release binaries and pass
+  `python3 scripts/packaging-acceptance.py --compiled-artifact --verbose`:
+  compiled install, project/worktree/CLI workflow, PTY descendant death, stale
+  lock/socket restart without manual removal, binary upgrade replacement,
+  uninstall, and daemon-data retention all passed in temporary directories. The
+  bundle included the pre-existing `target/release/talos-desktop` only to satisfy
+  package layout; the UI binary was not launched.
+- [ ] Rebuild the desktop release binary: `cargo build --release --locked -p
+  talosd -p talosdctl -p talos-desktop --bins` currently fails because the
+  in-progress UI source declares a missing `management` module and references
+  missing methods in `apps/talos-desktop/src/app.rs`. Those UI/worktree edits
+  were left untouched in this packaging task.
+- [ ] Exercise the unit under a live systemd-user manager. This environment
+  returns `/bin/bash: systemctl: command not found` (exit 127) for
+  `systemctl --user is-system-running`; no persistent user service was started
+  or changed. The package acceptance checks the installed unit directives only.
+- Focused daemon verification passed: `cargo test -p talosd --locked` (34 tests),
+  strict non-UI Clippy, and `cargo test --workspace --exclude talos-desktop --locked`
+  (204 passed, 1 ignored). Scoped daemon rustfmt, Python syntax, and
+  `git diff --check` passed. Full workspace fmt/Clippy/tests remain blocked by
+  incomplete desktop UI edits, which were left untouched here.
+- [x] The current CI workflow still does not assemble or upload a release archive.
 - [x] Update `docs/release/README.md` and `scripts/README.md` with the tested
   install/uninstall contract and its limits. Live desktop acceptance remains
   pending.
