@@ -18,13 +18,14 @@ use sha2::{Digest, Sha256};
 use talos_acp::{AcpEvent, SessionUpdateNotification};
 use talos_domain::{
     Agent, AgentId, AgentLifecycle, Attachment, DomainError, EventCursor, ModelRef, Notice,
-    PermissionOutcome, PermissionRequest, PermissionRequestId, PermissionRisk, ProviderDescriptor,
-    ProviderId, ProviderMode, RunId, RunLifecycle, Session, SessionId, SessionLifecycle,
-    TimelineEvent, TimelineEventKind, ToolCall, ToolStatus, Usage, Workspace, WorkspaceId,
-    WorkspaceKind, WorkspaceLifecycle,
+    PermissionOutcome, PermissionRequest, PermissionRequestId, PermissionRisk, Project, ProjectId,
+    ProviderDescriptor, ProviderId, ProviderMode, RunId, RunLifecycle, Session, SessionId,
+    SessionLifecycle, TimelineEvent, TimelineEventKind, ToolCall, ToolStatus, Usage, Workspace,
+    WorkspaceId, WorkspaceKind, WorkspaceLifecycle,
 };
 use talos_store::{
-    PromptRequestAcceptance, PromptRequestRecord, SessionSnapshot, WorkspaceArchiveResult,
+    ProjectDeleteResult, PromptRequestAcceptance, PromptRequestRecord, SessionSnapshot,
+    WorkspaceArchiveResult,
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,6 +59,10 @@ pub enum CoreError {
     ProviderUnavailable(String),
     #[error("workspace {0} was not found")]
     WorkspaceNotFound(WorkspaceId),
+    #[error("project {0} was not found")]
+    ProjectNotFound(ProjectId),
+    #[error("project {0} still has associated workspaces")]
+    ProjectHasWorkspaces(ProjectId),
     #[error("agent {0} was not found")]
     AgentNotFound(AgentId),
     #[error("session {0} was not found")]
@@ -72,6 +77,8 @@ pub enum CoreError {
     WorkspaceHasActiveRuns(WorkspaceId),
     #[error("workspace is archived and cannot start a new agent")]
     WorkspaceArchived,
+    #[error("archived agent {0} cannot create or load provider sessions")]
+    AgentArchived(AgentId),
     #[error("session {0} has no persisted provider-native session handle")]
     NativeSessionMissing(SessionId),
     #[error("session {0} is not loaded; call load_session before sending a prompt")]
@@ -106,6 +113,80 @@ pub enum CoreError {
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
+
+mod managed_worktrees;
+
+async fn git_output(directory: &Path, args: &[String]) -> CoreResult<std::process::Output> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .current_dir(directory)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true);
+    let child = command
+        .spawn()
+        .map_err(|error| CoreError::Other(format!("cannot start git: {error}")))?;
+    tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        .await
+        .map_err(|_| CoreError::Other("git operation exceeded 30 seconds".into()))?
+        .map_err(|error| CoreError::Other(format!("git operation failed: {error}")))
+}
+
+#[derive(Default)]
+struct UsageMetricAccumulator {
+    total: u64,
+    observed: bool,
+    complete: bool,
+}
+
+impl UsageMetricAccumulator {
+    fn record(&mut self, value: Option<u64>) {
+        if !self.observed {
+            self.observed = true;
+            self.complete = true;
+        }
+        if let Some(value) = value {
+            if let Some(total) = self.total.checked_add(value) {
+                self.total = total;
+            } else {
+                self.complete = false;
+            }
+        } else {
+            self.complete = false;
+        }
+    }
+
+    fn value(&self) -> Option<u64> {
+        (self.observed && self.complete).then_some(self.total)
+    }
+}
+
+fn merge_usage_snapshot(current: &mut Usage, update: &Usage) {
+    if update.input_tokens.is_some() {
+        current.input_tokens = update.input_tokens;
+    }
+    if update.output_tokens.is_some() {
+        current.output_tokens = update.output_tokens;
+    }
+    if update.cached_read_tokens.is_some() {
+        current.cached_read_tokens = update.cached_read_tokens;
+    }
+    if update.cached_write_tokens.is_some() {
+        current.cached_write_tokens = update.cached_write_tokens;
+    }
+    if update.context_used.is_some() {
+        current.context_used = update.context_used;
+    }
+    if update.context_size.is_some() {
+        current.context_size = update.context_size;
+    }
+    if update.cost_micros.is_some() {
+        current.cost_micros = update.cost_micros;
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CreatedAgent {
@@ -168,23 +249,27 @@ pub struct PendingPermissionSummary {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsageTotals {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_read_tokens: u64,
-    pub cached_write_tokens: u64,
-    pub cost_micros: u64,
+    /// `None` means no provider supplied this metric; `Some(0)` is a known zero.
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_read_tokens: Option<u64>,
+    pub cached_write_tokens: Option<u64>,
+    pub cost_micros: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionUsage {
     pub session_id: SessionId,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_read_tokens: u64,
-    pub cached_write_tokens: u64,
-    pub cost_micros: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_read_tokens: Option<u64>,
+    pub cached_write_tokens: Option<u64>,
+    pub cost_micros: Option<u64>,
 }
 
+/// Lifetime provider-reported usage over the persisted session set. Totals only
+/// include sessions with at least one usage event, so missing coverage is not a
+/// known zero; this is not a provider invoice or a locally priced estimate.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsageSummary {
     pub sessions: Vec<SessionUsage>,
@@ -228,6 +313,9 @@ struct Inner {
     /// `ShuttingDown` and the taken set is drained before the store closes.
     lifecycle_tasks: Mutex<Option<JoinSet<()>>>,
     run_start_gate: Mutex<()>,
+    worktree_gate: Mutex<()>,
+    #[cfg(test)]
+    worktree_fault: StdMutex<Option<&'static str>>,
     permission_start_gate: Mutex<()>,
     permissions: Mutex<HashMap<PermissionRequestId, PendingPermission>>,
     agent_updates: Mutex<()>,
@@ -274,6 +362,9 @@ impl AppService {
                 run_tasks: Mutex::new(HashMap::new()),
                 lifecycle_tasks: Mutex::new(Some(JoinSet::new())),
                 run_start_gate: Mutex::new(()),
+                worktree_gate: Mutex::new(()),
+                #[cfg(test)]
+                worktree_fault: StdMutex::new(None),
                 permission_start_gate: Mutex::new(()),
                 permissions: Mutex::new(HashMap::new()),
                 agent_updates: Mutex::new(()),
@@ -285,6 +376,7 @@ impl AppService {
             }),
         };
         service.recover_durable_state().await?;
+        service.recover_managed_worktrees().await?;
         Ok(service)
     }
 
@@ -443,6 +535,124 @@ impl AppService {
             .collect()
     }
 
+    pub async fn create_project(
+        &self,
+        name: impl Into<String>,
+        root_path: impl AsRef<Path>,
+    ) -> CoreResult<Project> {
+        self.ensure_running()?;
+        let requested = root_path.as_ref();
+        let canonical = tokio::fs::canonicalize(requested)
+            .await
+            .map_err(|_| CoreError::InvalidWorkspacePath(requested.display().to_string()))?;
+        if !tokio::fs::metadata(&canonical).await?.is_dir() {
+            return Err(CoreError::InvalidWorkspacePath(
+                canonical.display().to_string(),
+            ));
+        }
+        let project = Project::new(name, canonical.to_string_lossy())
+            .map_err(|error| CoreError::Other(error.to_string()))?;
+        let save = project.clone();
+        self.inner
+            .store
+            .run(move |store| store.save_project(&save))
+            .await
+            .map_err(CoreError::Store)?;
+        Ok(project)
+    }
+
+    pub async fn list_projects(&self) -> CoreResult<Vec<Project>> {
+        self.inner
+            .store
+            .run(|store| store.list_projects())
+            .await
+            .map_err(CoreError::Store)
+    }
+
+    pub async fn project(&self, id: ProjectId) -> CoreResult<Project> {
+        self.inner
+            .store
+            .run(move |store| store.project(id))
+            .await
+            .map_err(CoreError::Store)?
+            .ok_or(CoreError::ProjectNotFound(id))
+    }
+
+    pub async fn rename_project(
+        &self,
+        id: ProjectId,
+        name: impl Into<String>,
+    ) -> CoreResult<Project> {
+        self.ensure_running()?;
+        let name = name.into();
+        let mut candidate = self.project(id).await?;
+        candidate
+            .rename(name.clone())
+            .map_err(|error| CoreError::Other(error.to_string()))?;
+        self.inner
+            .store
+            .run(move |store| store.rename_project(id, name))
+            .await
+            .map_err(CoreError::Store)?
+            .ok_or(CoreError::ProjectNotFound(id))
+    }
+
+    pub async fn delete_project(&self, id: ProjectId) -> CoreResult<()> {
+        self.ensure_running()?;
+        match self
+            .inner
+            .store
+            .run(move |store| store.delete_project(id))
+            .await
+            .map_err(CoreError::Store)?
+        {
+            ProjectDeleteResult::Deleted => Ok(()),
+            ProjectDeleteResult::NotFound => Err(CoreError::ProjectNotFound(id)),
+            ProjectDeleteResult::AssociatedWorkspaces => Err(CoreError::ProjectHasWorkspaces(id)),
+        }
+    }
+
+    pub async fn set_workspace_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: Option<ProjectId>,
+    ) -> CoreResult<Workspace> {
+        self.ensure_running()?;
+        let workspace = self.workspace(workspace_id).await?;
+        if workspace.metadata.get("managedWorktree").is_some() && workspace.project_id != project_id
+        {
+            return Err(CoreError::Other(
+                "managed worktree project ownership cannot be changed".into(),
+            ));
+        }
+        if let Some(project_id) = project_id {
+            let project = self.project(project_id).await?;
+            let workspace_path = tokio::fs::canonicalize(&workspace.path)
+                .await
+                .map_err(|_| CoreError::InvalidWorkspacePath(workspace.path.clone()))?;
+            let project_path = tokio::fs::canonicalize(&project.root_path)
+                .await
+                .map_err(|_| CoreError::InvalidWorkspacePath(project.root_path.clone()))?;
+            let managed_worktree_root_matches = workspace
+                .metadata
+                .get("mainRepoRoot")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .is_some_and(|path| path == project_path);
+            if !workspace_path.starts_with(&project_path) && !managed_worktree_root_matches {
+                return Err(CoreError::Other(
+                    "workspace is outside the project root".into(),
+                ));
+            }
+        }
+        self.inner
+            .store
+            .run(move |store| store.set_workspace_project(workspace_id, project_id))
+            .await
+            .map_err(CoreError::Store)?
+            .ok_or(CoreError::WorkspaceNotFound(workspace_id))
+    }
+
     pub async fn create_workspace(
         &self,
         name: impl Into<String>,
@@ -524,7 +734,15 @@ impl AppService {
     }
 
     pub async fn restore_workspace(&self, id: WorkspaceId) -> CoreResult<Workspace> {
+        // Keep lock order aligned with managed deletion (worktree gate, then
+        // run-start gate) so restore cannot race a Git removal.
+        let _worktree_guard = self.inner.worktree_gate.lock().await;
+        let _start_guard = self.inner.run_start_gate.lock().await;
         self.ensure_running()?;
+        let workspace = self.workspace(id).await?;
+        if workspace.metadata.get("managedWorktree").is_some() {
+            self.validate_managed_worktree_restore(&workspace).await?;
+        }
         self.inner
             .store
             .run(move |store| store.restore_workspace(id))
@@ -600,6 +818,9 @@ impl AppService {
         let _start_guard = self.inner.run_start_gate.lock().await;
         self.ensure_running()?;
         let agent = self.agent(agent_id).await?;
+        if agent.lifecycle == AgentLifecycle::Archived {
+            return Err(CoreError::AgentArchived(agent_id));
+        }
         let workspace = self.workspace(agent.workspace_id).await?;
         if workspace.lifecycle != WorkspaceLifecycle::Active {
             return Err(CoreError::WorkspaceArchived);
@@ -700,13 +921,22 @@ impl AppService {
         let _start_guard = self.inner.run_start_gate.lock().await;
         self.ensure_running()?;
         if self.inner.sessions.read().await.contains_key(&session_id) {
-            return self
+            let session = self
                 .inner
                 .store
                 .run(move |store| store.session(session_id))
                 .await
                 .map_err(CoreError::Store)?
                 .ok_or(CoreError::SessionNotFound(session_id));
+            let session = session?;
+            let agent = self.agent(session.agent_id).await?;
+            if agent.lifecycle == AgentLifecycle::Archived {
+                return Err(CoreError::AgentArchived(agent.id));
+            }
+            if self.workspace(agent.workspace_id).await?.lifecycle != WorkspaceLifecycle::Active {
+                return Err(CoreError::WorkspaceArchived);
+            }
+            return Ok(session);
         }
         let session = self
             .inner
@@ -716,7 +946,13 @@ impl AppService {
             .map_err(CoreError::Store)?
             .ok_or(CoreError::SessionNotFound(session_id))?;
         let agent = self.agent(session.agent_id).await?;
+        if agent.lifecycle == AgentLifecycle::Archived {
+            return Err(CoreError::AgentArchived(agent.id));
+        }
         let workspace = self.workspace(agent.workspace_id).await?;
+        if workspace.lifecycle != WorkspaceLifecycle::Active {
+            return Err(CoreError::WorkspaceArchived);
+        }
         let native = session
             .provider_session_id
             .clone()
@@ -899,6 +1135,10 @@ impl AppService {
             .get(&session_id)
             .cloned()
             .ok_or(CoreError::SessionNotLoaded(session_id))?;
+        if self.workspace(runtime.agent.workspace_id).await?.lifecycle != WorkspaceLifecycle::Active
+        {
+            return Err(CoreError::WorkspaceArchived);
+        }
         if !prepared_images.is_empty() && !runtime.provider.capabilities().images {
             return Err(CoreError::ImagePromptUnsupported);
         }
@@ -1380,8 +1620,8 @@ impl AppService {
             && let Some(usage) = &outcome.usage
         {
             let usage = Usage {
-                input_tokens: Some(usage.input_tokens),
-                output_tokens: Some(usage.output_tokens),
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
                 cached_read_tokens: usage.cached_read_tokens,
                 cached_write_tokens: usage.cached_write_tokens,
                 context_used: None,
@@ -1578,7 +1818,14 @@ impl AppService {
         let model = ModelRef::new(runtime.agent.provider.clone(), model_id.clone())
             .map_err(|error| CoreError::Other(error.to_string()))?;
         let advertised = runtime.provider.models();
-        if !advertised.is_empty() && !advertised.iter().any(|model| model.model_id == model_id) {
+        if advertised.is_empty() {
+            return Err(ProviderError::Unsupported {
+                provider: runtime.agent.provider.to_string(),
+                feature: "model catalogue",
+            }
+            .into());
+        }
+        if !advertised.iter().any(|model| model.model_id == model_id) {
             return Err(ProviderError::InvalidOption {
                 provider: runtime.agent.provider.to_string(),
                 feature: "model selection",
@@ -1628,7 +1875,14 @@ impl AppService {
             .into());
         }
         let advertised = runtime.provider.modes();
-        if !advertised.is_empty() && !advertised.iter().any(|mode| mode.id == mode_id) {
+        if advertised.is_empty() {
+            return Err(ProviderError::Unsupported {
+                provider: runtime.agent.provider.to_string(),
+                feature: "mode catalogue",
+            }
+            .into());
+        }
+        if !advertised.iter().any(|mode| mode.id == mode_id) {
             return Err(ProviderError::InvalidOption {
                 provider: runtime.agent.provider.to_string(),
                 feature: "mode selection",
@@ -1670,6 +1924,13 @@ impl AppService {
             .into());
         }
         let advertised = runtime.provider.config_options();
+        if advertised.is_empty() {
+            return Err(ProviderError::Unsupported {
+                provider: runtime.agent.provider.to_string(),
+                feature: "configuration option catalogue",
+            }
+            .into());
+        }
         if let Some(option) = advertised.iter().find(|option| option.id == option_id) {
             if !option.options.is_empty()
                 && !option
@@ -1684,7 +1945,7 @@ impl AppService {
                 }
                 .into());
             }
-        } else if !advertised.is_empty() {
+        } else {
             return Err(ProviderError::InvalidOption {
                 provider: runtime.agent.provider.to_string(),
                 feature: "configuration",
@@ -2033,7 +2294,9 @@ impl AppService {
         Ok(())
     }
 
-    /// Aggregate billed token/cost usage from the durable timeline.
+    /// Summarize provider-reported usage from the durable timeline. Cost is
+    /// never inferred from local price tables; global totals are lifetime
+    /// subtotals over sessions with usage observations, not billing statements.
     pub async fn usage_summary(&self, session_id: Option<SessionId>) -> CoreResult<UsageSummary> {
         self.ensure_running()?;
         let sessions = if let Some(session_id) = session_id {
@@ -2049,11 +2312,21 @@ impl AppService {
             self.all_sessions().await?
         };
         let mut summary = UsageSummary::default();
+        let mut totals_input = UsageMetricAccumulator::default();
+        let mut totals_output = UsageMetricAccumulator::default();
+        let mut totals_cached_read = UsageMetricAccumulator::default();
+        let mut totals_cached_write = UsageMetricAccumulator::default();
+        let mut totals_cost = UsageMetricAccumulator::default();
         for session in sessions {
             let mut usage = SessionUsage {
                 session_id: session.id,
                 ..SessionUsage::default()
             };
+            // Provider usage notifications can be cumulative snapshots within a run.
+            // Keep the latest supplied value per run so reconnect/replay cannot sum
+            // repeated snapshots as if they were independent bills.
+            let mut run_usage = HashMap::<RunId, Usage>::new();
+            let mut unscoped_usage = Vec::new();
             let mut cursor = None;
             loop {
                 let page = self.replay_events(session.id, cursor, 10_000).await?;
@@ -2063,11 +2336,11 @@ impl AppService {
                 });
                 for event in page {
                     if let TimelineEventKind::Usage(record) = event.kind {
-                        usage.input_tokens += record.input_tokens.unwrap_or(0);
-                        usage.output_tokens += record.output_tokens.unwrap_or(0);
-                        usage.cached_read_tokens += record.cached_read_tokens.unwrap_or(0);
-                        usage.cached_write_tokens += record.cached_write_tokens.unwrap_or(0);
-                        usage.cost_micros += record.cost_micros.unwrap_or(0);
+                        if let Some(run_id) = event.run_id {
+                            merge_usage_snapshot(run_usage.entry(run_id).or_default(), &record);
+                        } else {
+                            unscoped_usage.push(record);
+                        }
                     }
                 }
                 if count < 10_000 {
@@ -2075,13 +2348,46 @@ impl AppService {
                 }
                 cursor = next_cursor;
             }
-            summary.totals.input_tokens += usage.input_tokens;
-            summary.totals.output_tokens += usage.output_tokens;
-            summary.totals.cached_read_tokens += usage.cached_read_tokens;
-            summary.totals.cached_write_tokens += usage.cached_write_tokens;
-            summary.totals.cost_micros += usage.cost_micros;
+            let records = run_usage
+                .into_values()
+                .chain(unscoped_usage)
+                .collect::<Vec<_>>();
+            let mut input = UsageMetricAccumulator::default();
+            let mut output = UsageMetricAccumulator::default();
+            let mut cached_read = UsageMetricAccumulator::default();
+            let mut cached_write = UsageMetricAccumulator::default();
+            let mut cost = UsageMetricAccumulator::default();
+            for record in &records {
+                input.record(record.input_tokens);
+                output.record(record.output_tokens);
+                cached_read.record(record.cached_read_tokens);
+                cached_write.record(record.cached_write_tokens);
+                cost.record(record.cost_micros);
+            }
+            usage.input_tokens = input.value();
+            usage.output_tokens = output.value();
+            usage.cached_read_tokens = cached_read.value();
+            usage.cached_write_tokens = cached_write.value();
+            usage.cost_micros = cost.value();
+            // Sessions without any usage observation do not poison global totals.
+            // A usage-bearing run with a missing metric does: displaying a known
+            // subtotal as a complete total would be misleading.
+            if !records.is_empty() {
+                totals_input.record(usage.input_tokens);
+                totals_output.record(usage.output_tokens);
+                totals_cached_read.record(usage.cached_read_tokens);
+                totals_cached_write.record(usage.cached_write_tokens);
+                totals_cost.record(usage.cost_micros);
+            }
             summary.sessions.push(usage);
         }
+        summary.totals = UsageTotals {
+            input_tokens: totals_input.value(),
+            output_tokens: totals_output.value(),
+            cached_read_tokens: totals_cached_read.value(),
+            cached_write_tokens: totals_cached_write.value(),
+            cost_micros: totals_cost.value(),
+        };
         Ok(summary)
     }
 
@@ -2181,6 +2487,7 @@ impl AppService {
     async fn shutdown_inner(&self) {
         self.inner.shutdown.cancel();
         {
+            let _worktree_guard = self.inner.worktree_gate.lock().await;
             let _start_guard = self.inner.run_start_gate.lock().await;
             let _permission_guard = self.inner.permission_start_gate.lock().await;
         }
@@ -3759,6 +4066,175 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Keep one end-to-end managed-worktree lifecycle regression together.
+    async fn managed_worktrees_are_owned_and_dirty_checkouts_are_never_removed() {
+        use std::process::Command as ProcessCommand;
+
+        let home = TestHome::new();
+        let repo = home.root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = ProcessCommand::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet", "-b", "main"]);
+        git(&["config", "user.name", "Talos Test"]);
+        git(&["config", "user.email", "talos-test@example.invalid"]);
+        std::fs::write(repo.join("tracked.txt"), "clean\\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+
+        let service = AppService::open_at(home.home()).await.unwrap();
+        let project = service.create_project("Test project", &repo).await.unwrap();
+        assert!(
+            service
+                .create_managed_worktree(
+                    project.id,
+                    "",
+                    "feature/invalid-name".into(),
+                    "HEAD".into(),
+                )
+                .await
+                .is_err()
+        );
+        let invalid_branch = ProcessCommand::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/feature/invalid-name",
+            ])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert_eq!(invalid_branch.status.code(), Some(1));
+        let worktrees = ProcessCommand::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(worktrees.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&worktrees.stdout)
+                .lines()
+                .filter(|line| line.starts_with("worktree "))
+                .count(),
+            1
+        );
+        assert_eq!(service.list_workspaces().await.unwrap().len(), 0);
+        assert!(
+            service
+                .create_managed_worktree(project.id, "Invalid", "bad..branch".into(), "HEAD".into())
+                .await
+                .is_err()
+        );
+        let workspace = service
+            .create_managed_worktree(
+                project.id,
+                "Feature",
+                "feature/talos-test".into(),
+                "HEAD".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(workspace.kind, WorkspaceKind::Worktree);
+        assert_eq!(workspace.project_id, Some(project.id));
+        let original_marker_project = workspace.metadata["managedWorktree"]["projectId"].clone();
+        let mut tampered = workspace.clone();
+        tampered.metadata["managedWorktree"]["projectId"] = json!(ProjectId::new());
+        service
+            .inner
+            .store
+            .run(move |store| store.save_workspace(&tampered))
+            .await
+            .unwrap();
+        let ownership_error = service
+            .delete_managed_worktree(workspace.id)
+            .await
+            .unwrap_err();
+        assert!(ownership_error.to_string().contains("ownership metadata"));
+        assert!(Path::new(&workspace.path).is_dir());
+        assert_eq!(
+            service.workspace(workspace.id).await.unwrap().lifecycle,
+            WorkspaceLifecycle::Active
+        );
+        let mut repaired = service.workspace(workspace.id).await.unwrap();
+        repaired.metadata["managedWorktree"]["projectId"] = original_marker_project;
+        service
+            .inner
+            .store
+            .run(move |store| store.save_workspace(&repaired))
+            .await
+            .unwrap();
+        assert!(
+            service
+                .create_managed_worktree(
+                    project.id,
+                    "Duplicate",
+                    "feature/talos-test".into(),
+                    "HEAD".into()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&workspace.path).join("tracked.txt")).unwrap(),
+            "clean\\n"
+        );
+        assert_eq!(
+            service
+                .set_workspace_project(workspace.id, Some(project.id))
+                .await
+                .unwrap()
+                .project_id,
+            Some(project.id)
+        );
+
+        let dirty = Path::new(&workspace.path).join("untracked.txt");
+        std::fs::write(&dirty, "keep me").unwrap();
+        assert!(service.delete_managed_worktree(workspace.id).await.is_err());
+        assert_eq!(std::fs::read_to_string(dirty).unwrap(), "keep me");
+        assert_eq!(
+            service.workspace(workspace.id).await.unwrap().lifecycle,
+            WorkspaceLifecycle::Active
+        );
+        std::fs::remove_file(Path::new(&workspace.path).join("untracked.txt")).unwrap();
+
+        let removed = service.delete_managed_worktree(workspace.id).await.unwrap();
+        assert_eq!(removed.lifecycle, WorkspaceLifecycle::Archived);
+        assert!(!Path::new(&workspace.path).exists());
+        let unmanaged_path = home.root.join("unmanaged-worktree");
+        std::fs::create_dir(&unmanaged_path).unwrap();
+        let unmanaged = service
+            .create_workspace("Unmanaged", &unmanaged_path, WorkspaceKind::Worktree)
+            .await
+            .unwrap();
+        assert!(service.delete_managed_worktree(unmanaged.id).await.is_err());
+        service.shutdown().await;
+    }
+
+    #[test]
+    fn usage_metrics_preserve_known_zero_and_fail_closed_on_partial_totals() {
+        let mut known_zero = UsageMetricAccumulator::default();
+        known_zero.record(Some(0));
+        assert_eq!(known_zero.value(), Some(0));
+
+        let mut incomplete = UsageMetricAccumulator::default();
+        incomplete.record(Some(12));
+        incomplete.record(None);
+        assert_eq!(incomplete.value(), None);
+    }
+
+    #[tokio::test]
     async fn workspace_lifecycle_preserves_sessions_and_rejects_active_runs() {
         let home = TestHome::new();
         let (service, session_id, _provider) = fixture_service_with_provider(&home).await;
@@ -3809,6 +4285,16 @@ mod tests {
 
         let archived = service.archive_workspace(original.id).await.unwrap();
         assert_eq!(archived.lifecycle, WorkspaceLifecycle::Archived);
+        assert!(matches!(
+            service
+                .send_prompt(session_id, "blocked after archive")
+                .await,
+            Err(CoreError::WorkspaceArchived)
+        ));
+        assert!(matches!(
+            service.load_session(session_id).await,
+            Err(CoreError::WorkspaceArchived)
+        ));
         let restored = service.restore_workspace(original.id).await.unwrap();
         assert_eq!(restored.lifecycle, WorkspaceLifecycle::Active);
         assert_eq!(restored.id, original.id);
@@ -3820,6 +4306,61 @@ mod tests {
                 .session,
             session
         );
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn archived_agent_cannot_create_or_load_provider_sessions() {
+        let home = TestHome::new();
+        let (service, session_id, provider) = fixture_service_with_provider(&home).await;
+        let agent_id = service
+            .session_snapshot(session_id, 1)
+            .await
+            .unwrap()
+            .session
+            .agent_id;
+        let mut agent = service.agent(agent_id).await.unwrap();
+        agent.lifecycle = AgentLifecycle::Archived;
+        let saved_agent = agent.clone();
+        service
+            .inner
+            .store
+            .run(move |store| store.save_agent(&saved_agent))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service.create_session(agent_id).await,
+            Err(CoreError::AgentArchived(id)) if id == agent_id
+        ));
+        assert!(matches!(
+            service.load_session(session_id).await,
+            Err(CoreError::AgentArchived(id)) if id == agent_id
+        ));
+        // Exercise the uncached historical-import path too: no native handle,
+        // archived session, and no provider resume/create call may be attempted.
+        if let Some(runtime) = service.inner.sessions.write().await.remove(&session_id)
+            && let Some(task) = runtime.event_task.lock().await.take()
+        {
+            task.abort();
+        }
+        service
+            .inner
+            .store
+            .run(move |store| {
+                let mut session = store.session(session_id)?.unwrap();
+                session.lifecycle = SessionLifecycle::Archived;
+                session.provider_session_id = None;
+                store.save_session(&session)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.load_session(session_id).await,
+            Err(CoreError::AgentArchived(id)) if id == agent_id
+        ));
+        assert_eq!(provider.next_session.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(provider.prompts.load(AtomicOrdering::Relaxed), 0);
         service.shutdown().await;
     }
 

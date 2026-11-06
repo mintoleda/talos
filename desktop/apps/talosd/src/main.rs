@@ -9,24 +9,24 @@ use std::{
 use serde_json::{Value, json};
 use talos_core::{AppService, CoreError, HomePaths, ProviderDiagnostic, ProviderError};
 use talos_domain::{
-    AgentId, EventCursor, PermissionRequestId, ProviderId, RunLifecycle, Session, SessionId,
-    TimelineEvent, TimelineEventKind, WorkspaceId, WorkspaceKind,
+    AgentId, EventCursor, PermissionRequestId, ProjectId, ProviderId, RunLifecycle, Session,
+    SessionId, TimelineEvent, TimelineEventKind, WorkspaceId, WorkspaceKind, WorkspaceLifecycle,
 };
 use talos_ipc::{
     Command, EventNotification, PROTOCOL_VERSION, PermissionDecision, RpcError, WireEvent,
     serve_connection_with_events,
 };
-use tokio::{io::AsyncWriteExt, net::UnixListener, sync::Notify, sync::broadcast};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Mutex, Notify, broadcast},
+};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-struct InstanceLock(PathBuf);
-
-impl Drop for InstanceLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+mod instance;
+mod terminal;
+use instance::InstanceGuard;
+use terminal::TerminalManager;
 
 #[derive(Clone)]
 struct Daemon {
@@ -34,6 +34,8 @@ struct Daemon {
     service: AppService,
     event_tx: broadcast::Sender<EventNotification>,
     shutdown: Arc<Notify>,
+    terminals: TerminalManager,
+    terminal_workspace_gate: Arc<Mutex<()>>,
 }
 
 impl Daemon {
@@ -50,6 +52,8 @@ impl Daemon {
             service,
             event_tx: event_tx.clone(),
             shutdown,
+            terminals: TerminalManager::new(),
+            terminal_workspace_gate: Arc::new(Mutex::new(())),
         };
         let bridge = tokio::spawn(async move {
             loop {
@@ -71,6 +75,7 @@ impl Daemon {
         (daemon, bridge)
     }
 
+    #[allow(clippy::too_many_lines)] // Central exhaustive IPC dispatch keeps wire handling auditable.
     async fn command(&self, command: Command) -> Result<Value, RpcError> {
         match command {
             Command::Hello { .. } => Err(RpcError::new(-32600, "hello must be first")),
@@ -87,6 +92,34 @@ impl Daemon {
             }
             Command::RestoreWorkspace { workspace_id } => {
                 self.restore_workspace(&workspace_id).await
+            }
+            Command::CreateProject { name, root_path } => {
+                self.create_project(name, root_path).await
+            }
+            Command::ListProjects => self.list_projects().await,
+            Command::GetProject { project_id } => self.get_project(&project_id).await,
+            Command::RenameProject { project_id, name } => {
+                self.rename_project(&project_id, name).await
+            }
+            Command::DeleteProject { project_id } => self.delete_project(&project_id).await,
+            Command::SetWorkspaceProject {
+                workspace_id,
+                project_id,
+            } => {
+                self.set_workspace_project(&workspace_id, project_id.as_deref())
+                    .await
+            }
+            Command::CreateManagedWorktree {
+                project_id,
+                name,
+                branch,
+                base_ref,
+            } => {
+                self.create_managed_worktree(&project_id, name, branch, base_ref)
+                    .await
+            }
+            Command::DeleteManagedWorktree { workspace_id } => {
+                self.delete_managed_worktree(&workspace_id).await
             }
             Command::ListProviders => Ok(serialize_provider_diagnostics(
                 &self.service.provider_diagnostics().await,
@@ -165,7 +198,147 @@ impl Daemon {
                 self.search_timeline(query, session_id.as_deref(), limit)
                     .await
             }
+            Command::CreateTerminal {
+                workspace_id,
+                cwd,
+                program,
+                args,
+                rows,
+                cols,
+            } => {
+                self.create_terminal(&workspace_id, cwd.as_deref(), &program, &args, rows, cols)
+                    .await
+            }
+            Command::ListTerminals { workspace_id } => self.list_terminals(&workspace_id).await,
+            Command::TerminalInput {
+                workspace_id,
+                terminal_id,
+                data,
+            } => self.terminal_input(&workspace_id, &terminal_id, &data),
+            Command::ResizeTerminal {
+                workspace_id,
+                terminal_id,
+                rows,
+                cols,
+            } => self.resize_terminal(&workspace_id, &terminal_id, rows, cols),
+            Command::CaptureTerminal {
+                workspace_id,
+                terminal_id,
+                limit,
+            } => self.capture_terminal(&workspace_id, &terminal_id, limit),
+            Command::KillTerminal {
+                workspace_id,
+                terminal_id,
+            } => self.kill_terminal(&workspace_id, &terminal_id),
         }
+    }
+
+    async fn create_terminal(
+        &self,
+        workspace_value: &str,
+        cwd: Option<&str>,
+        program: &str,
+        args: &[String],
+        rows: u16,
+        cols: u16,
+    ) -> Result<Value, RpcError> {
+        let _workspace_operation = self.terminal_workspace_gate.lock().await;
+        let workspace_id = parse_id::<WorkspaceId>(workspace_value)?;
+        let workspace = self
+            .service
+            .workspace(workspace_id)
+            .await
+            .map_err(map_core_error)?;
+        if workspace.lifecycle != WorkspaceLifecycle::Active {
+            return Err(RpcError::new(-32020, "workspace is not active"));
+        }
+        let terminal = self
+            .terminals
+            .create(
+                workspace_id.to_string(),
+                Path::new(&workspace.path),
+                cwd.map(Path::new),
+                program,
+                args,
+                rows,
+                cols,
+            )
+            .map_err(|error| terminal_rpc_error(error.to_string()))?;
+        serialize(terminal)
+    }
+
+    async fn list_terminals(&self, workspace_value: &str) -> Result<Value, RpcError> {
+        let workspace_id = parse_id::<WorkspaceId>(workspace_value)?;
+        self.service
+            .workspace(workspace_id)
+            .await
+            .map_err(map_core_error)?;
+        serialize(
+            self.terminals
+                .list(&workspace_id.to_string())
+                .map_err(|error| terminal_rpc_error(error.to_string()))?,
+        )
+    }
+
+    fn terminal_input(
+        &self,
+        workspace_value: &str,
+        terminal_value: &str,
+        data: &str,
+    ) -> Result<Value, RpcError> {
+        let workspace_id = parse_id::<WorkspaceId>(workspace_value)?;
+        let terminal_id = parse_id::<Uuid>(terminal_value)?;
+        self.terminals
+            .input(&workspace_id.to_string(), terminal_id, data)
+            .map_err(|error| terminal_rpc_error(error.to_string()))?;
+        Ok(json!({"terminal_id": terminal_id, "written": data.len()}))
+    }
+
+    fn resize_terminal(
+        &self,
+        workspace_value: &str,
+        terminal_value: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Value, RpcError> {
+        let workspace_id = parse_id::<WorkspaceId>(workspace_value)?;
+        let terminal_id = parse_id::<Uuid>(terminal_value)?;
+        self.terminals
+            .resize(&workspace_id.to_string(), terminal_id, rows, cols)
+            .map_err(|error| terminal_rpc_error(error.to_string()))?;
+        Ok(json!({"terminal_id": terminal_id, "rows": rows, "cols": cols}))
+    }
+
+    fn capture_terminal(
+        &self,
+        workspace_value: &str,
+        terminal_value: &str,
+        limit: Option<u32>,
+    ) -> Result<Value, RpcError> {
+        let workspace_id = parse_id::<WorkspaceId>(workspace_value)?;
+        let terminal_id = parse_id::<Uuid>(terminal_value)?;
+        serialize(
+            self.terminals
+                .capture(
+                    &workspace_id.to_string(),
+                    terminal_id,
+                    limit.unwrap_or(65_536) as usize,
+                )
+                .map_err(|error| terminal_rpc_error(error.to_string()))?,
+        )
+    }
+
+    fn kill_terminal(
+        &self,
+        workspace_value: &str,
+        terminal_value: &str,
+    ) -> Result<Value, RpcError> {
+        let workspace_id = parse_id::<WorkspaceId>(workspace_value)?;
+        let terminal_id = parse_id::<Uuid>(terminal_value)?;
+        self.terminals
+            .kill(&workspace_id.to_string(), terminal_id)
+            .map_err(|error| terminal_rpc_error(error.to_string()))?;
+        Ok(json!({"terminal_id": terminal_id, "killed": true}))
     }
 
     async fn list_pending_permissions(&self) -> Result<Value, RpcError> {
@@ -224,16 +397,19 @@ impl Daemon {
     }
 
     async fn archive_workspace(&self, value: &str) -> Result<Value, RpcError> {
+        let _workspace_operation = self.terminal_workspace_gate.lock().await;
         let id = parse_id::<WorkspaceId>(value)?;
         let workspace = self
             .service
             .archive_workspace(id)
             .await
             .map_err(map_core_error)?;
+        self.terminals.kill_workspace(&id.to_string());
         serialize(workspace)
     }
 
     async fn restore_workspace(&self, value: &str) -> Result<Value, RpcError> {
+        let _workspace_operation = self.terminal_workspace_gate.lock().await;
         let id = parse_id::<WorkspaceId>(value)?;
         let workspace = self
             .service
@@ -241,6 +417,100 @@ impl Daemon {
             .await
             .map_err(map_core_error)?;
         serialize(workspace)
+    }
+
+    async fn create_project(&self, name: String, root_path: String) -> Result<Value, RpcError> {
+        let path = PathBuf::from(root_path);
+        if !path.is_absolute() {
+            return Err(RpcError::new(-32602, "project root path must be absolute"));
+        }
+        serialize(
+            self.service
+                .create_project(name, path)
+                .await
+                .map_err(map_core_error)?,
+        )
+    }
+
+    async fn list_projects(&self) -> Result<Value, RpcError> {
+        serialize(self.service.list_projects().await.map_err(map_core_error)?)
+    }
+
+    async fn get_project(&self, value: &str) -> Result<Value, RpcError> {
+        let id = parse_id::<ProjectId>(value)?;
+        serialize(self.service.project(id).await.map_err(map_core_error)?)
+    }
+
+    async fn rename_project(&self, value: &str, name: String) -> Result<Value, RpcError> {
+        let id = parse_id::<ProjectId>(value)?;
+        serialize(
+            self.service
+                .rename_project(id, name)
+                .await
+                .map_err(map_core_error)?,
+        )
+    }
+
+    async fn delete_project(&self, value: &str) -> Result<Value, RpcError> {
+        let id = parse_id::<ProjectId>(value)?;
+        self.service
+            .delete_project(id)
+            .await
+            .map_err(map_core_error)?;
+        Ok(json!({"project_id": id, "deleted": true}))
+    }
+
+    async fn set_workspace_project(
+        &self,
+        workspace_value: &str,
+        project_value: Option<&str>,
+    ) -> Result<Value, RpcError> {
+        let workspace_id = parse_id::<WorkspaceId>(workspace_value)?;
+        let project_id = project_value.map(parse_id::<ProjectId>).transpose()?;
+        serialize(
+            self.service
+                .set_workspace_project(workspace_id, project_id)
+                .await
+                .map_err(map_core_error)?,
+        )
+    }
+
+    async fn create_managed_worktree(
+        &self,
+        project_value: &str,
+        name: String,
+        branch: String,
+        base_ref: String,
+    ) -> Result<Value, RpcError> {
+        let project_id = parse_id::<ProjectId>(project_value)?;
+        serialize(
+            self.service
+                .create_managed_worktree(project_id, name, branch, base_ref)
+                .await
+                .map_err(map_core_error)?,
+        )
+    }
+
+    async fn delete_managed_worktree(&self, workspace_value: &str) -> Result<Value, RpcError> {
+        let _workspace_operation = self.terminal_workspace_gate.lock().await;
+        let workspace_id = parse_id::<WorkspaceId>(workspace_value)?;
+        if !self
+            .terminals
+            .list(&workspace_id.to_string())
+            .map_err(|error| terminal_rpc_error(error.to_string()))?
+            .is_empty()
+        {
+            return Err(RpcError::new(
+                -32009,
+                "workspace has active terminals; kill them before removing its worktree",
+            ));
+        }
+        serialize(
+            self.service
+                .delete_managed_worktree(workspace_id)
+                .await
+                .map_err(map_core_error)?,
+        )
     }
 
     async fn provider_diagnostics(&self, provider_id: Option<&str>) -> Result<Value, RpcError> {
@@ -977,6 +1247,15 @@ where
         .map_err(|error: T::Err| RpcError::new(-32602, error.to_string()))
 }
 
+fn terminal_rpc_error(message: String) -> RpcError {
+    let code = if message.contains("not found") || message.contains("does not belong") {
+        -32004
+    } else {
+        -32602
+    };
+    RpcError::new(code, message)
+}
+
 fn map_core_error(error: CoreError) -> RpcError {
     core_error(error)
 }
@@ -1005,6 +1284,11 @@ fn core_error(error: CoreError) -> RpcError {
             format!("provider {provider} is disabled or unavailable"),
         ),
         CoreError::WorkspaceNotFound(id) => (-32004, format!("workspace {id} was not found")),
+        CoreError::ProjectNotFound(id) => (-32004, format!("project {id} was not found")),
+        CoreError::ProjectHasWorkspaces(id) => (
+            -32009,
+            format!("project {id} still has associated workspaces"),
+        ),
         CoreError::AgentNotFound(id) => (-32004, format!("agent {id} was not found")),
         CoreError::SessionNotFound(id) => (-32004, format!("session {id} was not found")),
         CoreError::RunNotFound(id) => (-32004, format!("run {id} was not found")),
@@ -1019,6 +1303,10 @@ fn core_error(error: CoreError) -> RpcError {
         CoreError::WorkspaceArchived => (
             -32602,
             "workspace is archived and cannot start a new agent".into(),
+        ),
+        CoreError::AgentArchived(id) => (
+            -32602,
+            format!("archived agent {id} cannot create or load provider sessions"),
         ),
         CoreError::NativeSessionMissing(id) => (
             -32602,
@@ -1141,54 +1429,23 @@ async fn run() -> anyhow::Result<()> {
     let home = home_dir()?;
     // Validate before chmod, token creation, lock creation or socket binding.
     open_home(&home).await?;
-    let lock_path = home.join("talosd.lock");
-    let lock_file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "daemon already running or lock unavailable ({}): {error}",
-                lock_path.display()
-            )
-        })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        lock_file
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .await?;
-    }
-    drop(lock_file);
-    tokio::fs::write(&lock_path, std::process::id().to_string()).await?;
-    let _lock = InstanceLock(lock_path.clone());
+    let instance = InstanceGuard::acquire(&home)?;
     let token = load_token(&home).await?;
     let socket_path = home.join("talosd.sock");
-    if tokio::fs::symlink_metadata(&socket_path).await.is_ok() {
-        anyhow::bail!(
-            "socket path already exists: {}; remove it only after confirming no daemon is running",
-            socket_path.display()
-        );
-    }
-    let listener = UnixListener::bind(&socket_path)?;
-    // Startup errors after bind must not leave a socket that blocks the next run.
-    let socket_guard = InstanceLock(socket_path.clone());
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    let (listener, socket_guard) = instance.bind_socket().await?;
     let service = AppService::open_at(home.clone()).await?;
     let shutdown_notify = Arc::new(Notify::new());
     let (daemon, event_bridge) =
         Daemon::new(home.clone(), service.clone(), shutdown_notify.clone());
     info!(socket = %socket_path.display(), home = %home.display(), "talosd listening");
     let shutdown = tokio::signal::ctrl_c();
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::pin!(shutdown);
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            _ = terminate.recv() => break,
             () = shutdown_notify.notified() => break,
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = result {
@@ -1232,6 +1489,7 @@ async fn run() -> anyhow::Result<()> {
     .await;
     connections.abort_all();
     while connections.join_next().await.is_some() {}
+    daemon.terminals.kill_all();
     service.shutdown().await;
     event_bridge.abort();
     let _ = event_bridge.await;
@@ -1450,11 +1708,11 @@ mod tests {
                     return Ok(ProviderPromptResult {
                         stop_reason: "end_turn".into(),
                         usage: Some(talos_acp::PromptUsage {
-                            input_tokens: 10,
-                            output_tokens: 20,
+                            input_tokens: Some(10),
+                            output_tokens: Some(20),
                             cached_read_tokens: Some(5),
                             cached_write_tokens: Some(2),
-                            total_tokens: 30,
+                            total_tokens: Some(30),
                             extra: serde_json::Map::default(),
                         }),
                     });
@@ -1553,6 +1811,98 @@ mod tests {
         let (daemon, bridge) =
             Daemon::new(temp.path().join("home"), service, Arc::new(Notify::new()));
         (daemon, bridge, temp)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_workspace_rpc_rejects_managed_checkout_symlinks_and_replacements() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command as ProcessCommand;
+
+        for replacement in ["symlink", "directory"] {
+            let (daemon, bridge, temp) = fixture_daemon().await;
+            let repo = temp.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            let git = |args: &[&str]| {
+                let output = ProcessCommand::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&["init", "--quiet", "-b", "main"]);
+            git(&["config", "user.name", "Daemon Fixture"]);
+            git(&["config", "user.email", "daemon-fixture@example.invalid"]);
+            std::fs::write(repo.join("tracked"), "preserve\n").unwrap();
+            git(&["add", "tracked"]);
+            git(&["commit", "--quiet", "-m", "fixture"]);
+
+            let project: Value = daemon
+                .command(Command::CreateProject {
+                    name: "Fixture".into(),
+                    root_path: repo.to_string_lossy().into_owned(),
+                })
+                .await
+                .unwrap();
+            let workspace: Value = daemon
+                .command(Command::CreateManagedWorktree {
+                    project_id: project["id"].as_str().unwrap().into(),
+                    name: "Feature".into(),
+                    branch: "feature/daemon-restore".into(),
+                    base_ref: "HEAD".into(),
+                })
+                .await
+                .unwrap();
+            let workspace_id = workspace["id"].as_str().unwrap().to_owned();
+            let path = PathBuf::from(workspace["path"].as_str().unwrap());
+            daemon
+                .service
+                .archive_workspace(parse_id::<WorkspaceId>(&workspace_id).unwrap())
+                .await
+                .unwrap();
+            let moved = temp.path().join("moved-checkout");
+            std::fs::rename(&path, &moved).unwrap();
+            if replacement == "symlink" {
+                symlink(&moved, &path).unwrap();
+            } else {
+                std::fs::create_dir(&path).unwrap();
+                std::fs::write(path.join("replacement-data"), "preserve replacement").unwrap();
+            }
+
+            let error = daemon
+                .command(Command::RestoreWorkspace {
+                    workspace_id: workspace_id.clone(),
+                })
+                .await
+                .unwrap_err();
+            assert_ne!(error.code, 0);
+            assert_eq!(
+                daemon
+                    .service
+                    .workspace(parse_id::<WorkspaceId>(&workspace_id).unwrap())
+                    .await
+                    .unwrap()
+                    .lifecycle,
+                WorkspaceLifecycle::Archived
+            );
+            assert_eq!(
+                std::fs::read_to_string(moved.join("tracked")).unwrap(),
+                "preserve\n"
+            );
+            if replacement == "directory" {
+                assert_eq!(
+                    std::fs::read_to_string(path.join("replacement-data")).unwrap(),
+                    "preserve replacement"
+                );
+            }
+            bridge.abort();
+            daemon.service.shutdown().await;
+        }
     }
 
     async fn fixture_session(daemon: &Daemon, root: &Path, name: &str) -> Session {
@@ -1757,6 +2107,234 @@ mod tests {
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].sequence, 1);
         assert!(has_more);
+    }
+
+    #[tokio::test]
+    async fn project_crud_and_workspace_association_are_available_over_ipc() {
+        let (daemon, bridge, temp) = fixture_daemon().await;
+        let project_root = temp.path().join("project-root");
+        let workspace_path = project_root.join("workspace");
+        tokio::fs::create_dir_all(&workspace_path).await.unwrap();
+        let project = daemon
+            .command(Command::CreateProject {
+                name: "Example".into(),
+                root_path: project_root.to_string_lossy().into_owned(),
+            })
+            .await
+            .unwrap();
+        let project_id = project["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            daemon
+                .command(Command::ListProjects)
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            daemon
+                .command(Command::GetProject {
+                    project_id: project_id.clone()
+                })
+                .await
+                .unwrap()["name"],
+            "Example"
+        );
+        daemon
+            .command(Command::RenameProject {
+                project_id: project_id.clone(),
+                name: "Renamed".into(),
+            })
+            .await
+            .unwrap();
+        let workspace = daemon
+            .command(Command::CreateWorkspace {
+                name: "Associated".into(),
+                path: workspace_path.to_string_lossy().into_owned(),
+            })
+            .await
+            .unwrap();
+        let workspace_id = workspace["id"].as_str().unwrap().to_owned();
+        let linked = daemon
+            .command(Command::SetWorkspaceProject {
+                workspace_id: workspace_id.clone(),
+                project_id: Some(project_id.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(linked["project_id"], project_id);
+        let rejected_delete = daemon
+            .command(Command::DeleteProject {
+                project_id: project_id.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(rejected_delete.code, -32009);
+        assert!(rejected_delete.message.contains("associated workspaces"));
+        daemon
+            .command(Command::SetWorkspaceProject {
+                workspace_id,
+                project_id: None,
+            })
+            .await
+            .unwrap();
+        daemon
+            .command(Command::DeleteProject {
+                project_id: project_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            daemon
+                .command(Command::ListProjects)
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        bridge.abort();
+        daemon.service.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Exercise the complete daemon terminal protocol in one fixture.
+    async fn terminal_lifecycle_is_exposed_over_ipc_and_workspace_scoped() {
+        let (daemon, bridge, temp) = fixture_daemon().await;
+        let _first_session = fixture_session(&daemon, temp.path(), "terminal-first").await;
+        let _second_session = fixture_session(&daemon, temp.path(), "terminal-second").await;
+        let workspaces = daemon.service.list_workspaces().await.unwrap();
+        let first = workspaces
+            .iter()
+            .find(|workspace| workspace.name == "terminal-first workspace")
+            .unwrap();
+        let second = workspaces
+            .iter()
+            .find(|workspace| workspace.name == "terminal-second workspace")
+            .unwrap();
+        let terminal: Value = daemon
+            .command(Command::CreateTerminal {
+                workspace_id: first.id.to_string(),
+                cwd: None,
+                program: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf READY; read line; printf 'GOT:%s' \"$line\"".into(),
+                ],
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .unwrap();
+        let terminal_id = terminal["id"].as_str().unwrap().to_owned();
+        let listed = daemon
+            .command(Command::ListTerminals {
+                workspace_id: first.id.to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(
+            daemon
+                .command(Command::ListTerminals {
+                    workspace_id: second.id.to_string()
+                })
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let captured = daemon
+                .command(Command::CaptureTerminal {
+                    workspace_id: first.id.to_string(),
+                    terminal_id: terminal_id.clone(),
+                    limit: Some(2048),
+                })
+                .await
+                .unwrap();
+            if captured["data"].as_str().unwrap().contains("READY") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "terminal did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let wrong_workspace = daemon
+            .command(Command::TerminalInput {
+                workspace_id: second.id.to_string(),
+                terminal_id: terminal_id.clone(),
+                data: "bad\n".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(wrong_workspace.code, -32004);
+        daemon
+            .command(Command::ResizeTerminal {
+                workspace_id: first.id.to_string(),
+                terminal_id: terminal_id.clone(),
+                rows: 35,
+                cols: 100,
+            })
+            .await
+            .unwrap();
+        daemon
+            .command(Command::TerminalInput {
+                workspace_id: first.id.to_string(),
+                terminal_id: terminal_id.clone(),
+                data: "ipc-input\n".into(),
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let captured = daemon
+                .command(Command::CaptureTerminal {
+                    workspace_id: first.id.to_string(),
+                    terminal_id: terminal_id.clone(),
+                    limit: Some(2048),
+                })
+                .await
+                .unwrap();
+            if captured["data"].as_str().unwrap().contains("GOT:ipc-input") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "terminal input did not arrive"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        daemon
+            .command(Command::KillTerminal {
+                workspace_id: first.id.to_string(),
+                terminal_id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            daemon
+                .command(Command::ListTerminals {
+                    workspace_id: first.id.to_string()
+                })
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        bridge.abort();
+        daemon.terminals.kill_all();
+        daemon.service.shutdown().await;
     }
 
     #[tokio::test]
@@ -2432,6 +3010,7 @@ mod tests {
             daemon.service.wait_run(run).await.unwrap(),
             RunLifecycle::Succeeded
         );
+        let unknown_session = fixture_session(&daemon, temp.path(), "usage-unknown").await;
         let summary = daemon
             .command(Command::UsageSummary { session_id: None })
             .await
@@ -2440,13 +3019,26 @@ mod tests {
         assert_eq!(summary["totals"]["output_tokens"], 20);
         assert_eq!(summary["totals"]["cached_read_tokens"], 5);
         assert_eq!(summary["totals"]["cached_write_tokens"], 2);
+        assert!(summary["totals"]["cost_micros"].is_null());
         let sessions = summary["sessions"].as_array().unwrap();
-        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions.len(), 2);
         assert_eq!(
             sessions[0]["session_id"].as_str().unwrap(),
             session.id.to_string()
         );
         assert_eq!(sessions[0]["input_tokens"], 10);
+        let unknown = sessions
+            .iter()
+            .find(|entry| entry["session_id"] == unknown_session.id.to_string())
+            .unwrap();
+        assert!(unknown["input_tokens"].is_null());
+        assert!(unknown["cost_micros"].is_null());
+
+        let repeated = daemon
+            .command(Command::UsageSummary { session_id: None })
+            .await
+            .unwrap();
+        assert_eq!(repeated["totals"], summary["totals"]);
 
         let single = daemon
             .command(Command::UsageSummary {

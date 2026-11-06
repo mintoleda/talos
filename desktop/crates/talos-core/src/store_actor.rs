@@ -120,7 +120,7 @@ mod tests {
             }));
         }
         for task in tasks {
-            assert_eq!(task.await.unwrap().unwrap(), 2);
+            assert_eq!(task.await.unwrap().unwrap(), 4);
         }
         actor.shutdown().await;
     }

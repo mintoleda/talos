@@ -6,14 +6,22 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::{Serialize, de::DeserializeOwned};
 use std::{path::Path, str::FromStr, time::Duration};
 use talos_domain::{
-    Agent, AgentId, EventCursor, ProviderId, RunId, RunLifecycle, Session, SessionId,
-    TimelineEvent, TimelineEventKind, ValidationError, Workspace, WorkspaceId,
+    Agent, AgentId, AgentLifecycle, EventCursor, Project, ProjectId, ProviderId, RunId,
+    RunLifecycle, Session, SessionId, SessionLifecycle, TimelineEvent, TimelineEventKind,
+    ValidationError, Workspace, WorkspaceId,
 };
 use thiserror::Error;
 
+mod managed_worktrees;
+pub use managed_worktrees::{
+    ManagedWorktreeOperation, WorktreeOperationKind, WorktreeOperationOutcome,
+};
+
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_prompt_requests.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const MIGRATION_3: &str = include_str!("../migrations/0003_projects.sql");
+const MIGRATION_4: &str = include_str!("../migrations/0004_managed_worktree_operations.sql");
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -31,6 +39,12 @@ pub enum StoreError {
     InvalidData(String),
     #[error("schema version {0} is newer than this build supports")]
     UnsupportedSchemaVersion(u32),
+    #[error("historical import conflicts with an existing record")]
+    HistoricalImportConflict,
+    #[error("historical import contains an executable session or run")]
+    HistoricalImportInvariant,
+    #[error("workspace {0} has a pending managed worktree operation")]
+    WorktreeOperationPending(WorkspaceId),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -40,6 +54,13 @@ pub enum WorkspaceArchiveResult {
     Archived(Workspace),
     NotFound,
     ActiveRuns,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProjectDeleteResult {
+    Deleted,
+    NotFound,
+    AssociatedWorkspaces,
 }
 
 pub struct SqliteStore {
@@ -57,7 +78,7 @@ impl SqliteStore {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
         let mut store = Self { connection };
         store.migrate()?;
         Ok(store)
@@ -97,6 +118,29 @@ impl SqliteStore {
             )?;
             tx.commit()?;
         }
+        let version: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        if version < 3 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(MIGRATION_3)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(3,?1)",
+                params![Utc::now().to_rfc3339()],
+            )?;
+            tx.commit()?;
+        }
+        if version < 4 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch(MIGRATION_4)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(4,?1)",
+                params![Utc::now().to_rfc3339()],
+            )?;
+            tx.commit()?;
+        }
         Ok(())
     }
     pub fn schema_version(&self) -> Result<u32> {
@@ -107,8 +151,100 @@ impl SqliteStore {
         )?)
     }
 
+    pub fn save_project(&mut self, value: &Project) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO projects(id,name,root_path,metadata,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET name=excluded.name,root_path=excluded.root_path,metadata=excluded.metadata,updated_at=excluded.updated_at",
+            params![value.id.to_string(), value.name, value.root_path, json(&value.metadata)?, ts(value.created_at), ts(value.updated_at)],
+        )?;
+        Ok(())
+    }
+    pub fn project(&self, id: ProjectId) -> Result<Option<Project>> {
+        self.connection
+            .query_row(
+                "SELECT id,name,root_path,metadata,created_at,updated_at FROM projects WHERE id=?1",
+                [id.to_string()],
+                project_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+    pub fn list_projects(&self) -> Result<Vec<Project>> {
+        let mut statement = self.connection.prepare("SELECT id,name,root_path,metadata,created_at,updated_at FROM projects ORDER BY created_at,id")?;
+        statement
+            .query_map([], project_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+    pub fn rename_project(&mut self, id: ProjectId, name: String) -> Result<Option<Project>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut project) = project_on(&tx, id)? else {
+            tx.rollback()?;
+            return Ok(None);
+        };
+        project.rename(name)?;
+        tx.execute(
+            "UPDATE projects SET name=?2,updated_at=?3 WHERE id=?1",
+            params![id.to_string(), project.name, ts(project.updated_at)],
+        )?;
+        tx.commit()?;
+        Ok(Some(project))
+    }
+    pub fn delete_project(&mut self, id: ProjectId) -> Result<ProjectDeleteResult> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if project_on(&tx, id)?.is_none() {
+            tx.rollback()?;
+            return Ok(ProjectDeleteResult::NotFound);
+        }
+        let linked: i64 = tx.query_row(
+            "SELECT (SELECT COUNT(*) FROM workspaces WHERE project_id=?1) + (SELECT COUNT(*) FROM managed_worktree_operations WHERE project_id=?1)",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        if linked != 0 {
+            tx.rollback()?;
+            return Ok(ProjectDeleteResult::AssociatedWorkspaces);
+        }
+        tx.execute("DELETE FROM projects WHERE id=?1", [id.to_string()])?;
+        tx.commit()?;
+        Ok(ProjectDeleteResult::Deleted)
+    }
+    pub fn set_workspace_project(
+        &mut self,
+        workspace_id: WorkspaceId,
+        project_id: Option<ProjectId>,
+    ) -> Result<Option<Workspace>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        managed_worktrees::ensure_no_worktree_operation(&tx, workspace_id)?;
+        let Some(mut workspace) = workspace_on(&tx, workspace_id)? else {
+            tx.rollback()?;
+            return Ok(None);
+        };
+        if let Some(project_id) = project_id
+            && project_on(&tx, project_id)?.is_none()
+        {
+            return Err(StoreError::NotFound(format!("project {project_id}")));
+        }
+        workspace.project_id = project_id;
+        workspace.updated_at = Utc::now();
+        update_workspace_row(&tx, &workspace)?;
+        tx.commit()?;
+        Ok(Some(workspace))
+    }
+
     pub fn save_workspace(&mut self, value: &Workspace) -> Result<()> {
-        save_workspace_row(&self.connection, value)
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        managed_worktrees::ensure_no_worktree_operation(&tx, value.id)?;
+        save_workspace_row(&tx, value)?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn workspace(&self, id: WorkspaceId) -> Result<Option<Workspace>> {
         workspace_on(&self.connection, id)
@@ -130,6 +266,7 @@ impl SqliteStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        managed_worktrees::ensure_no_worktree_operation(&tx, id)?;
         let Some(mut workspace) = workspace_on(&tx, id)? else {
             tx.rollback()?;
             return Ok(WorkspaceArchiveResult::NotFound);
@@ -147,6 +284,7 @@ impl SqliteStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        managed_worktrees::ensure_no_worktree_operation(&tx, id)?;
         let Some(mut workspace) = workspace_on(&tx, id)? else {
             tx.rollback()?;
             return Ok(None);
@@ -157,7 +295,7 @@ impl SqliteStore {
         Ok(Some(workspace))
     }
     pub fn list_workspaces(&self) -> Result<Vec<Workspace>> {
-        let mut s=self.connection.prepare("SELECT id,name,path,kind,lifecycle,metadata,created_at,updated_at FROM workspaces ORDER BY created_at,id")?;
+        let mut s=self.connection.prepare("SELECT id,name,path,kind,lifecycle,metadata,created_at,updated_at,project_id FROM workspaces ORDER BY created_at,id")?;
         let rows = s.query_map([], |r| {
             Ok(Workspace {
                 id: parse_id(r.get::<_, String>(0)?)?,
@@ -168,6 +306,7 @@ impl SqliteStore {
                 metadata: decode(r.get(5)?)?,
                 created_at: parse_ts(r.get(6)?)?,
                 updated_at: parse_ts(r.get(7)?)?,
+                project_id: parse_optional_id(r.get(8)?)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -235,6 +374,56 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Insert one legacy session and its parent records/events atomically.
+    /// Exact existing records are accepted to make crash recovery idempotent.
+    /// Historical imports must remain archived and have no provider handle/run.
+    pub fn import_historical_session_batch(
+        &mut self,
+        batch: &HistoricalSessionBatch,
+    ) -> Result<bool> {
+        if batch.agent.lifecycle != AgentLifecycle::Archived
+            || batch.session.lifecycle != SessionLifecycle::Archived
+            || batch.session.provider_session_id.is_some()
+            || batch.session.agent_id != batch.agent.id
+            || batch
+                .events
+                .iter()
+                .any(|event| event.session_id != batch.session.id || event.run_id.is_some())
+        {
+            return Err(StoreError::HistoricalImportInvariant);
+        }
+
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(project) = &batch.project {
+            ensure_historical_project(&tx, project)?;
+        }
+        ensure_historical_workspace(
+            &tx,
+            &batch.workspace,
+            batch.project.as_ref().map(|project| project.id),
+        )?;
+        if batch.agent.workspace_id != batch.workspace.id {
+            return Err(StoreError::HistoricalImportInvariant);
+        }
+        ensure_historical_agent(&tx, &batch.agent)?;
+
+        if let Some(existing) = session_on(&tx, batch.session.id)? {
+            if existing != batch.session || read_events_on(&tx, batch.session.id)? != batch.events {
+                return Err(StoreError::HistoricalImportConflict);
+            }
+            tx.commit()?;
+            return Ok(false);
+        }
+        insert_historical_session(&tx, &batch.session)?;
+        for event in &batch.events {
+            insert_event(&tx, event)?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
     pub fn replay_events(
         &self,
@@ -460,6 +649,17 @@ pub struct SessionSnapshot {
     pub cursor: Option<EventCursor>,
 }
 
+/// One all-or-nothing historical import batch. `project` is optional when the
+/// exact workspace already exists or does not need a project association.
+#[derive(Clone, Debug)]
+pub struct HistoricalSessionBatch {
+    pub project: Option<Project>,
+    pub workspace: Workspace,
+    pub agent: Agent,
+    pub session: Session,
+    pub events: Vec<TimelineEvent>,
+}
+
 /// Durable idempotency record for one keyed prompt acceptance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptRequestRecord {
@@ -500,13 +700,13 @@ fn read_prompt_request(
         .map_err(Into::into)
 }
 fn save_workspace_row(connection: &Connection, value: &Workspace) -> Result<()> {
-    connection.execute("INSERT INTO workspaces(id,name,path,kind,lifecycle,metadata,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET name=excluded.name,path=excluded.path,kind=excluded.kind,lifecycle=excluded.lifecycle,metadata=excluded.metadata,updated_at=excluded.updated_at",
-        params![value.id.to_string(),value.name,value.path,json(&value.kind)?,json(&value.lifecycle)?,json(&value.metadata)?,ts(value.created_at),ts(value.updated_at)])?;
+    connection.execute("INSERT INTO workspaces(id,name,path,kind,lifecycle,metadata,created_at,updated_at,project_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET name=excluded.name,path=excluded.path,kind=excluded.kind,lifecycle=excluded.lifecycle,metadata=excluded.metadata,updated_at=excluded.updated_at,project_id=excluded.project_id",
+        params![value.id.to_string(),value.name,value.path,json(&value.kind)?,json(&value.lifecycle)?,json(&value.metadata)?,ts(value.created_at),ts(value.updated_at),value.project_id.map(|id| id.to_string())])?;
     Ok(())
 }
 fn update_workspace_row(connection: &Connection, value: &Workspace) -> Result<()> {
     let changed = connection.execute(
-        "UPDATE workspaces SET name=?2,path=?3,kind=?4,lifecycle=?5,metadata=?6,updated_at=?7 WHERE id=?1",
+        "UPDATE workspaces SET name=?2,path=?3,kind=?4,lifecycle=?5,metadata=?6,updated_at=?7,project_id=?8 WHERE id=?1",
         params![
             value.id.to_string(),
             value.name,
@@ -514,7 +714,8 @@ fn update_workspace_row(connection: &Connection, value: &Workspace) -> Result<()
             json(&value.kind)?,
             json(&value.lifecycle)?,
             json(&value.metadata)?,
-            ts(value.updated_at)
+            ts(value.updated_at),
+            value.project_id.map(|id| id.to_string())
         ],
     )?;
     if changed != 1 {
@@ -522,10 +723,35 @@ fn update_workspace_row(connection: &Connection, value: &Workspace) -> Result<()
     }
     Ok(())
 }
+fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+    Ok(Project {
+        id: parse_id(row.get::<_, String>(0)?)?,
+        name: row.get(1)?,
+        root_path: row.get(2)?,
+        metadata: decode(row.get(3)?)?,
+        created_at: parse_ts(row.get(4)?)?,
+        updated_at: parse_ts(row.get(5)?)?,
+    })
+}
+fn project_on(connection: &Connection, id: ProjectId) -> Result<Option<Project>> {
+    connection
+        .query_row(
+            "SELECT id,name,root_path,metadata,created_at,updated_at FROM projects WHERE id=?1",
+            [id.to_string()],
+            project_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+fn parse_optional_id<T: FromStr<Err = ValidationError>>(
+    value: Option<String>,
+) -> rusqlite::Result<Option<T>> {
+    value.map(parse_id).transpose()
+}
 fn workspace_on(connection: &Connection, id: WorkspaceId) -> Result<Option<Workspace>> {
     connection
         .query_row(
-            "SELECT id,name,path,kind,lifecycle,metadata,created_at,updated_at FROM workspaces WHERE id=?1",
+            "SELECT id,name,path,kind,lifecycle,metadata,created_at,updated_at,project_id FROM workspaces WHERE id=?1",
             [id.to_string()],
             |row| {
                 Ok(Workspace {
@@ -537,12 +763,214 @@ fn workspace_on(connection: &Connection, id: WorkspaceId) -> Result<Option<Works
                     metadata: decode(row.get(5)?)?,
                     created_at: parse_ts(row.get(6)?)?,
                     updated_at: parse_ts(row.get(7)?)?,
+                    project_id: parse_optional_id(row.get(8)?)?,
                 })
             },
         )
         .optional()
         .map_err(Into::into)
 }
+fn ensure_historical_project(tx: &Transaction<'_>, value: &Project) -> Result<()> {
+    if let Some(existing) = project_on(tx, value.id)? {
+        return if existing == *value {
+            Ok(())
+        } else {
+            Err(StoreError::HistoricalImportConflict)
+        };
+    }
+    let path_owner: Option<String> = tx
+        .query_row(
+            "SELECT id FROM projects WHERE root_path=?1 LIMIT 1",
+            [&value.root_path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if path_owner.is_some() {
+        return Err(StoreError::HistoricalImportConflict);
+    }
+    tx.execute(
+        "INSERT INTO projects(id,name,root_path,metadata,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            value.id.to_string(),
+            value.name,
+            value.root_path,
+            json(&value.metadata)?,
+            ts(value.created_at),
+            ts(value.updated_at)
+        ],
+    )?;
+    Ok(())
+}
+
+fn ensure_historical_workspace(
+    tx: &Transaction<'_>,
+    value: &Workspace,
+    batch_project_id: Option<ProjectId>,
+) -> Result<()> {
+    if let Some(existing) = workspace_on(tx, value.id)? {
+        if existing == *value {
+            return Ok(());
+        }
+        if existing.project_id.is_none()
+            && value.project_id.is_some()
+            && value.project_id == batch_project_id
+            && workspace_matches_except_project(&existing, value)
+        {
+            let project_id = value
+                .project_id
+                .ok_or(StoreError::HistoricalImportConflict)?;
+            let changed = tx.execute(
+                "UPDATE workspaces SET project_id=?2 WHERE id=?1 AND project_id IS NULL",
+                params![value.id.to_string(), project_id.to_string()],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::HistoricalImportConflict);
+            }
+            return Ok(());
+        }
+        return Err(StoreError::HistoricalImportConflict);
+    }
+    let path_owner: Option<String> = tx
+        .query_row(
+            "SELECT id FROM workspaces WHERE path=?1 LIMIT 1",
+            [&value.path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if path_owner.is_some() {
+        return Err(StoreError::HistoricalImportConflict);
+    }
+    tx.execute(
+        "INSERT INTO workspaces(id,name,path,kind,lifecycle,metadata,created_at,updated_at,project_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            value.id.to_string(),
+            value.name,
+            value.path,
+            json(&value.kind)?,
+            json(&value.lifecycle)?,
+            json(&value.metadata)?,
+            ts(value.created_at),
+            ts(value.updated_at),
+            value.project_id.map(|id| id.to_string())
+        ],
+    )?;
+    Ok(())
+}
+
+fn workspace_matches_except_project(left: &Workspace, right: &Workspace) -> bool {
+    left.id == right.id
+        && left.name == right.name
+        && left.path == right.path
+        && left.kind == right.kind
+        && left.lifecycle == right.lifecycle
+        && left.metadata == right.metadata
+        && left.created_at == right.created_at
+        && left.updated_at == right.updated_at
+}
+
+fn ensure_historical_agent(tx: &Transaction<'_>, value: &Agent) -> Result<()> {
+    if let Some(existing) = agent_on(tx, value.id)? {
+        return if existing == *value {
+            Ok(())
+        } else {
+            Err(StoreError::HistoricalImportConflict)
+        };
+    }
+    tx.execute(
+        "INSERT INTO agents(id,workspace_id,provider,model,mode,lifecycle,title,config,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            value.id.to_string(),
+            value.workspace_id.to_string(),
+            value.provider.as_str(),
+            option_json(value.model.as_ref())?,
+            value.mode,
+            json(&value.lifecycle)?,
+            value.title,
+            json(&value.config)?,
+            ts(value.created_at),
+            ts(value.updated_at)
+        ],
+    )?;
+    Ok(())
+}
+
+fn agent_on(connection: &Connection, id: AgentId) -> Result<Option<Agent>> {
+    connection
+        .query_row(
+            "SELECT id,workspace_id,provider,model,mode,lifecycle,title,config,created_at,updated_at FROM agents WHERE id=?1",
+            [id.to_string()],
+            |row| {
+                Ok(Agent {
+                    id: parse_id(row.get::<_, String>(0)?)?,
+                    workspace_id: parse_id(row.get::<_, String>(1)?)?,
+                    provider: ProviderId::new(row.get::<_, String>(2)?).map_err(to_sql_conversion)?,
+                    model: decode_optional(row.get(3)?)?,
+                    mode: row.get(4)?,
+                    lifecycle: decode(row.get(5)?)?,
+                    title: row.get(6)?,
+                    config: decode(row.get(7)?)?,
+                    created_at: parse_ts(row.get(8)?)?,
+                    updated_at: parse_ts(row.get(9)?)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn session_on(connection: &Connection, id: SessionId) -> Result<Option<Session>> {
+    connection
+        .query_row(
+            "SELECT id,agent_id,lifecycle,provider_session_id,created_at,updated_at FROM sessions WHERE id=?1",
+            [id.to_string()],
+            |row| {
+                Ok(Session {
+                    id: parse_id(row.get::<_, String>(0)?)?,
+                    agent_id: parse_id(row.get::<_, String>(1)?)?,
+                    lifecycle: decode(row.get(2)?)?,
+                    provider_session_id: row.get(3)?,
+                    created_at: parse_ts(row.get(4)?)?,
+                    updated_at: parse_ts(row.get(5)?)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn insert_historical_session(tx: &Transaction<'_>, value: &Session) -> Result<()> {
+    tx.execute(
+        "INSERT INTO sessions(id,agent_id,lifecycle,provider_session_id,created_at,updated_at) VALUES(?1,?2,?3,NULL,?4,?5)",
+        params![
+            value.id.to_string(),
+            value.agent_id.to_string(),
+            json(&value.lifecycle)?,
+            ts(value.created_at),
+            ts(value.updated_at)
+        ],
+    )?;
+    Ok(())
+}
+
+fn read_events_on(tx: &Transaction<'_>, session_id: SessionId) -> Result<Vec<TimelineEvent>> {
+    let mut statement = tx.prepare(
+        "SELECT id,session_id,run_id,sequence,timestamp,payload FROM timeline_events WHERE session_id=?1 ORDER BY sequence",
+    )?;
+    statement
+        .query_map([session_id.to_string()], |row| {
+            Ok(TimelineEvent {
+                id: parse_id(row.get::<_, String>(0)?)?,
+                session_id: parse_id(row.get::<_, String>(1)?)?,
+                run_id: row.get::<_, Option<String>>(2)?.map(parse_id).transpose()?,
+                sequence: u64::try_from(row.get::<_, i64>(3)?).map_err(to_sql_conversion)?,
+                timestamp: parse_ts(row.get(4)?)?,
+                kind: decode(row.get(5)?)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 fn workspace_has_active_runs_on(connection: &Connection, id: WorkspaceId) -> Result<bool> {
     let mut statement = connection.prepare(
         "SELECT latest.payload FROM timeline_events AS latest
@@ -647,6 +1075,91 @@ mod tests {
         (w, a, s)
     }
 
+    fn historical_fixture() -> HistoricalSessionBatch {
+        let (workspace, mut agent, mut session) = fixture();
+        agent.lifecycle = AgentLifecycle::Archived;
+        session.lifecycle = SessionLifecycle::Archived;
+        let events = vec![
+            TimelineEvent::new(
+                session.id,
+                None,
+                1,
+                TimelineEventKind::Extension {
+                    kind: "legacy_fold_archive_record".into(),
+                    payload: serde_json::json!({"raw_base64":"e30K"}),
+                },
+            )
+            .unwrap(),
+        ];
+        HistoricalSessionBatch {
+            project: None,
+            workspace,
+            agent,
+            session,
+            events,
+        }
+    }
+
+    #[test]
+    fn historical_import_guards_reject_executable_or_mismatched_records_atomically() {
+        for case in 0..7 {
+            let mut db = SqliteStore::open_in_memory().unwrap();
+            let mut batch = historical_fixture();
+            match case {
+                0 => batch.agent.lifecycle = AgentLifecycle::Ready,
+                1 => batch.session.lifecycle = SessionLifecycle::Active,
+                2 => batch.session.provider_session_id = Some("native-handle".into()),
+                3 => batch.events[0].run_id = Some(RunId::new()),
+                4 => batch.events[0].session_id = SessionId::new(),
+                5 => batch.session.agent_id = AgentId::new(),
+                6 => batch.agent.workspace_id = WorkspaceId::new(),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                db.import_historical_session_batch(&batch),
+                Err(StoreError::HistoricalImportInvariant)
+            ));
+            assert_eq!(db.list_workspaces().unwrap(), Vec::new());
+            assert!(db.session(batch.session.id).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn historical_import_rolls_back_parents_and_history_if_event_insert_fails() {
+        let mut db = SqliteStore::open_in_memory().unwrap();
+        let mut batch = historical_fixture();
+        batch.events.push(batch.events[0].clone());
+        assert!(db.import_historical_session_batch(&batch).is_err());
+        assert_eq!(db.list_workspaces().unwrap(), Vec::new());
+        assert!(db.agent(batch.agent.id).unwrap().is_none());
+        assert!(db.session(batch.session.id).unwrap().is_none());
+        assert_eq!(
+            db.replay_events(batch.session.id, None, 10).unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn historical_import_accepts_exact_retry_and_refuses_changed_raw_provenance() {
+        let mut db = SqliteStore::open_in_memory().unwrap();
+        let mut batch = historical_fixture();
+        assert!(db.import_historical_session_batch(&batch).unwrap());
+        assert!(!db.import_historical_session_batch(&batch).unwrap());
+        let original = batch.events.clone();
+        batch.events[0].kind = TimelineEventKind::Extension {
+            kind: "legacy_fold_archive_record".into(),
+            payload: serde_json::json!({"raw_base64":"Y2hhbmdlZAo="}),
+        };
+        assert!(matches!(
+            db.import_historical_session_batch(&batch),
+            Err(StoreError::HistoricalImportConflict)
+        ));
+        assert_eq!(
+            db.replay_events(batch.session.id, None, 10).unwrap(),
+            original
+        );
+    }
+
     #[test]
     fn workspace_lifecycle_preserves_ids_and_rejects_active_runs() {
         let mut db = SqliteStore::open_in_memory().unwrap();
@@ -722,6 +1235,56 @@ mod tests {
         assert_eq!(
             db.archive_workspace(WorkspaceId::new()).unwrap(),
             WorkspaceArchiveResult::NotFound
+        );
+    }
+
+    #[test]
+    fn projects_persist_and_workspace_associations_protect_delete() {
+        let mut db = SqliteStore::open_in_memory().unwrap();
+        let mut project = Project::new("Repository", "/tmp/repository").unwrap();
+        let workspace = Workspace::new(
+            "Worktree",
+            "/tmp/repository/wt",
+            talos_domain::WorkspaceKind::Worktree,
+        )
+        .unwrap();
+        db.save_project(&project).unwrap();
+        db.save_workspace(&workspace).unwrap();
+        let associated = db
+            .set_workspace_project(workspace.id, Some(project.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(associated.project_id, Some(project.id));
+        assert_eq!(
+            db.workspace(workspace.id).unwrap().unwrap().project_id,
+            Some(project.id)
+        );
+        assert_eq!(db.list_projects().unwrap(), vec![project.clone()]);
+        assert_eq!(
+            db.delete_project(project.id).unwrap(),
+            ProjectDeleteResult::AssociatedWorkspaces
+        );
+
+        project = db
+            .rename_project(project.id, "Renamed".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(project.name, "Renamed");
+        assert_eq!(db.project(project.id).unwrap(), Some(project.clone()));
+        assert_eq!(
+            db.set_workspace_project(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .project_id,
+            None
+        );
+        assert_eq!(
+            db.delete_project(project.id).unwrap(),
+            ProjectDeleteResult::Deleted
+        );
+        assert_eq!(
+            db.delete_project(project.id).unwrap(),
+            ProjectDeleteResult::NotFound
         );
     }
 
@@ -839,7 +1402,7 @@ mod tests {
             db.append_event(&e).unwrap();
             db.set_config_metadata("theme", &serde_json::json!({"accent":"blue"}))
                 .unwrap();
-            assert_eq!(db.schema_version().unwrap(), 2);
+            assert_eq!(db.schema_version().unwrap(), 4);
         }
         {
             let db = SqliteStore::open(&path).unwrap();
@@ -916,12 +1479,12 @@ mod tests {
         )
         .unwrap();
         db.append_event(&event).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 4);
         drop(db);
 
         let db = SqliteStore::open(&path).unwrap();
         assert_eq!(db.replay_events(session.id, None, 10).unwrap(), vec![event]);
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 4);
     }
 
     fn prompt_record(
@@ -1336,7 +1899,7 @@ mod tests {
         ];
         {
             let mut db = SqliteStore::open(&path).unwrap();
-            assert_eq!(db.schema_version().unwrap(), 2);
+            assert_eq!(db.schema_version().unwrap(), 4);
             db.save_workspace(&w).unwrap();
             db.save_agent(&a).unwrap();
             db.save_session(&s).unwrap();
@@ -1348,14 +1911,14 @@ mod tests {
         }
         {
             let mut db = SqliteStore::open(&path).unwrap();
-            assert_eq!(db.schema_version().unwrap(), 2);
+            assert_eq!(db.schema_version().unwrap(), 4);
             assert_eq!(db.prompt_request(s.id, "legacy").unwrap().unwrap(), record);
             assert_eq!(
                 db.run_state(s.id, run_id).unwrap(),
                 Some(RunLifecycle::Starting)
             );
             db.migrate().unwrap();
-            assert_eq!(db.schema_version().unwrap(), 2);
+            assert_eq!(db.schema_version().unwrap(), 4);
             assert!(db.integrity_check().unwrap());
         }
         {

@@ -39,6 +39,34 @@ pub enum Command {
     RestoreWorkspace {
         workspace_id: String,
     },
+    CreateProject {
+        name: String,
+        root_path: String,
+    },
+    ListProjects,
+    GetProject {
+        project_id: String,
+    },
+    RenameProject {
+        project_id: String,
+        name: String,
+    },
+    DeleteProject {
+        project_id: String,
+    },
+    SetWorkspaceProject {
+        workspace_id: String,
+        project_id: Option<String>,
+    },
+    CreateManagedWorktree {
+        project_id: String,
+        name: String,
+        branch: String,
+        base_ref: String,
+    },
+    DeleteManagedWorktree {
+        workspace_id: String,
+    },
     ListProviders,
     ProviderDiagnostics {
         provider_id: Option<String>,
@@ -134,6 +162,37 @@ pub enum Command {
         query: String,
         session_id: Option<String>,
         limit: Option<u32>,
+    },
+    CreateTerminal {
+        workspace_id: String,
+        cwd: Option<String>,
+        program: String,
+        args: Vec<String>,
+        rows: u16,
+        cols: u16,
+    },
+    ListTerminals {
+        workspace_id: String,
+    },
+    TerminalInput {
+        workspace_id: String,
+        terminal_id: String,
+        data: String,
+    },
+    ResizeTerminal {
+        workspace_id: String,
+        terminal_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    CaptureTerminal {
+        workspace_id: String,
+        terminal_id: String,
+        limit: Option<u32>,
+    },
+    KillTerminal {
+        workspace_id: String,
+        terminal_id: String,
     },
 }
 
@@ -752,6 +811,29 @@ mod tests {
         round_trip(&Command::RestoreWorkspace {
             workspace_id: "workspace-1".into(),
         });
+        round_trip(&Command::CreateProject {
+            name: "Repository".into(),
+            root_path: "/tmp/repository".into(),
+        });
+        round_trip(&Command::ListProjects);
+        round_trip(&Command::GetProject {
+            project_id: "project-1".into(),
+        });
+        round_trip(&Command::RenameProject {
+            project_id: "project-1".into(),
+            name: "Renamed".into(),
+        });
+        round_trip(&Command::DeleteProject {
+            project_id: "project-1".into(),
+        });
+        round_trip(&Command::SetWorkspaceProject {
+            workspace_id: "workspace-1".into(),
+            project_id: Some("project-1".into()),
+        });
+        round_trip(&Command::SetWorkspaceProject {
+            workspace_id: "workspace-1".into(),
+            project_id: None,
+        });
         round_trip(&Command::ListPendingPermissions);
         round_trip(&Command::ListModels {
             provider_id: "talos".into(),
@@ -781,11 +863,55 @@ mod tests {
             session_id: Some("session-1".into()),
             limit: Some(25),
         });
+        round_trip(&Command::CreateTerminal {
+            workspace_id: "workspace-1".into(),
+            cwd: Some("src".into()),
+            program: "sh".into(),
+            args: vec!["-i".into()],
+            rows: 24,
+            cols: 80,
+        });
+        round_trip(&Command::ListTerminals {
+            workspace_id: "workspace-1".into(),
+        });
+        round_trip(&Command::TerminalInput {
+            workspace_id: "workspace-1".into(),
+            terminal_id: "terminal-1".into(),
+            data: "help\\n".into(),
+        });
+        round_trip(&Command::ResizeTerminal {
+            workspace_id: "workspace-1".into(),
+            terminal_id: "terminal-1".into(),
+            rows: 40,
+            cols: 120,
+        });
+        round_trip(&Command::CaptureTerminal {
+            workspace_id: "workspace-1".into(),
+            terminal_id: "terminal-1".into(),
+            limit: Some(4096),
+        });
+        round_trip(&Command::KillTerminal {
+            workspace_id: "workspace-1".into(),
+            terminal_id: "terminal-1".into(),
+        });
         round_trip(&Command::PromptWithImages {
             session_id: "session-1".into(),
             text: "Describe these".into(),
             image_paths: vec!["/tmp/image.png".into()],
             request_key: Some("image-request".into()),
+        });
+    }
+
+    #[test]
+    fn managed_worktree_commands_serde_round_trip() {
+        round_trip(&Command::CreateManagedWorktree {
+            project_id: "project-1".into(),
+            name: "Feature".into(),
+            branch: "feature/test".into(),
+            base_ref: "HEAD".into(),
+        });
+        round_trip(&Command::DeleteManagedWorktree {
+            workspace_id: "workspace-1".into(),
         });
     }
 

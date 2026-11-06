@@ -381,11 +381,11 @@ pub struct PromptResponse {
 #[serde(rename_all = "camelCase")]
 pub struct PromptUsage {
     #[serde(default)]
-    pub total_tokens: u64,
+    pub total_tokens: Option<u64>,
     #[serde(default)]
-    pub input_tokens: u64,
+    pub input_tokens: Option<u64>,
     #[serde(default)]
-    pub output_tokens: u64,
+    pub output_tokens: Option<u64>,
     #[serde(default)]
     pub cached_read_tokens: Option<u64>,
     #[serde(default)]

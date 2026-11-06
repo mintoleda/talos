@@ -77,7 +77,11 @@ async fn streaming_session_methods_and_string_rpc_ids() {
         .await
         .expect("prompt");
     assert_eq!(response.stop_reason, "end_turn");
-    assert_eq!(response.usage.expect("usage").total_tokens, 3);
+    let usage = response.usage.expect("usage");
+    assert_eq!(usage.total_tokens, Some(3));
+    assert_eq!(usage.input_tokens, Some(2));
+    assert_eq!(usage.output_tokens, Some(1));
+    assert_eq!(usage.cached_read_tokens, None);
 
     let first = client
         .next_event()
