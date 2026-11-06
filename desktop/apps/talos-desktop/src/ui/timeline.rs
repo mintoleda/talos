@@ -19,10 +19,10 @@ use crate::ui::widgets;
 
 /// Borrowed inputs for one timeline frame.
 pub struct TimelineState<'a> {
+    pub session_id: &'a str,
     pub entries: &'a [Entry],
     pub running: bool,
     pub motion: bool,
-    pub pending: &'a HashMap<String, PendingState>,
     pub cache: &'a mut MarkdownCache,
     pub stick: &'a mut bool,
     pub provider: &'a str,
@@ -31,14 +31,18 @@ pub struct TimelineState<'a> {
 /// A decision the timeline wants the application to perform.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TimelineAction {
-    Decide { id: String, allow: bool },
+    Decide {
+        session: String,
+        id: String,
+        allow: bool,
+    },
 }
 
 /// Render the timeline. Returns actions requested by the user this frame.
 pub fn show(ui: &mut egui::Ui, state: &mut TimelineState<'_>) -> Vec<TimelineAction> {
     let mut actions = Vec::new();
     let viewport = ui.available_rect_before_wrap();
-    let scroll_id = egui::Id::unique(("timeline", ui.id()));
+    let scroll_id = egui::Id::unique(("timeline", state.session_id));
     ui.spacing_mut().item_spacing.y = 0.0;
 
     let output = egui::ScrollArea::vertical()
@@ -84,10 +88,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut TimelineState<'_>) -> Vec<TimelineAct
     let view = output.inner_rect.height();
     let at_bottom = offset + view + 40.0 >= content;
     let scrolled_up = ui.input(|input| input.smooth_scroll_delta.y > 0.0);
-    if at_bottom || !state.running {
-        *state.stick = true;
-    } else if scrolled_up {
+    if scrolled_up && !at_bottom {
         *state.stick = false;
+    } else if at_bottom {
+        *state.stick = true;
     }
 
     if !*state.stick {
@@ -118,7 +122,7 @@ fn entry_block(
     ui: &mut egui::Ui,
     entry: &Entry,
     state: &mut TimelineState<'_>,
-    actions: &mut Vec<TimelineAction>,
+    _actions: &mut Vec<TimelineAction>,
 ) {
     ui.push_id(&entry.id, |ui| match &entry.kind {
         EntryKind::User { text } => user_block(ui, text),
@@ -126,16 +130,13 @@ fn entry_block(
             assistant_block(ui, text, *streaming, state.provider, state.cache);
         }
         EntryKind::Thought { text, streaming } => thought_block(ui, text, *streaming),
-        EntryKind::Permission {
-            id,
-            action,
-            target,
-            risk,
-            reason,
-        } => permission_block(ui, state, actions, id, action, target, risk, reason),
+        EntryKind::Permission { .. } => {}
         EntryKind::Notice { message, .. } => notice_block(ui, message),
         EntryKind::Error { message, .. } => error_block(ui, message),
-        EntryKind::Usage(usage) => usage_block(ui, usage),
+        EntryKind::Attachment { name, mime, size } => notice_block(
+            ui,
+            &format!("Image · {name} · {mime} · {} KiB", size / 1024),
+        ),
         EntryKind::Tool { .. } => {}
     });
 }
@@ -209,8 +210,8 @@ fn assistant_block(
 
 fn thought_block(ui: &mut egui::Ui, text: &str, streaming: bool) {
     ui.add_space(10.0);
-    let id = egui::Id::unique(("thought", text.len(), text.as_ptr()));
-    let mut collapsed =
+    let id = ui.make_persistent_id("thought");
+    let collapsed =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
     let summary = if streaming {
         "Thinking…"
@@ -252,7 +253,7 @@ fn tool_group(ui: &mut egui::Ui, entries: &[Entry]) {
     });
     let id = egui::Id::unique(("tool-group", entries.first().map(|entry| &entry.id)));
     let default_open = !all_done;
-    let mut collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
+    let collapsing = egui::collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
         id,
         default_open,
@@ -289,14 +290,14 @@ fn tool_group(ui: &mut egui::Ui, entries: &[Entry]) {
                         .font(theme::medium(12.5))
                         .color(theme::SECONDARY),
                 );
-                if let Some(last) = entries.last() {
-                    if !last.at.is_empty() {
-                        ui.label(
-                            RichText::new(&last.at)
-                                .font(theme::ui(10.5))
-                                .color(theme::FAINT),
-                        );
-                    }
+                if let Some(last) = entries.last()
+                    && !last.at.is_empty()
+                {
+                    ui.label(
+                        RichText::new(&last.at)
+                            .font(theme::ui(10.5))
+                            .color(theme::FAINT),
+                    );
                 }
             })
             .body(|ui| {
@@ -328,7 +329,7 @@ fn tool_row(
     output: &str,
 ) {
     let id = egui::Id::unique(("tool", id));
-    let mut collapsing =
+    let collapsing =
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
     let color = match state {
         ToolState::Running => theme::BLUE,
@@ -368,16 +369,43 @@ fn tool_row(
         });
 }
 
+pub fn pending_requests(
+    ui: &mut egui::Ui,
+    session: &str,
+    entries: &[Entry],
+    pending: &HashMap<String, PendingState>,
+    online: bool,
+) -> Vec<TimelineAction> {
+    let mut actions = Vec::new();
+    for entry in entries {
+        if let EntryKind::Permission { id, .. } = &entry.kind
+            && pending.contains_key(id)
+        {
+            ui.push_id(id, |ui| {
+                permission_block(ui, session, pending, online, entry, &mut actions)
+            });
+        }
+    }
+    actions
+}
 fn permission_block(
     ui: &mut egui::Ui,
-    state: &TimelineState<'_>,
+    session: &str,
+    pending: &HashMap<String, PendingState>,
+    online: bool,
+    entry: &Entry,
     actions: &mut Vec<TimelineAction>,
-    id: &str,
-    action: &str,
-    target: &str,
-    risk: &str,
-    reason: &str,
 ) {
+    let EntryKind::Permission {
+        id,
+        action,
+        target,
+        risk,
+        reason,
+    } = &entry.kind
+    else {
+        return;
+    };
     ui.add_space(14.0);
     egui::Frame::new()
         .fill(theme::SURFACE)
@@ -420,7 +448,7 @@ fn permission_block(
             }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                let pending = state.pending.get(id).copied().unwrap_or_default();
+                let pending = pending.get(id).copied().unwrap_or_default();
                 match pending {
                     PendingState::Submitting => {
                         ui.spinner();
@@ -431,45 +459,56 @@ fn permission_block(
                         );
                     }
                     PendingState::Idle | PendingState::Failed => {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Deny")
-                                        .font(theme::medium(12.5))
-                                        .color(theme::SECONDARY),
+                        ui.add_enabled_ui(online, |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Deny")
+                                            .font(theme::medium(12.5))
+                                            .color(theme::SECONDARY),
+                                    )
+                                    .fill(theme::SURFACE_HIGH)
+                                    .corner_radius(9),
                                 )
-                                .fill(theme::SURFACE_HIGH)
-                                .corner_radius(9),
-                            )
-                            .clicked()
-                        {
-                            actions.push(TimelineAction::Decide {
-                                id: id.to_owned(),
-                                allow: false,
-                            });
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Allow once")
-                                        .font(theme::medium(12.5))
-                                        .color(Color32::from_rgb(14, 20, 26)),
+                                .clicked()
+                            {
+                                actions.push(TimelineAction::Decide {
+                                    session: session.to_owned(),
+                                    id: id.to_owned(),
+                                    allow: false,
+                                });
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Allow once")
+                                            .font(theme::medium(12.5))
+                                            .color(Color32::from_rgb(14, 20, 26)),
+                                    )
+                                    .fill(theme::BLUE)
+                                    .corner_radius(9),
                                 )
-                                .fill(theme::BLUE)
-                                .corner_radius(9),
-                            )
-                            .clicked()
-                        {
-                            actions.push(TimelineAction::Decide {
-                                id: id.to_owned(),
-                                allow: true,
-                            });
-                        }
+                                .clicked()
+                            {
+                                actions.push(TimelineAction::Decide {
+                                    session: session.to_owned(),
+                                    id: id.to_owned(),
+                                    allow: true,
+                                });
+                            }
+                        });
                         if pending == PendingState::Failed {
                             ui.label(
                                 RichText::new("Decision failed — try again")
                                     .font(theme::ui(11.0))
                                     .color(theme::RED),
+                            );
+                        }
+                        if !online {
+                            ui.label(
+                                RichText::new("Reconnect to submit a decision.")
+                                    .font(theme::ui(11.0))
+                                    .color(theme::MUTED),
                             );
                         }
                     }
@@ -521,29 +560,19 @@ fn error_block(ui: &mut egui::Ui, message: &str) {
     ui.add_space(6.0);
 }
 
-fn usage_block(ui: &mut egui::Ui, usage: &crate::state::Usage) {
-    let mut parts = Vec::new();
-    if let (Some(used), Some(size)) = (usage.context_used, usage.context_size) {
-        parts.push(format!("context {used}/{size}"));
-    }
-    if let Some(input) = usage.input_tokens {
-        parts.push(format!("in {input}"));
-    }
-    if let Some(output) = usage.output_tokens {
-        parts.push(format!("out {output}"));
-    }
-    if parts.is_empty() {
-        return;
-    }
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new(parts.join("  ·  "))
-            .font(theme::mono(10.5))
-            .color(theme::FAINT),
-    );
-}
-
 fn code_panel(ui: &mut egui::Ui, text: &str) {
+    let preview_end = text
+        .char_indices()
+        .nth(16_000)
+        .map_or(text.len(), |(index, _)| index);
+    let full = text;
+    let text = &text[..preview_end];
+    if preview_end < full.len() {
+        ui.label("Output preview limited to 16,000 characters");
+        if ui.button("Copy complete output").clicked() {
+            ui.ctx().copy_text(full.to_owned());
+        }
+    }
     let preview: String = if text.chars().count() > 6000 {
         let head: String = text.chars().take(6000).collect();
         format!("{head}\n… (truncated preview)")

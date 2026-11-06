@@ -100,7 +100,7 @@ pub fn install(ctx: &egui::Context, high_contrast: bool) {
 }
 
 fn install_fonts(ctx: &egui::Context) {
-    if ctx.data(|data| data.get_temp::<bool>(egui::Id::new("talos-fonts"))) == Some(true) {
+    if ctx.data(|data| data.get_temp::<bool>(egui::Id::unique("talos-fonts"))) == Some(true) {
         return;
     }
     let mut fonts = FontDefinitions::default();
@@ -153,7 +153,7 @@ fn install_fonts(ctx: &egui::Context) {
     );
     fonts.families.insert(FontFamily::Monospace, mono);
     ctx.set_fonts(fonts);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("talos-fonts"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("talos-fonts"), true));
 }
 
 fn family(name: &str) -> FontFamily {

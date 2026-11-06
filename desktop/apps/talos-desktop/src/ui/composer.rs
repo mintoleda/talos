@@ -17,6 +17,7 @@ use crate::ui::motion;
 /// Everything the composer needs for one frame.
 pub struct ComposerState<'a> {
     pub session_id: &'a str,
+    pub provider_id: &'a str,
     pub draft: &'a mut String,
     pub running: bool,
     pub online: bool,
@@ -25,6 +26,8 @@ pub struct ComposerState<'a> {
     pub providers: &'a [ProviderSummary],
     pub usage: Option<&'a Usage>,
     pub motion: bool,
+    pub attachments: &'a [serde_json::Value],
+    pub config_options: &'a serde_json::Value,
 }
 
 /// User intent produced by the composer.
@@ -34,7 +37,9 @@ pub enum ComposerAction {
     Stop,
     SetModel { provider: String, model: String },
     Attach,
-    Voice,
+    RemoveAttachment(usize),
+    SetMode(String),
+    SetConfig { option: String, value: String },
 }
 
 /// Stable widget id for focusing the composer with a keyboard shortcut.
@@ -50,12 +55,20 @@ pub fn height(draft: &str, width: f32) -> f32 {
     104.0 + (rows.saturating_sub(1) as f32) * 19.0
 }
 
+/// Height for the composer when validated image chips are present.
+#[must_use]
+pub fn height_with_attachments(draft: &str, width: f32, attachment_count: usize) -> f32 {
+    let columns = ((width - 64.0) / 230.0).floor().max(1.0) as usize;
+    let rows = attachment_count.div_ceil(columns);
+    height(draft, width) + (rows as f32) * 30.0
+}
+
 /// Draw the composer and return any requested action.
 pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<ComposerAction> {
     let available = ui.available_width();
     let width = (available - 40.0).clamp(260.0, theme::COMPOSER_MAX);
     let rows = draft_lines(state.draft, width);
-    let shell_height = height(state.draft, width);
+    let shell_height = height_with_attachments(state.draft, width, state.attachments.len());
     let mut action = None;
 
     ui.vertical_centered(|ui| {
@@ -103,6 +116,35 @@ pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<Composer
             |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
 
+                if !state.attachments.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        for (index, attachment) in state.attachments.iter().enumerate() {
+                            let name = attachment["name"].as_str().unwrap_or("Image");
+                            let mime = attachment["mime"].as_str().unwrap_or("image");
+                            let size = attachment["size"].as_u64().unwrap_or_default() / 1024;
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!(
+                                            "{} · {mime} · {size} KiB  ×",
+                                            truncate_name(name, 22)
+                                        ))
+                                        .font(theme::ui(10.5))
+                                        .color(theme::SECONDARY),
+                                    )
+                                    .fill(theme::SURFACE_HIGH)
+                                    .stroke(Stroke::new(1.0, theme::LINE))
+                                    .corner_radius(8),
+                                )
+                                .on_hover_text("Remove attachment")
+                                .clicked()
+                            {
+                                action = Some(ComposerAction::RemoveAttachment(index));
+                            }
+                        }
+                    });
+                }
+
                 let input_height = 26.0 + (rows.saturating_sub(1) as f32) * 19.0;
                 let edit = egui::TextEdit::multiline(state.draft)
                     .id(focus_id)
@@ -117,7 +159,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<Composer
                     .margin(Margin::ZERO)
                     .font(theme::ui(14.5))
                     .text_color(theme::TEXT)
-                    .lock_focus(true);
+                    .lock_focus(true)
+                    .return_key(egui::KeyboardShortcut::new(
+                        egui::Modifiers::SHIFT,
+                        egui::Key::Enter,
+                    ));
                 let response = ui.add_sized([ui.available_width(), input_height], edit);
 
                 let quiet_input = ui.input(|input| {
@@ -142,14 +188,26 @@ pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<Composer
                     && !quiet_input;
 
                 let running = state.running;
-                let ready = state.online && can_send(state.draft, 0, running);
+                let ready = state.online && can_send(state.draft, state.attachments.len(), running);
                 if (enter || command_enter) && ready {
                     action = Some(ComposerAction::Send);
                 }
 
                 // Bottom control baseline.
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    if icon_control(ui, Icon::Plus, "Attach a file", true).clicked() {
+                    if icon_control(
+                        ui,
+                        Icon::Plus,
+                        "Attach images · PNG, JPEG, GIF, WebP",
+                        state.online
+                            && state
+                                .providers
+                                .iter()
+                                .find(|p| p.id == state.provider_id)
+                                .is_some_and(|p| p.supports("images")),
+                    )
+                    .clicked()
+                    {
                         action = Some(ComposerAction::Attach);
                     }
                     model_selector(ui, state, &mut action);
@@ -164,26 +222,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<Composer
                                 None
                             };
                         }
-                        if icon_control(
-                            ui,
-                            Icon::Waveform,
-                            "Dictation isn't wired to this daemon yet",
-                            false,
-                        )
-                        .clicked()
-                        {
-                            action = Some(ComposerAction::Voice);
-                        }
-                        if icon_control(
-                            ui,
-                            Icon::Mic,
-                            "Voice input isn't wired to this daemon yet",
-                            false,
-                        )
-                        .clicked()
-                        {
-                            action = Some(ComposerAction::Voice);
-                        }
+                        config_selector(ui, state, &mut action);
                         context_meter(ui, state);
                     });
                 });
@@ -193,16 +232,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<Composer
     action
 }
 
+fn truncate_name(name: &str, limit: usize) -> String {
+    if name.chars().count() <= limit {
+        return name.to_owned();
+    }
+    let mut name: String = name.chars().take(limit.saturating_sub(1)).collect();
+    name.push('…');
+    name
+}
+
 fn model_selector(
     ui: &mut egui::Ui,
     state: &ComposerState<'_>,
     action: &mut Option<ComposerAction>,
 ) {
-    let provider_id = state
-        .session
-        .map(|session| session.provider.as_str())
-        .filter(|provider| !provider.is_empty())
-        .unwrap_or("talos");
+    let provider_id = state.provider_id;
     let provider = state
         .providers
         .iter()
@@ -219,7 +263,7 @@ fn model_selector(
         Icon::Sparkle,
         theme::ORANGE,
         &format!("{provider_label} · {model_label}"),
-        true,
+        state.online && !state.running && state.session.is_none_or(|s| !s.archived),
     );
     egui::Popup::menu(&response)
         .id(egui::Id::unique("model-menu"))
@@ -271,12 +315,13 @@ fn model_selector(
                         let selected = current_provider && model.id == model_label;
                         if ui
                             .add_enabled(
-                                provider.available && current_provider,
+                                provider.available && (current_provider || state.session.is_none()) && provider.supports("model_selection") && !state.running,
                                 egui::Button::new(
                                     RichText::new(format!(
-                                        "   {}{}",
+                                        "   {}{}{}",
                                         model.label,
-                                        if selected { "  ✓" } else { "" }
+                                        if selected { "  ✓" } else { "" },
+                                        if model.default { " · default" } else { "" }
                                     ))
                                     .font(theme::ui(12.0))
                                     .color(if selected { theme::TEXT } else { theme::SECONDARY }),
@@ -316,10 +361,23 @@ fn chip(
     label: &str,
     interactive: bool,
 ) -> Response {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), theme::medium(12.0), theme::SECONDARY);
-    let size = Vec2::new(galley.size().x + 46.0, 28.0);
+    let label = if ui.available_width() < 390.0 {
+        "Model"
+    } else {
+        label
+    };
+    let galley = ui.painter().layout(
+        label.to_owned(),
+        theme::medium(12.0),
+        theme::SECONDARY,
+        (ui.available_width() - 160.0).clamp(30.0, 240.0),
+    );
+    let size = Vec2::new(
+        (galley.size().x + 46.0)
+            .min((ui.available_width() - 90.0).max(80.0))
+            .min(300.0),
+        36.0,
+    );
     let sense = if interactive {
         Sense::click()
     } else {
@@ -366,6 +424,7 @@ fn chip(
     if interactive && response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, interactive, label));
     response
 }
 
@@ -412,7 +471,25 @@ fn context_meter(ui: &mut egui::Ui, state: &ComposerState<'_>) {
 }
 
 fn send_button(ui: &mut egui::Ui, ready: bool, running: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::splat(38.0),
+        if ready || running {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::Role::Button,
+            ready || running,
+            if running { "Stop run" } else { "Send prompt" },
+        )
+    });
+    if response.has_focus() {
+        ui.painter()
+            .circle_stroke(rect.center(), 21.0, Stroke::new(2.0, theme::BLUE));
+    }
     let hover =
         ui.ctx()
             .animate_bool_with_time(egui::Id::unique("send-hover"), response.hovered(), 0.09);
@@ -452,7 +529,14 @@ fn send_button(ui: &mut egui::Ui, ready: bool, running: bool) -> Response {
 }
 
 fn icon_control(ui: &mut egui::Ui, icon: Icon, tip: &str, enabled: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::splat(36.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
     let hover = ui.ctx().animate_bool_with_time(
         egui::Id::unique(("icon-hover", tip)),
         response.hovered(),
@@ -491,6 +575,15 @@ fn icon_control(ui: &mut egui::Ui, icon: Icon, tip: &str, enabled: bool) -> Resp
             egui::CursorIcon::Default
         });
     }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, tip));
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            7.0,
+            Stroke::new(2.0, theme::BLUE),
+            egui::StrokeKind::Inside,
+        );
+    }
     response.on_hover_text(tip)
 }
 
@@ -510,14 +603,59 @@ pub fn suggestion_chip(ui: &mut egui::Ui, label: &str) -> Response {
     .on_hover_text("Insert this prompt")
 }
 
-/// Wrap a hint line with the keyboard contract.
-pub fn hint(ui: &mut egui::Ui) {
-    ui.add(
-        egui::Label::new(
-            RichText::new("Enter to send  ·  Shift+Enter for a new line")
-                .font(theme::ui(10.5))
-                .color(theme::FAINT),
-        )
-        .extend(),
-    );
+fn config_selector(
+    ui: &mut egui::Ui,
+    state: &ComposerState<'_>,
+    action: &mut Option<ComposerAction>,
+) {
+    let Some(session) = state.session else { return };
+    let Some(provider) = state.providers.iter().find(|p| p.id == session.provider) else {
+        return;
+    };
+    if !provider.supports("modes") && !provider.supports("config_options") {
+        return;
+    }
+    ui.add_enabled_ui(state.online && !state.running && !session.archived, |ui| {
+        ui.menu_button("Options", |ui| {
+            if provider.supports("modes") {
+                ui.label("Session mode");
+                for (id, label) in &provider.modes {
+                    if ui
+                        .selectable_label(session.mode.as_ref() == Some(id), label)
+                        .clicked()
+                    {
+                        *action = Some(ComposerAction::SetMode(id.clone()));
+                        ui.close();
+                    }
+                }
+            }
+            if provider.supports("config_options") {
+                for option in state.config_options.as_array().into_iter().flatten() {
+                    let (Some(id), Some(name)) = (option["id"].as_str(), option["name"].as_str())
+                    else {
+                        continue;
+                    };
+                    ui.label(name);
+                    for choice in option["options"].as_array().into_iter().flatten() {
+                        let Some(value) = choice["value"].as_str() else {
+                            continue;
+                        };
+                        if ui
+                            .selectable_label(
+                                option["currentValue"] == value,
+                                choice["name"].as_str().unwrap_or(value),
+                            )
+                            .clicked()
+                        {
+                            *action = Some(ComposerAction::SetConfig {
+                                option: id.into(),
+                                value: value.into(),
+                            });
+                            ui.close();
+                        }
+                    }
+                }
+            }
+        });
+    });
 }
