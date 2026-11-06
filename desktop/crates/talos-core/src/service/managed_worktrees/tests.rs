@@ -211,8 +211,18 @@ async fn delete_boundaries_reconcile_without_retrying_removal_of_present_files()
                     assert!(reopened.delete_managed_worktree(actual.id).await.is_err());
                 } else {
                     assert_eq!(actual.lifecycle, WorkspaceLifecycle::Archived);
-                    assert!(!Path::new(&actual.path).exists());
-                    assert!(reopened.restore_workspace(actual.id).await.is_err());
+                    assert_ne!(actual.path, workspace.path);
+                    assert_eq!(actual.metadata["managedWorktree"]["preserved"], true);
+                    assert_eq!(actual.metadata["managedWorktree"]["path"], actual.path);
+                    assert!(Path::new(&actual.path).is_dir());
+                    assert_eq!(
+                        std::fs::read_to_string(Path::new(&actual.path).join("tracked")).unwrap(),
+                        "original\n"
+                    );
+                    let restored = reopened.restore_workspace(actual.id).await.unwrap();
+                    assert_eq!(restored.lifecycle, WorkspaceLifecycle::Active);
+                    assert_eq!(restored.path, actual.path);
+                    reopened.archive_workspace(actual.id).await.unwrap();
                 }
                 reopened.shutdown().await;
             }
@@ -311,7 +321,32 @@ async fn git_refusal_cancels_delete_and_preserves_the_original_archive_state() {
 }
 
 #[tokio::test]
-async fn ignored_file_created_after_preflight_is_preserved_by_immediate_recheck() {
+async fn file_created_before_recheck_is_detected_and_kept_at_the_original_path() {
+    let fixture = Fixture::new();
+    let service = fixture.open().await;
+    let workspace = fixture.create(&service).await;
+    let path = Path::new(&workspace.path);
+    fault(&service, "delete_race_before_recheck");
+
+    assert!(service.delete_managed_worktree(workspace.id).await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(path.join("delete-race-data")).unwrap(),
+        "preserve this race-created file"
+    );
+    assert_eq!(
+        service.workspace(workspace.id).await.unwrap().lifecycle,
+        WorkspaceLifecycle::Active
+    );
+    assert_eq!(
+        service.pending_worktree_operations().await.unwrap().len(),
+        0
+    );
+    assert!(registration(&fixture.repo, path).await.unwrap().is_some());
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn ignored_file_created_after_cleanliness_check_is_quarantined_not_deleted() {
     let fixture = Fixture::new();
     let service = fixture.open().await;
     let workspace = fixture.create(&service).await;
@@ -334,25 +369,68 @@ async fn ignored_file_created_after_preflight_is_preserved_by_immediate_recheck(
     }
     fault(&service, "delete_race_ignored");
 
-    assert!(service.delete_managed_worktree(workspace.id).await.is_err());
+    let preserved = service.delete_managed_worktree(workspace.id).await.unwrap();
+    let preserved_path = PathBuf::from(&preserved.path);
+    assert_ne!(preserved_path, path);
+    assert_eq!(preserved.lifecycle, WorkspaceLifecycle::Archived);
+    assert_eq!(preserved.metadata["managedWorktree"]["preserved"], true);
     assert_eq!(
-        std::fs::read_to_string(path.join("delete-race-data")).unwrap(),
+        std::fs::read_to_string(preserved_path.join("delete-race-data")).unwrap(),
         "preserve this race-created file"
     );
-    assert_eq!(
-        service.workspace(workspace.id).await.unwrap().lifecycle,
-        WorkspaceLifecycle::Active
+    assert!(!path.exists());
+    assert!(
+        registration(&fixture.repo, &preserved_path)
+            .await
+            .unwrap()
+            .is_some()
     );
     assert_eq!(
         service.pending_worktree_operations().await.unwrap().len(),
         0
     );
-    assert!(registration(&fixture.repo, path).await.unwrap().is_some());
+
+    // The retained checkout is still owned: restore must accept its registered
+    // path, rather than requiring the original pre-quarantine path.
+    let restored = service.restore_workspace(workspace.id).await.unwrap();
+    assert_eq!(restored.lifecycle, WorkspaceLifecycle::Active);
+    assert_eq!(restored.path, preserved.path);
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&restored.path).join("delete-race-data")).unwrap(),
+        "preserve this race-created file"
+    );
     service.shutdown().await;
 }
 
 #[tokio::test]
-async fn missing_checkout_registration_is_removed_without_force_on_restart() {
+async fn deleting_a_restored_preserved_worktree_uses_a_new_quarantine_path() {
+    let fixture = Fixture::new();
+    let service = fixture.open().await;
+    let workspace = fixture.create(&service).await;
+
+    let first = service.delete_managed_worktree(workspace.id).await.unwrap();
+    let first_path = PathBuf::from(&first.path);
+    let restored = service.restore_workspace(workspace.id).await.unwrap();
+    assert_eq!(restored.path, first.path);
+
+    let second = service.delete_managed_worktree(workspace.id).await.unwrap();
+    let second_path = PathBuf::from(&second.path);
+    assert_ne!(second_path, first_path);
+    assert!(!first_path.exists());
+    assert!(second_path.is_dir());
+    assert!(
+        registration(&fixture.repo, &second_path)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(second.metadata["managedWorktree"]["path"], second.path);
+    assert_eq!(second.metadata["managedWorktree"]["preserved"], true);
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_checkout_registration_is_retained_as_ambiguous_on_restart() {
     let fixture = Fixture::new();
     let service = fixture.open().await;
     let workspace = fixture.create(&service).await;
@@ -360,22 +438,31 @@ async fn missing_checkout_registration_is_removed_without_force_on_restart() {
     assert!(service.delete_managed_worktree(workspace.id).await.is_err());
     std::fs::remove_dir_all(&workspace.path).unwrap();
     service.shutdown().await;
-    let reopened = fixture.open().await;
-    assert_eq!(
-        reopened.pending_worktree_operations().await.unwrap().len(),
-        0
-    );
-    assert!(
-        registration(&fixture.repo, Path::new(&workspace.path))
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        reopened.workspace(workspace.id).await.unwrap().lifecycle,
-        WorkspaceLifecycle::Archived
-    );
-    reopened.shutdown().await;
+    for _ in 0..2 {
+        let reopened = fixture.open().await;
+        let pending = reopened.pending_worktree_operations().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0]
+                .last_error
+                .as_ref()
+                .unwrap()
+                .contains("ambiguous")
+        );
+        assert!(!Path::new(&workspace.path).exists());
+        assert!(
+            registration(&fixture.repo, Path::new(&workspace.path))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            reopened.workspace(workspace.id).await.unwrap().lifecycle,
+            WorkspaceLifecycle::Archived
+        );
+        assert!(reopened.restore_workspace(workspace.id).await.is_err());
+        reopened.shutdown().await;
+    }
 }
 
 #[cfg(unix)]

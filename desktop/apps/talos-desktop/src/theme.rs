@@ -15,19 +15,19 @@ use eframe::egui::{
 // ---------------------------------------------------------------------------
 
 /// Window canvas, the deepest layer.
-pub const CANVAS: Color32 = Color32::from_rgb(16, 19, 18);
+pub const CANVAS: Color32 = Color32::from_rgb(24, 28, 26);
 /// Navigation rail; one step above the canvas.
 pub const RAIL: Color32 = Color32::from_rgb(19, 23, 22);
 /// Sidebar / history panel surface.
-pub const SIDEBAR: Color32 = Color32::from_rgb(21, 25, 24);
+pub const SIDEBAR: Color32 = Color32::from_rgb(20, 24, 22);
 /// Raised card surface (tool cards, user messages).
-pub const SURFACE: Color32 = Color32::from_rgb(27, 32, 31);
+pub const SURFACE: Color32 = Color32::from_rgb(31, 35, 33);
 /// Higher emphasis surface (menus, popovers, chips).
 pub const SURFACE_HIGH: Color32 = Color32::from_rgb(33, 39, 38);
 /// Hovered surface.
 pub const HOVER: Color32 = Color32::from_rgb(38, 45, 44);
 /// Selected surface with a blue wash.
-pub const SELECTED: Color32 = Color32::from_rgb(30, 42, 54);
+pub const SELECTED: Color32 = Color32::from_rgb(40, 45, 42);
 /// Code block / inline code surface.
 pub const CODE: Color32 = Color32::from_rgb(24, 29, 28);
 
@@ -59,12 +59,12 @@ pub const RED: Color32 = Color32::from_rgb(224, 115, 106);
 // ---------------------------------------------------------------------------
 
 pub const RAIL_WIDTH: f32 = 60.0;
-pub const SIDEBAR_MIN: f32 = 244.0;
+pub const SIDEBAR_MIN: f32 = 200.0;
 pub const SIDEBAR_MAX: f32 = 340.0;
-pub const SIDEBAR_DEFAULT: f32 = 286.0;
-pub const READING_MAX: f32 = 760.0;
-pub const COMPOSER_MAX: f32 = 880.0;
-pub const COMPOSER_RADIUS: u8 = 22;
+pub const SIDEBAR_DEFAULT: f32 = 224.0;
+pub const READING_MAX: f32 = 820.0;
+pub const COMPOSER_MAX: f32 = 840.0;
+pub const COMPOSER_RADIUS: u8 = 16;
 pub const CARD_RADIUS: u8 = 14;
 pub const CHIP_RADIUS: u8 = 8;
 
@@ -132,7 +132,7 @@ fn install_fonts(ctx: &egui::Context) {
             .insert(0, name.to_owned());
     }
     // Proportional falls back to the UI face; keep egui's emoji fallbacks.
-    let mut proportional = vec![FAMILY_UI.to_owned()];
+    let mut proportional = vec![FAMILY_MONO.to_owned()];
     proportional.extend(
         fonts
             .families
@@ -163,22 +163,22 @@ fn family(name: &str) -> FontFamily {
 /// Regular UI font at a size.
 #[must_use]
 pub fn ui(size: f32) -> FontId {
-    FontId::new(size, family(FAMILY_UI))
+    FontId::new(size, family(FAMILY_MONO))
 }
 /// Medium weight, for labels and controls.
 #[must_use]
 pub fn medium(size: f32) -> FontId {
-    FontId::new(size, family(FAMILY_MEDIUM))
+    FontId::new(size, family(FAMILY_MONO_MEDIUM))
 }
 /// Semibold, for titles and emphasis.
 #[must_use]
 pub fn semibold(size: f32) -> FontId {
-    FontId::new(size, family(FAMILY_SEMIBOLD))
+    FontId::new(size, family(FAMILY_MONO_MEDIUM))
 }
 /// Bold, for strong display headings.
 #[must_use]
 pub fn bold(size: f32) -> FontId {
-    FontId::new(size, family(FAMILY_BOLD))
+    FontId::new(size, family(FAMILY_MONO_MEDIUM))
 }
 /// Monospace for paths, commands and code.
 #[must_use]

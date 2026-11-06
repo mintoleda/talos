@@ -298,17 +298,17 @@ pub(super) fn import_sessions(
             })
             .ok_or(MigrationError::SourceChanged)?;
         let path = pair.0.to_string_lossy().into_owned();
-        if (source_bytes > MAX_SESSION_PLAN_SOURCE_BYTES
-            || !budget.source_fits(source_bytes)
-            || budget.sessions >= MAX_PREPARED_SESSIONS)
-            && journal.pending_session.as_ref().is_none_or(|pending| {
-                let key = format!(
-                    "{}::{}",
-                    snapshot.root.to_string_lossy(),
-                    pair.0.to_string_lossy()
-                );
-                pending.source_key != key
-            })
+        let is_pending = journal.pending_session.as_ref().is_some_and(|pending| {
+            let key = format!(
+                "{}::{}",
+                snapshot.root.to_string_lossy(),
+                pair.0.to_string_lossy()
+            );
+            pending.source_key == key
+        });
+        if source_bytes > MAX_SESSION_PLAN_SOURCE_BYTES
+            || (!is_pending
+                && (!budget.source_fits(source_bytes) || budget.sessions >= MAX_PREPARED_SESSIONS))
         {
             push_issue(&mut report.issues, Issue {
                 path,
@@ -1078,7 +1078,8 @@ fn push_issue(issues: &mut Vec<Issue>, issue: Issue) {
         issues.push(Issue {
             path: "sessions-source".into(),
             category: "issue_limit_reached".into(),
-            message: "additional session inventory issues were omitted at the bounded report limit".into(),
+            message: "additional session inventory issues were omitted at the bounded report limit"
+                .into(),
         });
     }
 }
@@ -1799,7 +1800,10 @@ fn recover_linked_attachment_temporary(
             match temp_metadata.nlink() {
                 1 => false,
                 2 if temp_metadata.dev() == target_metadata.dev()
-                    && temp_metadata.ino() == target_metadata.ino() => true,
+                    && temp_metadata.ino() == target_metadata.ino() =>
+                {
+                    true
+                }
                 _ => return Err(MigrationError::UnsafePath),
             }
         };

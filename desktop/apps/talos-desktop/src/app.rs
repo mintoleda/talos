@@ -1,9 +1,11 @@
 //! Desktop application shell: panels, routing, keyboard map and dialogs.
 
 mod management;
+mod workspace_picker;
 use management::Management;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 use talos_ipc::Command;
 
@@ -82,8 +84,7 @@ struct NewAgentForm {
 #[derive(Default)]
 struct NewWorkspaceForm {
     open: bool,
-    name: String,
-    path: String,
+    selection: Option<std::sync::mpsc::Receiver<workspace_picker::Selection>>,
 }
 
 const NEW_CONVERSATION: &str = "__new__";
@@ -176,7 +177,7 @@ impl Desktop {
     }
 
     fn session_id(&self) -> Option<String> {
-        self.selected.clone()
+        self.selected.clone().filter(|id| id != NEW_CONVERSATION)
     }
 
     /// Reuse the most recently active model for this provider when creating a
@@ -264,8 +265,7 @@ impl Desktop {
             let provider = self
                 .view()
                 .session(&id)
-                .map(|session| session.provider.clone())
-                .unwrap_or_else(|| "talos".into());
+                .map_or_else(|| "talos".into(), |session| session.provider.clone());
             let model = self
                 .pending_model
                 .take()
@@ -290,6 +290,9 @@ impl Desktop {
         }
         if let Some(id) = self.backend.created_workspace.take() {
             self.workspace_filter = Some(id);
+            self.selected = Some(NEW_CONVERSATION.into());
+            self.settings = None;
+            self.composer_focus = true;
         }
         if let Some(error) = self.view().error.clone() {
             self.backend.view.error = None;
@@ -306,7 +309,7 @@ impl Desktop {
             .selected
             .as_deref()
             .is_some_and(|id| self.view().session(id).is_some());
-        if !valid {
+        if !valid && self.selected.as_deref() != Some(NEW_CONVERSATION) {
             self.selected = self
                 .view()
                 .sessions
@@ -536,7 +539,7 @@ impl Desktop {
         } else {
             theme::SIDEBAR_DEFAULT
         };
-        egui::Panel::left("history")
+        egui::Panel::left("workspace-sidebar")
             .default_size(width)
             .size_range(theme::SIDEBAR_MIN..=theme::SIDEBAR_MAX)
             .resizable(breakpoint == Breakpoint::Wide)
@@ -551,180 +554,86 @@ impl Desktop {
     }
 
     fn sidebar_contents(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.small_button("Manage workspaces").clicked() {
-                self.settings = Some(SettingsTab::Workspaces);
-                self.backend.submit(Action::Rpc(Command::ListProjects));
-            }
-            if ui.small_button("History").clicked() {
-                self.settings = Some(SettingsTab::History);
-            }
-        });
-        // Workspace picker.
-        let current = self
-            .workspace_filter
-            .as_ref()
-            .and_then(|id| {
-                self.view()
-                    .workspaces
-                    .iter()
-                    .find(|workspace| &workspace.id == id)
-            })
-            .map_or("All workspaces".to_owned(), |workspace| {
-                workspace.name.clone()
-            });
-        let response = ui.add_sized(
-            [ui.available_width(), 34.0],
-            egui::Button::new(
-                RichText::new(format!("      {current}"))
-                    .font(theme::medium(12.5))
-                    .color(theme::SECONDARY),
-            )
-            .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::new(1.0, theme::LINE))
-            .corner_radius(9),
-        );
-        icons::paint(
-            ui.painter(),
-            egui::Rect::from_center_size(
-                egui::pos2(response.rect.left() + 18.0, response.rect.center().y),
-                Vec2::splat(14.0),
-            ),
-            Icon::Folder,
-            theme::MUTED,
-            1.5,
-        );
-        icons::paint(
-            ui.painter(),
-            egui::Rect::from_center_size(
-                egui::pos2(response.rect.right() - 16.0, response.rect.center().y),
-                Vec2::splat(12.0),
-            ),
-            Icon::ChevronDown,
-            theme::FAINT,
-            1.4,
-        );
-        egui::Popup::menu(&response)
-            .id(egui::Id::unique("workspace-menu"))
-            .show(|ui| {
-                ui.set_min_width(230.0);
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("All workspaces")
-                                .font(theme::ui(12.0))
-                                .color(theme::TEXT),
-                        )
-                        .fill(if self.workspace_filter.is_none() {
-                            theme::SELECTED
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .corner_radius(7),
-                    )
-                    .clicked()
-                {
-                    self.workspace_filter = None;
-                    ui.close();
-                }
-                let workspaces = self.view().workspaces.clone();
-                for workspace in workspaces.into_iter().filter(|w| !w.archived) {
-                    let selected = self.workspace_filter.as_deref() == Some(workspace.id.as_str());
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(&workspace.name).font(theme::ui(12.0)).color(
-                                    if selected {
-                                        theme::TEXT
-                                    } else {
-                                        theme::SECONDARY
-                                    },
-                                ),
-                            )
-                            .fill(if selected {
-                                theme::SELECTED
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .corner_radius(7),
-                        )
-                        .on_hover_text(&workspace.path)
-                        .clicked()
-                    {
-                        self.workspace_filter = Some(workspace.id.clone());
-                        ui.close();
+        for (icon, label) in [
+            (Icon::Plus, "New workspace"),
+            (Icon::History, "History"),
+            (Icon::Search, "Search"),
+        ] {
+            if navigation_row(ui, icon, label) {
+                match icon {
+                    Icon::Plus => self.new_workspace.open = true,
+                    Icon::History => self.settings = Some(SettingsTab::History),
+                    Icon::Search => {
+                        self.palette.open = true;
+                        self.palette.focus = true;
+                        self.palette.query.clear();
                     }
+                    _ => {}
                 }
-                ui.separator();
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("  Add workspace…")
-                                .font(theme::ui(12.0))
-                                .color(theme::SECONDARY),
-                        )
-                        .corner_radius(7),
-                    )
-                    .clicked()
-                {
-                    self.new_workspace.open = true;
-                    ui.close();
-                }
-            });
-        ui.add_space(8.0);
-        let new_agent = ui.add_sized(
-            [ui.available_width(), 36.0],
-            egui::Button::new(
-                RichText::new("  New agent")
-                    .font(theme::medium(13.0))
-                    .color(theme::TEXT),
-            )
-            .fill(theme::SURFACE)
-            .stroke(Stroke::new(1.0, theme::LINE))
-            .corner_radius(10),
-        );
-        let icon_rect = egui::Rect::from_min_size(
-            new_agent.rect.left_top() + Vec2::new(12.0, 10.0),
-            Vec2::splat(16.0),
-        );
-        icons::paint(ui.painter(), icon_rect, Icon::Plus, theme::SECONDARY, 1.6);
-        if new_agent.clicked() {
-            self.create_agent();
+            }
         }
-        ui.add_space(6.0);
-        let search = ui.add_sized(
-            [ui.available_width(), 30.0],
-            egui::Button::new(
-                RichText::new("  Search agents")
-                    .font(theme::ui(12.0))
-                    .color(theme::FAINT),
-            )
-            .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::new(1.0, theme::LINE))
-            .corner_radius(9),
-        );
-        icons::paint(
-            ui.painter(),
-            egui::Rect::from_center_size(
-                egui::pos2(search.rect.left() + 18.0, search.rect.center().y),
-                Vec2::splat(14.0),
-            ),
-            Icon::Search,
-            theme::FAINT,
-            1.5,
-        );
-        if search.clicked() {
-            self.palette.open = true;
-            self.palette.focus = true;
-            self.palette.query.clear();
-        }
-        search.on_hover_text("Search agents and commands · ⌘K");
-
-        ui.checkbox(&mut self.show_archived, "Archived conversations");
         ui.add_space(12.0);
         widgets::divider(ui);
-        ui.add_space(4.0);
-
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Workspaces")
+                    .font(theme::ui(11.0))
+                    .color(theme::MUTED),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if header_icon(ui, Icon::Sliders, "Manage workspaces") {
+                    self.settings = Some(SettingsTab::Workspaces);
+                    self.backend.submit(Action::Rpc(Command::ListProjects));
+                }
+                if header_icon(ui, Icon::Plus, "New agent") {
+                    self.create_agent();
+                }
+            });
+        });
+        let workspaces = self.view().workspaces.clone();
+        if workspaces.len() > 1 {
+            let current = workspaces
+                .iter()
+                .find(|w| Some(&w.id) == self.workspace_filter.as_ref())
+                .map_or("All workspaces", |w| w.name.as_str());
+            egui::ComboBox::from_id_salt("workspace-filter")
+                .selected_text(
+                    RichText::new(current)
+                        .font(theme::ui(12.0))
+                        .color(theme::MUTED),
+                )
+                .width(ui.available_width() - 12.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.workspace_filter, None, "All workspaces");
+                    for workspace in workspaces.iter().filter(|w| !w.archived) {
+                        ui.selectable_value(
+                            &mut self.workspace_filter,
+                            Some(workspace.id.clone()),
+                            &workspace.name,
+                        );
+                    }
+                });
+        }
+        egui::Panel::bottom("sidebar-footer")
+            .exact_size(34.0)
+            .frame(egui::Frame::new().fill(theme::SIDEBAR))
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    if header_icon(ui, Icon::Settings, "Settings") {
+                        self.settings = Some(SettingsTab::Appearance);
+                    }
+                    if header_icon(ui, Icon::Inbox, "Needs your attention") {
+                        self.open_attention();
+                    }
+                    if !self.view().online {
+                        ui.label(
+                            RichText::new("Disconnected")
+                                .font(theme::ui(10.5))
+                                .color(theme::AMBER),
+                        );
+                    }
+                });
+            });
         egui::ScrollArea::vertical()
             .id_salt("history-list")
             .auto_shrink([false, false])
@@ -733,33 +642,18 @@ impl Desktop {
                     .view()
                     .sessions_for(self.workspace_filter.as_deref())
                     .into_iter()
-                    .filter(|session| session.archived == self.show_archived)
+                    .filter(|s| !s.archived)
                     .cloned()
                     .collect();
-                let attention: Vec<&Session> = sessions
-                    .iter()
-                    .filter(|session| session.status == SessionStatus::Attention)
-                    .collect();
-                let active: Vec<&Session> = sessions
-                    .iter()
-                    .filter(|session| session.status == SessionStatus::Running)
-                    .collect();
-                let recent: Vec<&Session> = sessions
-                    .iter()
-                    .filter(|session| {
-                        !matches!(
-                            session.status,
-                            SessionStatus::Attention | SessionStatus::Running
-                        )
-                    })
-                    .collect();
-                let selected = self.selected.clone();
                 let mut chosen = None;
-                for (label, group) in [
-                    ("NEEDS YOU", attention),
-                    ("ACTIVE", active),
-                    ("RECENT", recent),
-                ] {
+                for (label, working) in [("Working", true), ("Recent", false)] {
+                    let group: Vec<_> = sessions
+                        .iter()
+                        .filter(|s| {
+                            matches!(s.status, SessionStatus::Running | SessionStatus::Attention)
+                                == working
+                        })
+                        .collect();
                     if group.is_empty() {
                         continue;
                     }
@@ -768,185 +662,72 @@ impl Desktop {
                         if session_row(
                             ui,
                             session,
-                            selected.as_deref() == Some(&session.id),
+                            self.selected.as_deref() == Some(&session.id),
                             self.reduced_motion,
                         ) {
                             chosen = Some(session.id.clone());
                         }
                     }
-                    ui.add_space(6.0);
+                    ui.add_space(12.0);
                 }
                 if sessions.is_empty() {
-                    ui.add_space(18.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new("No agents in this workspace yet.")
-                                .font(theme::ui(12.0))
-                                .color(theme::FAINT),
-                        );
-                        ui.add_space(6.0);
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Start the first one")
-                                        .font(theme::medium(12.0))
-                                        .color(theme::BLUE),
-                                )
-                                .frame(false),
-                            )
-                            .clicked()
-                        {
-                            self.create_agent();
-                        }
-                    });
+                    ui.add_space(16.0);
+                    ui.label(
+                        RichText::new("No conversations yet")
+                            .font(theme::ui(12.0))
+                            .color(theme::MUTED),
+                    );
+                    if navigation_row(ui, Icon::Plus, "Start a conversation") {
+                        self.create_agent();
+                    }
                 }
                 if let Some(id) = chosen {
                     self.select(&id);
                 }
             });
-
-        // Usage footer.
-        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            ui.add_space(6.0);
-            let usage = self
-                .session()
-                .and_then(|session| self.view().usage.get(&session.id));
-            let (fraction, label) = usage.map_or((0.0, "No usage yet".to_owned()), |usage| {
-                let fraction = usage
-                    .context_size
-                    .filter(|size| *size > 0)
-                    .zip(usage.context_used)
-                    .map_or(0.0, |(size, used)| used as f32 / size as f32);
-                let tokens = usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0);
-                (
-                    fraction,
-                    if tokens > 0 {
-                        format!(
-                            "{} tokens · {:.0}% context",
-                            crate::backend::format_tokens(tokens),
-                            fraction * 100.0
-                        )
-                    } else {
-                        "Usage reported per run".to_owned()
-                    },
-                )
-            });
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new(label)
-                    .font(theme::ui(10.5))
-                    .color(theme::FAINT),
-            );
-            let (rect, _) =
-                ui.allocate_exact_size(Vec2::new(ui.available_width(), 4.0), Sense::hover());
-            ui.painter().rect_filled(rect, 2.0, theme::LINE);
-            if fraction > 0.0 {
-                let filled = egui::Rect::from_min_size(
-                    rect.min,
-                    Vec2::new(rect.width() * fraction.clamp(0.02, 1.0), rect.height()),
-                );
-                let color = if fraction > 0.9 {
-                    theme::RED
-                } else if fraction > 0.7 {
-                    theme::AMBER
-                } else {
-                    theme::BLUE
-                };
-                ui.painter().rect_filled(filled, 2.0, color);
-            }
-            widgets::divider(ui);
-            ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("Providers")
-                                .font(theme::ui(11.0))
-                                .color(theme::MUTED),
-                        )
-                        .frame(false),
-                    )
-                    .clicked()
-                {
-                    self.settings = Some(SettingsTab::Providers);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} online",
-                            self.view()
-                                .providers
-                                .iter()
-                                .filter(|provider| provider.available)
-                                .count()
-                        ))
-                        .font(theme::ui(10.5))
-                        .color(theme::FAINT),
-                    );
-                });
-            });
-        });
     }
 
-    fn header(&mut self, root: &mut egui::Ui, breakpoint: Breakpoint) {
+    fn header(&mut self, root: &mut egui::Ui, _breakpoint: Breakpoint) {
         egui::Panel::top("header")
-            .exact_size(58.0)
+            .exact_size(38.0)
             .frame(
                 egui::Frame::new()
                     .fill(theme::CANVAS)
-                    .inner_margin(Margin::symmetric(20, 8)),
+                    .inner_margin(Margin::symmetric(10, 2)),
             )
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    if breakpoint != Breakpoint::Wide
-                        && header_icon(ui, Icon::PanelLeft, "Toggle history · ⌘B")
-                    {
+                ui.horizontal_centered(|ui| {
+                    if header_icon(ui, Icon::PanelLeft, "Toggle sidebar · Ctrl+B") {
                         self.sidebar_open = !self.sidebar_open;
                     }
+                    if self.is_start_surface() {
+                        return;
+                    }
                     let session = self.session().cloned();
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        let title = session
-                            .as_ref()
-                            .map_or("New conversation", |session| session.title.as_str());
+                    let title = session
+                        .as_ref()
+                        .map_or("New conversation", |s| s.title.as_str());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(truncate(title, 48))
+                                .font(theme::ui(13.0))
+                                .color(theme::SECONDARY),
+                        )
+                        .truncate(),
+                    );
+                    if let Some(session) = &session {
+                        let workspace = self
+                            .view()
+                            .workspaces
+                            .iter()
+                            .find(|w| w.id == session.workspace)
+                            .map_or(session.workspace.as_str(), |w| w.name.as_str());
                         ui.label(
-                            RichText::new(title)
-                                .font(theme::semibold(15.0))
-                                .color(theme::TEXT),
+                            RichText::new(workspace)
+                                .font(theme::ui(12.0))
+                                .color(theme::MUTED),
                         );
-                        if let Some(session) = &session {
-                            let workspace = self
-                                .view()
-                                .workspaces
-                                .iter()
-                                .find(|workspace| workspace.id == session.workspace)
-                                .map_or(session.workspace.clone(), |workspace| {
-                                    workspace.name.clone()
-                                });
-                            let provider = self
-                                .view()
-                                .provider(&session.provider)
-                                .map_or(session.provider.clone(), |provider| provider.name.clone());
-                            let detail = if session.cwd.is_empty() {
-                                format!("{workspace}  ·  {provider}")
-                            } else {
-                                format!("{workspace}  ·  {}", compact_path(&session.cwd))
-                            };
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(detail)
-                                        .font(theme::ui(11.0))
-                                        .color(theme::MUTED),
-                                )
-                                .truncate(),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new("Choose a workspace and start an agent")
-                                    .font(theme::ui(11.0))
-                                    .color(theme::MUTED),
-                            );
-                        }
-                    });
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if header_icon(ui, Icon::More, "Conversation actions") {
                             self.open_session_menu();
@@ -954,10 +735,9 @@ impl Desktop {
                         if header_icon(ui, Icon::PanelLeft, "Inspector") {
                             self.inspector = !self.inspector;
                         }
-                        if header_icon(ui, Icon::Copy, "Copy conversation") {
-                            self.copy_conversation();
-                        }
-                        if let Some(session) = &self.session().cloned() {
+                        if let Some(session) = &session
+                            && session.status != SessionStatus::Idle
+                        {
                             status_chip(ui, session.status, self.reduced_motion);
                         }
                     });
@@ -987,7 +767,7 @@ impl Desktop {
                     text.push_str("\n\n");
                 }
                 EntryKind::Tool { name, target, .. } => {
-                    text.push_str(&format!("[{name}] {target}\n"));
+                    let _ = writeln!(text, "[{name}] {target}");
                 }
                 _ => {}
             }
@@ -1081,6 +861,11 @@ impl Desktop {
             });
     }
 
+    fn is_start_surface(&self) -> bool {
+        self.session_id()
+            .is_none_or(|id| self.view().entries.get(&id).is_none_or(Vec::is_empty))
+    }
+
     fn conversation(&mut self, ui: &mut egui::Ui) {
         let Some(id) = self.session_id() else {
             self.empty_state(ui);
@@ -1092,15 +877,11 @@ impl Desktop {
             return;
         }
         let mut stick = self.stick.get(&id).copied().unwrap_or(true);
-        let Some(mut cache) = self.caches.remove(&id) else {
-            self.caches.insert(id.clone(), MarkdownCache::default());
-            return;
-        };
+        let mut cache = self.caches.remove(&id).unwrap_or_default();
         let running = self.view().running(&id);
         let provider = self
             .session()
-            .map(|session| session.provider.clone())
-            .unwrap_or_else(|| "talos".into());
+            .map_or_else(|| "talos".into(), |session| session.provider.clone());
         let provider_name = self
             .view()
             .provider(&provider)
@@ -1143,64 +924,67 @@ impl Desktop {
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui) {
-        ui.add_space((ui.available_height() * 0.24).clamp(12.0, 160.0));
-        ui.vertical_centered(|ui| {
-            ui.set_max_width((ui.available_width() - 24.0).clamp(280.0, 560.0));
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(46.0), Sense::hover());
-            paint_logo(ui, rect);
-            ui.add_space(18.0);
-            ui.label(
-                RichText::new("What are we building?")
-                    .font(theme::semibold(24.0))
-                    .color(theme::TEXT),
-            );
-            ui.add_space(8.0);
-            ui.add(
-                egui::Label::new(
-                    RichText::new(match self.session() {
-                        Some(session) if !session.workspace.is_empty() => {
-                            "Talos runs the coding loop; Talos Desktop keeps the workspace, history and decisions in one place."
+        // Keep the complete start surface together, scrollable at high scaling.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(((ui.available_height() - 220.0) * 0.45).max(12.0));
+                ui.vertical_centered(|ui| {
+                    ui.set_max_width((ui.available_width() - 16.0).min(theme::COMPOSER_MAX));
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        ui.label(
+                            RichText::new("New workspace")
+                                .font(theme::ui(20.0))
+                                .color(theme::TEXT),
+                        );
+                        ui.add_space(20.0);
+                        let workspaces: Vec<_> = self
+                            .view()
+                            .workspaces
+                            .iter()
+                            .filter(|w| !w.archived)
+                            .cloned()
+                            .collect();
+                        let current = workspaces
+                            .iter()
+                            .find(|w| Some(&w.id) == self.workspace_filter.as_ref())
+                            .or_else(|| workspaces.first());
+                        let label = current.map_or("Choose folder…", |w| w.name.as_str());
+                        if workspaces.is_empty() {
+                            if ui.button(label).clicked() {
+                                self.new_workspace.open = true;
+                            }
+                        } else {
+                            egui::ComboBox::from_id_salt("start-workspace")
+                                .selected_text(
+                                    RichText::new(label)
+                                        .font(theme::ui(13.0))
+                                        .color(theme::SECONDARY),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for workspace in &workspaces {
+                                        ui.selectable_value(
+                                            &mut self.workspace_filter,
+                                            Some(workspace.id.clone()),
+                                            &workspace.name,
+                                        );
+                                    }
+                                    ui.separator();
+                                    if ui.button("Choose another folder…").clicked() {
+                                        self.new_workspace.open = true;
+                                        ui.close();
+                                    }
+                                });
                         }
-                        _ => "Add a workspace to give the agent a place to work.",
-                    })
-                    .font(theme::ui(13.0))
-                    .color(theme::SECONDARY),
-                )
-                .wrap(),
-            );
-            ui.add_space(26.0);
-            let suggestions = [
-                "Explain the architecture of this repo",
-                "Review my uncommitted changes",
-                "Find the riskiest code path",
-            ];
-            ui.vertical_centered(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(0.0, 8.0);
-                for suggestion in suggestions {
-                    if composer::suggestion_chip(ui, suggestion).clicked() {
-                        let id = self
-                            .session_id()
-                            .unwrap_or_else(|| NEW_CONVERSATION.into());
-                        self.drafts.insert(id, suggestion.to_owned());
-                        self.composer_focus = true;
-                    }
-                }
+                        ui.add_space(12.0);
+                        self.composer_panel(ui, layout_for_width(ui.available_width()), true);
+                    });
+                });
             });
-            if !self.view().online {
-                ui.add_space(22.0);
-                ui.label(
-                    RichText::new(
-                        "Connect to the local daemon to create agents. Your drafts stay here.",
-                    )
-                    .font(theme::ui(11.5))
-                    .color(theme::AMBER),
-                );
-            }
-        });
     }
 
-    fn composer_panel(&mut self, root: &mut egui::Ui, breakpoint: Breakpoint) {
-        if self.settings.is_some() {
+    fn composer_panel(&mut self, root: &mut egui::Ui, breakpoint: Breakpoint, embedded: bool) {
+        if self.settings.is_some() || (!embedded && self.is_start_surface()) {
             return;
         }
         let id = self
@@ -1267,90 +1051,93 @@ impl Desktop {
             });
             self.composer_focus = false;
         }
-        egui::Panel::bottom("composer")
-            .exact_size(height + 18.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::CANVAS)
-                    .inner_margin(Margin::symmetric(0, 6)),
-            )
-            .show(root, |ui| {
-                ui.set_max_width(ui.available_width());
-                let mut state = ComposerState {
-                    session_id: &id,
-                    provider_id: &provider_id,
-                    draft: &mut draft,
-                    running,
-                    online,
-                    session: session.as_ref(),
-                    remembered_model: remembered_model.as_deref(),
-                    providers: &providers,
-                    usage: usage.as_ref(),
-                    motion,
-                    attachments: &attachments,
-                    config_options: &config_options,
-                };
-                let action = composer::show(ui, &mut state);
-                let _ = breakpoint;
-                match action {
-                    Some(ComposerAction::Send) => {
-                        self.drafts.insert(id.clone(), draft.clone());
-                        let sent = if has_session {
-                            self.send()
-                        } else {
-                            self.start_from_prompt()
-                        };
-                        if sent {
-                            draft.clear();
-                        }
+        let draw = |ui: &mut egui::Ui| {
+            ui.set_max_width(ui.available_width());
+            let mut state = ComposerState {
+                session_id: &id,
+                provider_id: &provider_id,
+                draft: &mut draft,
+                running,
+                online,
+                session: session.as_ref(),
+                remembered_model: remembered_model.as_deref(),
+                providers: &providers,
+                usage: usage.as_ref(),
+                motion,
+                attachments: &attachments,
+                config_options: &config_options,
+            };
+            let action = composer::show(ui, &mut state);
+            let _ = breakpoint;
+            match action {
+                Some(ComposerAction::Send) => {
+                    self.drafts.insert(id.clone(), draft.clone());
+                    let sent = if has_session {
+                        self.send()
+                    } else {
+                        self.start_from_prompt()
+                    };
+                    if sent {
+                        draft.clear();
                     }
-                    Some(ComposerAction::Stop) => {
-                        self.backend.submit(Action::Cancel(id.clone()));
-                    }
-                    Some(ComposerAction::SetModel { provider, model }) => {
-                        if has_session {
-                            if self.backend.submit(Action::SetModel {
-                                session: id.clone(),
-                                model: model.clone(),
-                            }) {
-                                self.notify(format!("Model set to {model} for the next turn."));
-                            }
-                        } else {
-                            self.pending_model = Some((provider, model.clone()));
-                            self.notify(format!(
-                                "Model {model} selected for the new conversation."
-                            ));
-                        }
-                    }
-                    Some(ComposerAction::Attach) => {
-                        self.attachment_dialog = Some((id.clone(), String::new()));
-                    }
-                    Some(ComposerAction::RemoveAttachment(index)) => {
-                        if let Some(images) = self.images.get_mut(&id)
-                            && index < images.len()
-                        {
-                            images.remove(index);
-                        }
-                        if self.images.get(&id).is_some_and(Vec::is_empty) {
-                            self.images.remove(&id);
-                        }
-                    }
-                    Some(ComposerAction::SetMode(mode)) => {
-                        self.backend.submit(Action::Rpc(Command::SetMode {
-                            session_id: id.clone(),
-                            mode_id: mode,
-                        }));
-                    }
-                    Some(ComposerAction::SetConfig { option, value }) => {
-                        self.backend.submit(Action::SetConfig {
-                            session: id.clone(),
-                            option,
-                            value,
-                        });
-                    }
-                    None => {}
                 }
-            });
+                Some(ComposerAction::Stop) => {
+                    self.backend.submit(Action::Cancel(id.clone()));
+                }
+                Some(ComposerAction::SetModel { provider, model }) => {
+                    if has_session {
+                        if self.backend.submit(Action::SetModel {
+                            session: id.clone(),
+                            model: model.clone(),
+                        }) {
+                            self.notify(format!("Model set to {model} for the next turn."));
+                        }
+                    } else {
+                        self.pending_model = Some((provider, model.clone()));
+                        self.notify(format!("Model {model} selected for the new conversation."));
+                    }
+                }
+                Some(ComposerAction::Attach) => {
+                    self.attachment_dialog = Some((id.clone(), String::new()));
+                }
+                Some(ComposerAction::RemoveAttachment(index)) => {
+                    if let Some(images) = self.images.get_mut(&id)
+                        && index < images.len()
+                    {
+                        images.remove(index);
+                    }
+                    if self.images.get(&id).is_some_and(Vec::is_empty) {
+                        self.images.remove(&id);
+                    }
+                }
+                Some(ComposerAction::SetMode(mode)) => {
+                    self.backend.submit(Action::Rpc(Command::SetMode {
+                        session_id: id.clone(),
+                        mode_id: mode,
+                    }));
+                }
+                Some(ComposerAction::SetConfig { option, value }) => {
+                    self.backend.submit(Action::SetConfig {
+                        session: id.clone(),
+                        option,
+                        value,
+                    });
+                }
+                None => {}
+            }
+        };
+        if embedded {
+            egui::Frame::NONE.show(root, draw);
+        } else {
+            egui::Panel::bottom("composer")
+                .exact_size(height + 12.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::CANVAS)
+                        .inner_margin(Margin::symmetric(0, 6)),
+                )
+                .show(root, draw);
+        }
         self.drafts.insert(id, draft);
     }
 
@@ -1438,7 +1225,7 @@ impl Desktop {
         for (label, value) in [
             (
                 "Provider",
-                provider_label(self.view(), &session.provider).to_owned(),
+                provider_label(self.view(), &session.provider).clone(),
             ),
             ("Agent ID", session.agent_id.clone()),
             ("Model", session.model_label()),
@@ -1558,7 +1345,7 @@ impl Desktop {
                     SettingsTab::Providers => self.settings_providers(ui),
                     SettingsTab::Permissions => self.settings_permissions(ui),
                     SettingsTab::Diagnostics => self.settings_diagnostics(ui),
-                    SettingsTab::About => self.settings_about(ui),
+                    SettingsTab::About => Self::settings_about(ui),
                     SettingsTab::Workspaces => self.workspace_settings(ui),
                     SettingsTab::History => self.history_settings(ui),
                     SettingsTab::Terminal => self.terminal_settings(ui),
@@ -1812,7 +1599,7 @@ impl Desktop {
         }
     }
 
-    fn settings_about(&mut self, ui: &mut egui::Ui) {
+    fn settings_about(ui: &mut egui::Ui) {
         settings_heading(ui, "Talos Desktop");
         ui.label(
             RichText::new(
@@ -1889,10 +1676,10 @@ impl Desktop {
                         .contains(&self.palette.query.to_lowercase())
             })
             .collect();
-        if !filtered.is_empty() {
-            self.palette.index = self.palette.index.min(filtered.len() - 1);
-        } else {
+        if filtered.is_empty() {
             self.palette.index = 0;
+        } else {
+            self.palette.index = self.palette.index.min(filtered.len() - 1);
         }
         // Scrim.
         let screen = ctx.content_rect();
@@ -2302,62 +2089,44 @@ impl Desktop {
     }
 
     fn new_workspace_dialog(&mut self, ctx: &egui::Context) {
-        if !self.new_workspace.open {
-            return;
+        if self.new_workspace.open && self.new_workspace.selection.is_none() {
+            self.new_workspace.open = false;
+            self.new_workspace.selection = Some(workspace_picker::open(ctx.clone()));
         }
-        let mut open = true;
-        egui::Window::new("Add workspace")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(400.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("NAME")
-                        .font(theme::semibold(9.5))
-                        .color(theme::FAINT),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_workspace.name)
-                        .hint_text("my-project")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("ABSOLUTE PATH")
-                        .font(theme::semibold(9.5))
-                        .color(theme::FAINT),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_workspace.path)
-                        .hint_text("/home/you/repos/project")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(12.0);
-                let ready = self.view().online
-                    && self.backend.busy == 0
-                    && !self.new_workspace.name.trim().is_empty()
-                    && self.new_workspace.path.starts_with('/');
-                if ui
-                    .add_enabled(
-                        ready,
-                        egui::Button::new(
-                            RichText::new("Add workspace")
-                                .font(theme::medium(12.5))
-                                .color(Color32::from_rgb(13, 18, 22)),
-                        )
-                        .fill(theme::BLUE)
-                        .corner_radius(9),
-                    )
-                    .clicked()
+        let Some(receiver) = &self.new_workspace.selection else {
+            return;
+        };
+        let selection = match receiver.try_recv() {
+            Ok(selection) => selection,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("The folder picker closed unexpectedly. Please try again.".into())
+            }
+        };
+        self.new_workspace.selection = None;
+        match selection {
+            Ok(Some(path)) => {
+                let path_text = path.to_string_lossy().into_owned();
+                if let Some(workspace) = self
+                    .view()
+                    .workspaces
+                    .iter()
+                    .find(|w| w.path == path_text && !w.archived)
                 {
-                    self.backend.submit(Action::CreateWorkspace {
-                        name: self.new_workspace.name.trim().to_owned(),
-                        path: self.new_workspace.path.trim().to_owned(),
-                    });
+                    self.workspace_filter = Some(workspace.id.clone());
+                    self.selected = Some(NEW_CONVERSATION.into());
+                    self.settings = None;
+                    self.composer_focus = true;
+                } else if !self.backend.submit(Action::CreateWorkspace {
+                    name: workspace_picker::folder_name(&path),
+                    path: path_text,
+                }) {
+                    self.warn("Could not add the folder. Reconnect and try again.");
                 }
-            });
-        self.new_workspace.open &= open;
+            }
+            Ok(None) => {}
+            Err(error) => self.warn(error),
+        }
     }
 
     fn rename_dialog(&mut self, ctx: &egui::Context) {
@@ -2483,11 +2252,12 @@ impl eframe::App for Desktop {
         theme::install(&ctx, self.high_contrast);
         self.shortcuts(&ctx);
         let breakpoint = layout_for_width(root.available_width());
-        self.rail(root, breakpoint);
         self.sidebar(root, breakpoint);
         self.header(root, breakpoint);
-        self.status_bar(root);
-        self.composer_panel(root, breakpoint);
+        if !self.view().online {
+            self.status_bar(root);
+        }
+        self.composer_panel(root, breakpoint, false);
         self.permission_panel(root);
         self.recovery_panel(root);
         self.attachment_panel(root);
@@ -2500,6 +2270,33 @@ impl eframe::App for Desktop {
 // ---------------------------------------------------------------------------
 // Small components and helpers
 // ---------------------------------------------------------------------------
+
+fn navigation_row(ui: &mut egui::Ui, icon: Icon, label: &str) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+    if response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(rect, 6.0, theme::HOVER);
+    }
+    icons::paint(
+        ui.painter(),
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 12.0, rect.center().y),
+            Vec2::splat(14.0),
+        ),
+        icon,
+        theme::MUTED,
+        1.3,
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 30.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        theme::ui(13.0),
+        theme::SECONDARY,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    response.clicked()
+}
 
 fn rail_button(ui: &mut egui::Ui, icon: Icon, active: bool, badge: usize) -> bool {
     let width = theme::RAIL_WIDTH - 18.0;
@@ -2635,112 +2432,69 @@ fn status_chip(ui: &mut egui::Ui, status: SessionStatus, motion: bool) {
     ui.add_space(4.0);
 }
 
-fn session_row(ui: &mut egui::Ui, session: &Session, selected: bool, reduced: bool) -> bool {
-    let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 52.0), Sense::click());
-    let id = egui::Id::unique(("session-row", &session.id));
-    let hover = motion::animate_bool(ui.ctx(), id, response.hovered(), !reduced);
-    let active = motion::animate_bool(ui.ctx(), id.with("active"), selected, !reduced);
-    let fill = if active > 0.01 {
-        theme::mix(theme::SIDEBAR, theme::SELECTED, active)
-    } else {
-        theme::mix(theme::SIDEBAR, theme::HOVER, hover * 0.8)
-    };
-    if hover > 0.01 || active > 0.01 {
-        ui.painter()
-            .rect_filled(rect.shrink2(Vec2::new(4.0, 2.0)), 9.0, fill);
-    }
-    if active > 0.01 {
-        let marker = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + 4.0, rect.center().y - 11.0),
-            Vec2::new(2.0, 22.0),
-        );
+fn session_row(ui: &mut egui::Ui, session: &Session, selected: bool, _reduced: bool) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 48.0), Sense::click());
+    if selected || response.hovered() || response.has_focus() {
         ui.painter().rect_filled(
-            marker,
-            1.0,
-            Color32::from_rgba_unmultiplied(
-                theme::BLUE.r(),
-                theme::BLUE.g(),
-                theme::BLUE.b(),
-                (255.0 * active) as u8,
-            ),
+            rect,
+            7.0,
+            if selected {
+                theme::SELECTED
+            } else {
+                theme::HOVER
+            },
         );
     }
-    let avatar = egui::Rect::from_min_size(
-        egui::pos2(rect.left() + 14.0, rect.center().y - 11.0),
-        Vec2::splat(22.0),
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 14.0, rect.top() + 17.0),
+        Vec2::splat(14.0),
     );
-    let hue = hue_for(&session.id);
-    ui.painter()
-        .rect_filled(avatar, 7.0, Color32::from_rgb(hue.0, hue.1, hue.2));
-    let letter = session
-        .title
-        .chars()
-        .next()
-        .unwrap_or('A')
-        .to_uppercase()
-        .to_string();
-    ui.painter().text(
-        avatar.center(),
-        egui::Align2::CENTER_CENTER,
-        letter,
-        theme::semibold(11.0),
-        Color32::from_rgb(22, 26, 25),
+    icons::paint(
+        ui.painter(),
+        icon_rect,
+        Icon::Conversations,
+        theme::MUTED,
+        1.3,
     );
-    let text_left = avatar.right() + 10.0;
-    let title = truncate(&session.title, 30);
     ui.painter().text(
-        egui::pos2(text_left, rect.top() + 11.0),
+        egui::pos2(rect.left() + 30.0, rect.top() + 9.0),
         egui::Align2::LEFT_TOP,
-        title,
-        theme::medium(12.5),
+        truncate(&session.title, 23),
+        theme::ui(12.5),
         if selected {
             theme::TEXT
         } else {
             theme::SECONDARY
         },
     );
-    let workspace = truncate(&session.detail, 24);
-    let subtitle = if session.time.is_empty() {
-        workspace
-    } else {
-        format!("{workspace}  ·  {}", session.time)
-    };
     ui.painter().text(
-        egui::pos2(text_left, rect.top() + 29.0),
+        egui::pos2(rect.left() + 30.0, rect.top() + 28.0),
         egui::Align2::LEFT_TOP,
-        subtitle,
+        truncate(&session.detail, 26),
         theme::ui(10.5),
-        theme::FAINT,
+        theme::MUTED,
     );
-    let (status_color, _) = match session.status {
-        SessionStatus::Running => (theme::BLUE, "running"),
-        SessionStatus::Attention => (theme::AMBER, "attention"),
-        SessionStatus::Error => (theme::RED, "error"),
-        SessionStatus::Offline => (theme::FAINT, "offline"),
-        SessionStatus::Idle => (theme::GREEN, "idle"),
-    };
-    let dot_center = egui::pos2(rect.right() - 14.0, rect.center().y);
-    if session.status == SessionStatus::Attention {
-        ui.painter()
-            .circle_stroke(dot_center, 5.0, Stroke::new(1.0, theme::AMBER));
+    if matches!(
+        session.status,
+        SessionStatus::Running | SessionStatus::Attention | SessionStatus::Error
+    ) {
+        let color = match session.status {
+            SessionStatus::Attention => theme::AMBER,
+            SessionStatus::Error => theme::RED,
+            _ => theme::BLUE,
+        };
+        ui.painter().circle_filled(
+            egui::pos2(rect.right() - 8.0, rect.top() + 17.0),
+            3.0,
+            color,
+        );
     }
-    ui.painter().circle_filled(dot_center, 3.0, status_color);
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &session.title));
     let clicked = response.clicked();
     response.on_hover_text(format!(
-        "{}\n{}\n{}",
-        session.title,
-        session.workspace,
-        match session.status {
-            SessionStatus::Attention => "Waiting for your decision",
-            SessionStatus::Running => "Running",
-            SessionStatus::Error => "Last run failed",
-            SessionStatus::Offline => "Offline",
-            SessionStatus::Idle => "Idle",
-        }
+        "{}\n{}\n{:?}",
+        session.title, session.cwd, session.status
     ));
     clicked
 }
@@ -2892,6 +2646,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancelling_folder_picker_preserves_selection() {
+        let context = egui::Context::default();
+        let mut desktop = Desktop::new(context.clone(), true);
+        desktop.selected = Some("demo-1".into());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Ok(None)).unwrap();
+        desktop.new_workspace.selection = Some(receiver);
+        desktop.new_workspace_dialog(&context);
+        assert_eq!(desktop.selected.as_deref(), Some("demo-1"));
+        assert!(desktop.new_workspace.selection.is_none());
+    }
+
+    #[test]
+    fn existing_folder_opens_start_surface_without_duplicate_workspace() {
+        let context = egui::Context::default();
+        let mut desktop = Desktop::new(context.clone(), true);
+        let workspace = desktop.view().workspaces[0].clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(Some(std::path::PathBuf::from(&workspace.path))))
+            .unwrap();
+        desktop.new_workspace.selection = Some(receiver);
+        desktop.new_workspace_dialog(&context);
+        desktop.ensure_selection();
+        assert_eq!(desktop.workspace_filter.as_ref(), Some(&workspace.id));
+        assert!(desktop.session_id().is_none());
+        assert!(desktop.is_start_surface());
+        assert_eq!(desktop.backend.busy, 0);
+    }
+
+    #[test]
+    fn start_surface_and_model_picker_render_at_responsive_sizes() {
+        for scale in [1.0, 2.0] {
+            for (width, height) in [(1600.0, 900.0), (900.0, 650.0), (720.0, 520.0)] {
+                let context = egui::Context::default();
+                let mut desktop = Desktop::new(context.clone(), true);
+                context.set_zoom_factor(scale);
+                desktop.selected = Some(NEW_CONVERSATION.into());
+                let mut frame = eframe::Frame::_new_kittest();
+                for _ in 0..2 {
+                    egui::Popup::open_id(&context, egui::Id::unique("model-menu"));
+                    let output = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, height),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| eframe::App::ui(&mut desktop, ui, &mut frame),
+                    );
+                    assert_ne!(output.shapes.len(), 0);
+                    assert!(desktop.session_id().is_none());
+                    output.drop_without_applying_deltas();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn truncation_keeps_byte_boundaries() {
         assert_eq!(truncate("hello", 10), "hello");
         assert_eq!(truncate("hello world", 6), "hello…");
@@ -2921,11 +2735,13 @@ mod tests {
                 .pending
                 .insert("perm-1".into(), PendingState::Idle);
             let mut frame = eframe::Frame::_new_kittest();
-            let mut input = egui::RawInput::default();
-            input.screen_rect = Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(width, height),
-            ));
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                ..Default::default()
+            };
 
             let output = context.run_ui(input, |ui| {
                 eframe::App::ui(&mut desktop, ui, &mut frame);

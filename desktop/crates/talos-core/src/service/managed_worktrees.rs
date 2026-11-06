@@ -61,9 +61,52 @@ async fn registration(repo: &Path, path: &Path) -> CoreResult<Option<String>> {
 }
 
 /// Same-parent destination so Git's worktree move is an atomic directory rename.
-/// The checkout is deliberately retained here instead of recursively removed.
+/// A suffix identifies successive preservation attempts for the same workspace.
 fn quarantine_path(path: &Path, id: WorkspaceId) -> PathBuf {
-    path.with_file_name(format!(".talos-preserved-{id}"))
+    let prefix = format!(".talos-preserved-{id}");
+    let generation = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(&prefix))
+        .and_then(|suffix| suffix.strip_prefix('-'))
+        .and_then(|generation| generation.parse::<u64>().ok())
+        .and_then(|generation| generation.checked_add(1));
+    let name = if path.file_name().and_then(|name| name.to_str()) == Some(prefix.as_str()) {
+        format!("{prefix}-2")
+    } else if let Some(generation) = generation {
+        format!("{prefix}-{generation}")
+    } else {
+        prefix
+    };
+    path.with_file_name(name)
+}
+
+fn is_quarantine_path(managed_path: &Path, candidate: &Path, id: WorkspaceId) -> bool {
+    if candidate.parent() != managed_path.parent() {
+        return false;
+    }
+    let prefix = format!(".talos-preserved-{id}");
+    let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    match name.strip_prefix(&prefix) {
+        Some("") => true,
+        Some(suffix) => suffix
+            .strip_prefix('-')
+            .and_then(|generation| generation.parse::<u64>().ok())
+            .is_some_and(|generation| generation >= 2),
+        None => false,
+    }
+}
+
+async fn next_quarantine_path(repo: &Path, path: &Path, id: WorkspaceId) -> CoreResult<PathBuf> {
+    let mut candidate = quarantine_path(path, id);
+    loop {
+        if !path_exists(&candidate).await? && registration(repo, &candidate).await?.is_none() {
+            return Ok(candidate);
+        }
+        candidate = quarantine_path(&candidate, id);
+    }
 }
 
 async fn path_exists(path: &Path) -> CoreResult<bool> {
@@ -163,8 +206,19 @@ impl AppService {
             .managed_destination(project_id, workspace.id, false)
             .await?;
         let marker = &workspace.metadata["managedWorktree"];
-        let path = managed_path;
+        let path = if marker["preserved"].as_bool() == Some(true) {
+            PathBuf::from(
+                marker["path"]
+                    .as_str()
+                    .ok_or_else(|| invalid("preserved worktree path is missing"))?,
+            )
+        } else {
+            managed_path.clone()
+        };
         if workspace.kind != WorkspaceKind::Worktree
+            || (marker["preserved"].as_bool() == Some(true)
+                && !is_quarantine_path(&managed_path, &path, workspace.id))
+            || (marker["preserved"].as_bool() != Some(true) && path != managed_path)
             || marker["owner"].as_str() != Some("talosd")
             || marker["projectId"].as_str() != Some(project_id.to_string().as_str())
             || marker["repoRoot"].as_str() != Some(repo.to_string_lossy().as_ref())
@@ -228,6 +282,7 @@ impl AppService {
         let operation = ManagedWorktreeOperation {
             kind: WorktreeOperationKind::Delete,
             workspace: workspace.clone(),
+            preserved_path: None,
             repo_root: repo_root.to_owned(),
             repo_common_dir: repo_common_dir.to_string_lossy().into_owned(),
             last_error: None,
@@ -275,7 +330,21 @@ impl AppService {
         let exists = path_exists(&path).await?;
 
         if operation.kind == WorktreeOperationKind::Delete {
-            let quarantine = quarantine_path(&path, operation.workspace.id);
+            let quarantine = PathBuf::from(
+                operation
+                    .preserved_path
+                    .as_deref()
+                    .ok_or_else(|| invalid("delete intent has no preservation destination"))?,
+            );
+            if !is_quarantine_path(
+                Path::new(&operation.workspace.path),
+                &quarantine,
+                operation.workspace.id,
+            ) {
+                return Err(invalid(
+                    "delete preservation destination does not match ownership",
+                ));
+            }
             let quarantine_exists = path_exists(&quarantine).await?;
             let quarantine_record = registration(&repo, &quarantine).await?;
             match (exists, record, quarantine_exists, quarantine_record) {
@@ -290,15 +359,12 @@ impl AppService {
                 }
                 (false, None, true, Some(record)) => {
                     Self::validate_checkout(operation, &repo, &quarantine, &record).await?;
-                    return Err(invalid(&format!(
-                        "managed worktree is preserved at {}; explicit cleanup is required",
-                        quarantine.display()
-                    )));
-                }
-                (false, _, false, _) => {
-                    return Err(invalid(
-                        "managed worktree checkout is missing; Git metadata is retained for explicit resolution",
-                    ));
+                    self.finish_worktree(
+                        operation.workspace.id,
+                        WorktreeOperationOutcome::DeletePreserved,
+                    )
+                    .await?;
+                    return Ok(());
                 }
                 _ => {
                     return Err(invalid(
@@ -385,6 +451,7 @@ impl AppService {
         let operation = ManagedWorktreeOperation {
             kind: WorktreeOperationKind::Create,
             workspace: workspace.clone(),
+            preserved_path: None,
             repo_root: repo.to_string_lossy().into_owned(),
             repo_common_dir: common_dir(&repo).await?.to_string_lossy().into_owned(),
             last_error: None,
@@ -441,6 +508,12 @@ impl AppService {
         let repo = tokio::fs::canonicalize(project.root_path).await?;
         let operation = ManagedWorktreeOperation {
             kind: WorktreeOperationKind::Delete,
+            preserved_path: Some(
+                next_quarantine_path(&repo, Path::new(&workspace.path), workspace.id)
+                    .await?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             workspace,
             repo_root: repo.to_string_lossy().into_owned(),
             repo_common_dir: common_dir(&repo).await?.to_string_lossy().into_owned(),
@@ -453,45 +526,65 @@ impl AppService {
         Self::validate_checkout(&operation, &repo, &path, &record).await?;
         validate_checkout_clean(&path).await?;
         let saved = operation.clone();
-        let archived = match self
+        match self
             .inner
             .store
             .run(move |store| store.begin_worktree_delete(&saved))
             .await
             .map_err(CoreError::Store)?
         {
-            WorkspaceArchiveResult::Archived(workspace) => workspace,
+            WorkspaceArchiveResult::Archived(_) => {}
             WorkspaceArchiveResult::ActiveRuns => {
                 return Err(CoreError::WorkspaceHasActiveRuns(id));
             }
             WorkspaceArchiveResult::NotFound => return Err(CoreError::WorkspaceNotFound(id)),
-        };
+        }
         #[cfg(test)]
         self.worktree_fault("delete_intent")?;
         #[cfg(test)]
-        self.worktree_inject_file("delete_race_ignored", &path.join("delete-race-data"))?;
-        // git worktree remove deletes ignored files, so repeat the full check
-        // after the durable intent and immediately before asking Git to remove
-        // the directory. If the recheck fails, reconcile the intent while the
-        // registered checkout is still present, preserving its previous state.
+        self.worktree_inject_file("delete_race_before_recheck", &path.join("delete-race-data"))?;
+        let quarantine = operation.preserved_path.as_deref().unwrap();
+        if path_exists(Path::new(quarantine)).await? {
+            let _ = self.recover_worktree(&operation).await;
+            return Err(invalid("worktree preservation destination already exists"));
+        }
+        // Rechecking catches files created after the initial preflight. Even if
+        // a file appears after this check, `worktree move` atomically renames the
+        // checkout rather than deleting it, so the new content is preserved too.
         if let Err(error) = validate_checkout_clean(&path).await {
             let _ = self.recover_worktree(&operation).await;
             return Err(error);
         }
-        if let Err(error) =
-            git_text(&repo, &["worktree", "remove", &operation.workspace.path]).await
+        #[cfg(test)]
+        self.worktree_inject_file("delete_race_ignored", &path.join("delete-race-data"))?;
+        #[cfg(test)]
+        self.worktree_fault("delete_pre_move")?;
+        if let Err(error) = git_text(
+            &repo,
+            &["worktree", "move", &operation.workspace.path, quarantine],
+        )
+        .await
         {
-            // Git may have changed state even when it failed. Observe before
-            // rolling back lifecycle; preserve ambiguous intent on any error.
+            // Git moves are non-destructive on failure. Observe any completed move
+            // after timeout/cancellation before retaining the durable intent.
             let _ = self.recover_worktree(&operation).await;
             return Err(error);
         }
         #[cfg(test)]
         self.worktree_fault("delete_git")?;
-        self.finish_worktree(id, WorktreeOperationOutcome::Deleted)
+        let quarantine_record = registration(&repo, Path::new(quarantine))
+            .await?
+            .ok_or_else(|| invalid("moved checkout is not registered at preservation path"))?;
+        Self::validate_checkout(&operation, &repo, Path::new(quarantine), &quarantine_record)
             .await?;
+        let archived = self
+            .finish_worktree(id, WorktreeOperationOutcome::DeletePreserved)
+            .await?
+            .ok_or(CoreError::WorkspaceNotFound(id))?;
         #[cfg(test)]
         self.worktree_fault("delete_commit")?;
+        // The archived workspace points to its hidden, registered preservation
+        // path. Deletion never recursively removes checkout contents.
         Ok(archived)
     }
 

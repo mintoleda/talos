@@ -421,7 +421,24 @@ def exercise_compiled_cli(bundle: Path, root: Path) -> None:
         project = ctl_json(ctl, home, env, "project", "create", "Artifact project", str(repo))
         worktree = ctl_json(ctl, home, env, "worktree", "create", project["id"], "Artifact worktree", "feature/artifact", "HEAD")
         require(Path(worktree["path"]).is_dir(), "Installed CLI did not create its managed worktree")
-        ctl_json(ctl, home, env, "worktree", "delete", worktree["id"])
+        deleted = ctl_json(ctl, home, env, "worktree", "delete", worktree["id"])
+        preserved_path = Path(deleted["path"])
+        require(
+            deleted["lifecycle"] == "Archived"
+            and deleted["metadata"]["managedWorktree"]["preserved"] is True
+            and deleted["metadata"]["managedWorktree"]["path"] == str(preserved_path),
+            f"Installed CLI did not report the archived, preserved worktree path: {deleted!r}",
+        )
+        require(
+            preserved_path.is_dir()
+            and (preserved_path / "tracked.txt").read_text(encoding="utf-8")
+            == "release fixture\\n",
+            "Managed worktree delete did not retain checkout contents at its reported path",
+        )
+        require(
+            not Path(worktree["path"]).exists(),
+            "Managed worktree delete left the original checkout path in place",
+        )
         association_repo = root / "association-repo"
         association_repo.mkdir()
         association_workspace_path = association_repo / "workspace"

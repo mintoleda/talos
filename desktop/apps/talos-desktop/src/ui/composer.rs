@@ -48,11 +48,24 @@ pub fn composer_id(session: &str) -> egui::Id {
     egui::Id::unique(("composer", session))
 }
 
+#[derive(Clone, Copy)]
+struct EnterKeyState {
+    focused: bool,
+    enter_pressed: bool,
+    shift: bool,
+    ime_active: bool,
+    ready: bool,
+}
+
+fn send_key_submits(state: EnterKeyState) -> bool {
+    state.focused && state.enter_pressed && !state.shift && !state.ime_active && state.ready
+}
+
 /// Total shell height for a given draft and available width.
 #[must_use]
 pub fn height(draft: &str, width: f32) -> f32 {
     let rows = draft_lines(draft, width.min(theme::COMPOSER_MAX));
-    104.0 + (rows.saturating_sub(1) as f32) * 19.0
+    92.0 + rows.saturating_sub(1) as f32 * 19.0
 }
 
 /// Height for the composer when validated image chips are present.
@@ -66,7 +79,7 @@ pub fn height_with_attachments(draft: &str, width: f32, attachment_count: usize)
 /// Draw the composer and return any requested action.
 pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<ComposerAction> {
     let available = ui.available_width();
-    let width = (available - 40.0).clamp(260.0, theme::COMPOSER_MAX);
+    let width = (available - 16.0).clamp(260.0, theme::COMPOSER_MAX);
     let rows = draft_lines(state.draft, width);
     let shell_height = height_with_attachments(state.draft, width, state.attachments.len());
     let mut action = None;
@@ -108,13 +121,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<Composer
             egui::StrokeKind::Inside,
         );
 
-        let inner = rect.shrink2(Vec2::new(16.0, 12.0));
+        let inner = rect.shrink2(Vec2::new(12.0, 10.0));
         ui.scope_builder(
             UiBuilder::new()
                 .max_rect(inner)
                 .layout(Layout::top_down(Align::Min)),
             |ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                ui.spacing_mut().button_padding = Vec2::new(6.0, 4.0);
 
                 if !state.attachments.is_empty() {
                     ui.horizontal_wrapped(|ui| {
@@ -172,24 +186,17 @@ pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<Composer
                         .iter()
                         .any(|event| matches!(event, egui::Event::Ime(_)))
                 });
-                let enter = response.has_focus()
-                    && ui.input(|input| {
-                        input.key_pressed(egui::Key::Enter)
-                            && !input.modifiers.shift
-                            && !input.modifiers.command
-                    })
-                    && !quiet_input;
-                let command_enter = response.has_focus()
-                    && ui.input(|input| {
-                        input.key_pressed(egui::Key::Enter)
-                            && input.modifiers.command
-                            && !input.modifiers.shift
-                    })
-                    && !quiet_input;
-
+                let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                let shift = ui.input(|input| input.modifiers.shift);
                 let running = state.running;
                 let ready = state.online && can_send(state.draft, state.attachments.len(), running);
-                if (enter || command_enter) && ready {
+                if send_key_submits(EnterKeyState {
+                    focused: response.has_focus(),
+                    enter_pressed,
+                    shift,
+                    ime_active: quiet_input,
+                    ready,
+                }) {
                     action = Some(ComposerAction::Send);
                 }
 
@@ -211,6 +218,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<Composer
                         action = Some(ComposerAction::Attach);
                     }
                     model_selector(ui, state, &mut action);
+                    config_selector(ui, state, &mut action);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let send = send_button(ui, ready, running);
                         if send.clicked() {
@@ -222,7 +230,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<Composer
                                 None
                             };
                         }
-                        config_selector(ui, state, &mut action);
                         context_meter(ui, state);
                     });
                 });
@@ -258,99 +265,139 @@ fn model_selector(
         .or(state.remembered_model)
         .unwrap_or("Default model");
     let provider_label = provider.map_or(provider_id, |provider| provider.name.as_str());
+    let display_model = provider
+        .and_then(|provider| provider.models.iter().find(|model| model.id == model_label))
+        .map_or_else(
+            || model_label.rsplit('/').next().unwrap_or(model_label),
+            |model| model.label.as_str(),
+        );
     let response = chip(
         ui,
         Icon::Sparkle,
-        theme::ORANGE,
-        &format!("{provider_label} · {model_label}"),
+        theme::MUTED,
+        display_model,
         state.online && !state.running && state.session.is_none_or(|s| !s.archived),
-    );
+    )
+    .on_hover_text(format!("{provider_label} · {model_label}"));
+    let picker_id = egui::Id::unique(("model-picker-state", state.session_id));
+    let mut picker = ui.ctx().data_mut(|data| {
+        data.get_temp::<ModelPicker>(picker_id)
+            .unwrap_or_else(|| ModelPicker {
+                provider: provider_id.to_owned(),
+                query: String::new(),
+            })
+    });
+    let max_width = (ui.ctx().content_rect().width() - 32.0).clamp(260.0, 600.0);
     egui::Popup::menu(&response)
         .id(egui::Id::unique("model-menu"))
         .show(|ui| {
-            ui.set_min_width(280.0);
-            ui.set_max_width(320.0);
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new("MODEL")
-                    .font(theme::semibold(10.0))
-                    .color(theme::FAINT),
+            ui.set_width(max_width);
+            ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut picker.query)
+                    .hint_text("Search models…")
+                    .desired_width(f32::INFINITY)
+                    .font(theme::ui(14.0))
+                    .frame(egui::Frame::NONE),
             );
-            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                for provider in state.providers {
-                    let current_provider = provider.id == provider_id;
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        icons::icon(
-                            ui,
-                            Icon::Cpu,
-                            12.0,
-                            if current_provider {
-                                theme::BLUE
-                            } else {
-                                theme::MUTED
-                            },
-                        );
-                        ui.label(
-                            RichText::new(&provider.name)
-                                .font(theme::semibold(11.0))
-                                .color(theme::SECONDARY),
-                        );
-                        if !provider.available {
-                            ui.label(
-                                RichText::new("unavailable")
-                                    .font(theme::ui(10.0))
-                                    .color(theme::FAINT),
-                            );
-                        }
-                    });
-                    if provider.models.is_empty() {
-                        ui.label(
-                            RichText::new("   No models reported by this provider")
-                                .font(theme::ui(11.0))
-                                .color(theme::FAINT),
-                        );
-                    }
-                    for model in &provider.models {
-                        let selected = current_provider && model.id == model_label;
-                        if ui
-                            .add_enabled(
-                                provider.available && (current_provider || state.session.is_none()) && provider.supports("model_selection") && !state.running,
-                                egui::Button::new(
-                                    RichText::new(format!(
-                                        "   {}{}{}",
-                                        model.label,
-                                        if selected { "  ✓" } else { "" },
-                                        if model.default { " · default" } else { "" }
-                                    ))
-                                    .font(theme::ui(12.0))
-                                    .color(if selected { theme::TEXT } else { theme::SECONDARY }),
-                                )
-                                .fill(if selected { theme::SELECTED } else { Color32::TRANSPARENT })
-                                .corner_radius(7),
-                            )
-                            .clicked()
-                        {
-                            *action = Some(ComposerAction::SetModel {
-                                provider: provider.id.clone(),
-                                model: model.id.clone(),
-                            });
-                            ui.close();
-                        }
-                    }
-                }
-            });
-            if state.providers.iter().all(|provider| provider.models.is_empty()) {
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "Talos reports its model catalog during a session. Configure credentials in ~/.talosd/config.toml.",
-                    )
-                    .font(theme::ui(10.5))
-                    .color(theme::FAINT),
-                );
+            if response.clicked() {
+                search.request_focus();
             }
+            ui.add_space(6.0);
+            ui.separator();
+            let list_height = (ui.ctx().content_rect().height() - 110.0).clamp(90.0, 300.0);
+            let query = picker.query.trim().to_lowercase();
+            if !state.providers.iter().any(|p| p.id == picker.provider)
+                && let Some(provider) = state.providers.first() {
+                picker.provider.clone_from(&provider.id);
+            }
+            let sidebar_width = (max_width * 0.30).clamp(90.0, 170.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(sidebar_width, list_height + 30.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(sidebar_width);
+                        for provider in state.providers {
+                            let selected = picker.provider == provider.id;
+                            let response = ui.add_sized(
+                                [sidebar_width, 38.0],
+                                egui::Button::new(RichText::new(&provider.name)
+                                    .font(theme::ui(13.0))
+                                    .color(if selected { theme::TEXT } else { theme::MUTED }))
+                                    .fill(if selected { theme::SELECTED } else { Color32::TRANSPARENT })
+                                    .stroke(Stroke::NONE)
+                                    .corner_radius(8)
+                                    .wrap_mode(egui::TextWrapMode::Truncate),
+                            );
+                            if response.clicked() { picker.provider.clone_from(&provider.id); }
+                            if !provider.available { response.on_hover_text("Provider unavailable"); }
+                        }
+                    },
+                );
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.set_width((max_width - sidebar_width - 24.0).max(100.0));
+                    if let Some(provider) = state.providers.iter().find(|p| p.id == picker.provider) {
+                        let models: Vec<_> = provider.models.iter().filter(|m| model_matches(&query, &m.label, &m.id)).collect();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&provider.name).font(theme::medium(13.0)).color(theme::TEXT));
+                            ui.label(RichText::new(format!("{} models", models.len())).font(theme::ui(11.0)).color(theme::MUTED));
+                        });
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical().id_salt("model-picker-list").max_height(list_height).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            if !provider.available {
+                                ui.label(RichText::new("Provider unavailable").font(theme::ui(12.0)).color(theme::MUTED));
+                            }
+                            if models.is_empty() {
+                                ui.label(RichText::new(if query.is_empty() { "No models reported yet" } else { "No matching models" })
+                                    .font(theme::ui(12.0)).color(theme::MUTED));
+                            }
+                            for model in models {
+                                let current_provider = provider.id == provider_id;
+                                let selected = current_provider && model.id == model_label;
+                                let enabled = state.online && provider.available
+                                    && (current_provider || state.session.is_none())
+                                    && provider.supports("model_selection") && !state.running
+                                    && state.session.is_none_or(|s| !s.archived);
+                                let mut label = egui::text::LayoutJob::default();
+                                label.append(&format!("{}  {}", if selected { "✓" } else { " " }, model.label),
+                                    0.0, egui::TextFormat { font_id: theme::ui(13.0), color: theme::TEXT, ..Default::default() });
+                                label.append(&format!("  {}", model.id), 0.0,
+                                    egui::TextFormat { font_id: theme::ui(11.5), color: theme::MUTED, ..Default::default() });
+                                let response = ui.add_enabled(enabled,
+                                    egui::Button::new(label)
+                                        .min_size(Vec2::new(ui.available_width(), 38.0))
+                                        .fill(if selected { theme::SELECTED } else { Color32::TRANSPARENT })
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(8)
+                                        .wrap_mode(egui::TextWrapMode::Truncate))
+                                    .on_hover_text(if !current_provider && state.session.is_some() {
+                                        format!("{}\nStart a new conversation to change provider.", model.id)
+                                    } else { model.id.clone() });
+                                if response.clicked() {
+                                    *action = Some(ComposerAction::SetModel { provider: provider.id.clone(), model: model.id.clone() });
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                });
+            });
         });
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(picker_id, picker));
+}
+
+#[derive(Clone)]
+struct ModelPicker {
+    provider: String,
+    query: String,
+}
+
+fn model_matches(query: &str, label: &str, id: &str) -> bool {
+    query.is_empty() || label.to_lowercase().contains(query) || id.to_lowercase().contains(query)
 }
 
 /// A small icon + label chip with a smooth hover wash.
@@ -434,7 +481,10 @@ fn context_meter(ui: &mut egui::Ui, state: &ComposerState<'_>) {
         (Some(used), Some(size)) if size > 0 => Some(used as f32 / size as f32),
         _ => None,
     });
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
+    if fraction.is_none() {
+        return;
+    }
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
     let painter = ui.painter();
     let center = rect.center();
     let radius = 8.0;
@@ -472,7 +522,7 @@ fn context_meter(ui: &mut egui::Ui, state: &ComposerState<'_>) {
 
 fn send_button(ui: &mut egui::Ui, ready: bool, running: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(
-        Vec2::splat(38.0),
+        Vec2::splat(32.0),
         if ready || running {
             Sense::click()
         } else {
@@ -496,7 +546,7 @@ fn send_button(ui: &mut egui::Ui, ready: bool, running: bool) -> Response {
     let fill = if running {
         theme::RED
     } else if ready {
-        theme::mix(theme::BLUE, theme::BLUE_HOVER, hover)
+        theme::mix(theme::GREEN, theme::TEXT, hover * 0.15)
     } else {
         theme::SURFACE_HIGH
     };
@@ -506,7 +556,7 @@ fn send_button(ui: &mut egui::Ui, ready: bool, running: bool) -> Response {
     } else {
         theme::FAINT
     };
-    painter.circle_filled(rect.center(), 19.0, fill);
+    painter.rect_filled(rect.shrink(2.0), 9.0, fill);
     if running {
         let square = egui::Rect::from_center_size(rect.center(), Vec2::splat(9.0));
         painter.rect_filled(square, 2.0, color);
@@ -658,4 +708,17 @@ fn config_selector(
             }
         });
     });
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::model_matches;
+
+    #[test]
+    fn search_matches_model_labels_and_ids() {
+        assert!(model_matches("luna", "GPT Luna", "codex/model"));
+        assert!(model_matches("codex", "GPT Luna", "openai-codex/model"));
+        assert!(model_matches("", "GPT Luna", "codex/model"));
+        assert!(!model_matches("claude", "GPT Luna", "codex/model"));
+    }
 }

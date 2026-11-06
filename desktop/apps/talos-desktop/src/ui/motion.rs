@@ -83,7 +83,7 @@ pub fn glow(painter: &egui::Painter, rect: Rect, color: Color32, intensity: f32)
     if intensity <= 0.001 {
         return;
     }
-    let alpha = (color.a() as f32 * intensity).clamp(0.0, 255.0) as u8;
+    let alpha = (f32::from(color.a()) * intensity).clamp(0.0, 255.0) as u8;
     let glow_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha / 3);
     for i in 1..=4 {
         let expand = i as f32 * 1.5;

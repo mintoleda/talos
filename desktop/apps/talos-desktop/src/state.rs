@@ -1109,6 +1109,7 @@ mod tests {
     use serde_json::json;
     use talos_ipc::{EventNotification, WireEvent};
 
+    #[allow(clippy::needless_pass_by_value)]
     fn event(id: &str, run: &str, kind: Value) -> EventNotification {
         EventNotification {
             version: 1,

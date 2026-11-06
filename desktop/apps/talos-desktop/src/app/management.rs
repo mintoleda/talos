@@ -128,7 +128,7 @@ impl Desktop {
                 ui.label("Rename");
                 let name = project["name"].as_str().unwrap_or_default();
                 if self.manage.project_name.is_empty() {
-                    self.manage.project_name = name.to_owned();
+                    name.clone_into(&mut self.manage.project_name);
                 }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.manage.project_name).desired_width(180.0),
@@ -435,7 +435,7 @@ impl Desktop {
                             }
                         } else if ui.small_button("Rename").clicked() {
                             self.manage.workspace_rename_id = Some(workspace.id.clone());
-                            self.manage.workspace_name = workspace.name.clone();
+                            self.manage.workspace_name.clone_from(&workspace.name);
                         }
                     });
                 });
@@ -1225,8 +1225,7 @@ fn search_text(kind: &Value) -> String {
         .or_else(|| payload.get("delta"))
         .or_else(|| payload.get("name"))
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| payload.to_string());
+        .map_or_else(|| payload.to_string(), str::to_owned);
     format!("{name}: {content}")
 }
 
