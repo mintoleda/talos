@@ -30,9 +30,18 @@ systemctl --user daemon-reload
 
 The uninstaller removes only the five installed files listed above. It leaves `~/.talosd`, `~/.paseo`, and containing directories untouched. Both scripts refuse symlink destinations; the uninstaller checks all destinations before removing any file.
 
-The **user** service runs as your account (`systemctl --user`, not `sudo systemctl`) and uses the daemon's default `$HOME/.talosd` for its private state, authentication token, instance lock, and Unix socket. `talosdctl` defaults to the same home/socket; set `TALOSD_HOME` consistently for both processes if using a nondefault home (e.g., via a systemd user drop-in), and use `talosdctl --home PATH health` for a manual override. **Do not point it at `~/.paseo`**: that belongs to the legacy runtime and is not migrated by this installer. The systemd unit uses `%h/.local/bin/talosd` and sends SIGINT for graceful socket/lock cleanup. If a crash leaves a stale lock or socket, verify no daemon is running before removing those files from `.talosd`; automatic stale-file deletion is intentionally disabled.
+The **user** service runs as your account (`systemctl --user`, not `sudo systemctl`) and uses the daemon's default `$HOME/.talosd` for its private state, authentication token, instance guard, lock marker, and Unix socket. `talosdctl` defaults to the same home/socket; set `TALOSD_HOME` consistently for both processes if using a nondefault home (e.g., via a systemd user drop-in), and use `talosdctl --home PATH health` for a manual override. **Do not point it at `~/.paseo`**: that belongs to the legacy runtime and is not migrated by this installer. The systemd unit uses `%h/.local/bin/talosd`, sends SIGINT for graceful cleanup, and sets `KillMode=control-group` so systemd removes remaining service processes after a daemon crash.
 
-The desktop launcher resolves `talos-desktop` via the desktop session's `PATH`: ensure `~/.local/bin` is available there, or start the binary by absolute path. The packaging acceptance check uses stub binaries, so it does not establish a real release build, CLI workflow, live desktop integration, or visual QA. See [../STATUS.md](../STATUS.md) for current evidence and failing workspace gates; this installation guide is not a claim that the current tree is release-ready.
+On startup, talosd serializes recovery with a persistent private `talosd.guard` file lock. It removes a regular `talosd.lock` marker only when its recorded daemon PID is confirmed absent; unknown/importer markers and live or unverifiable PIDs fail closed. It removes `talosd.sock` only when it is a Unix socket and a connection is refused. Live, timed-out, inaccessible, symlink, and non-socket paths are preserved. This allows a normal process crash to restart without manual file deletion while avoiding guesses about active owners. The compiled-artifact acceptance exercises this restart path in a temporary home.
+
+The desktop launcher resolves `talos-desktop` via the desktop session's `PATH`: ensure `~/.local/bin` is available there, or start the binary by absolute path. Fixture packaging acceptance uses stub binaries. A local compiled-artifact acceptance is also available after building Linux release binaries:
+
+```sh
+cargo build --release --locked -p talosd -p talosdctl -p talos-desktop --bins
+python3 scripts/packaging-acceptance.py --compiled-artifact --verbose
+```
+
+It validates compiled install, replacement of prior binaries during upgrade, uninstall data retention, and daemon/CLI project, worktree, PTY hard-crash, and stale lock/socket restart behavior in temporary homes. It checks the packaged unit directives but does not launch the desktop UI, exercise a live systemd-user manager, or publish a release artifact. In the current acceptance environment, `systemctl --user is-system-running` could not run because `/bin/bash` reported `systemctl: command not found` (exit 127); no user service was started or changed. See [../STATUS.md](../STATUS.md) for evidence and remaining gates; this guide is not a claim that the current tree is release-ready.
 
 ## Build locally
 

@@ -22,6 +22,12 @@ for binary in talosd talosdctl talos-desktop; do
     exit 1
   fi
 done
+for asset in packaging/systemd/talosd.service packaging/desktop/talos-desktop.desktop; do
+  if [[ ! -f "$bundle/$asset" ]]; then
+    printf 'Missing integration asset: %s\n' "$bundle/$asset" >&2
+    exit 1
+  fi
+done
 
 bin="$HOME/.local/bin"
 service="$HOME/.config/systemd/user/talosd.service"
@@ -32,6 +38,21 @@ for path in "$HOME/.local" "$bin" "$HOME/.local/share" "$(dirname -- "$desktop")
   "$bin/talosd" "$bin/talosdctl" "$bin/talos-desktop" "$service" "$desktop"; do
   if [[ -L "$path" ]]; then
     printf 'Refusing symlink destination: %s\n' "$path" >&2
+    exit 1
+  fi
+done
+
+# Validate every destination before replacing any existing package file.
+for path in "$HOME/.local" "$bin" "$HOME/.local/share" "$(dirname -- "$desktop")" \
+  "$HOME/.config" "$HOME/.config/systemd" "$(dirname -- "$service")"; do
+  if [[ -e "$path" && ! -d "$path" ]]; then
+    printf 'Refusing non-directory destination: %s\n' "$path" >&2
+    exit 1
+  fi
+done
+for path in "$bin/talosd" "$bin/talosdctl" "$bin/talos-desktop" "$service" "$desktop"; do
+  if [[ -e "$path" && ! -f "$path" ]]; then
+    printf 'Refusing non-file destination: %s\n' "$path" >&2
     exit 1
   fi
 done
