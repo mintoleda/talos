@@ -37,6 +37,8 @@ SCENARIOS = (
     "redaction",
     "interrupt",
     "cancel-permission",
+    "terminal",
+    "projects",
 )
 START_TIMEOUT = 25.0
 STEP_TIMEOUT = 30.0
@@ -47,6 +49,24 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 class SmokeFailure(RuntimeError):
     """A checked smoke scenario failed."""
+
+
+def _process_exists(pid: int) -> bool:
+    stat = Path(f"/proc/{pid}/stat")
+    try:
+        # A zombie has terminated and cannot execute, even before init reaps it.
+        fields = stat.read_text(encoding="ascii").rsplit(")", 1)[1].strip().split()
+        if fields and fields[0] == "Z":
+            return False
+    except OSError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _kind(event: dict) -> tuple[str, object]:
@@ -629,12 +649,172 @@ class Harness:
             "redaction": self.scenario_redaction,
             "interrupt": self.scenario_interrupt_and_restart,
             "cancel-permission": self.scenario_permission_cancel,
+            "terminal": self.scenario_terminal,
+            "projects": self.scenario_projects,
         }
         selected = self.args.scenario or list(SCENARIOS)
         for name in selected:
             self.log(f"scenario {name}")
             scenarios[name]()
         self.log("all selected smoke scenarios passed")
+
+    def scenario_terminal(self) -> None:
+        daemon = self.start_daemon("terminal")
+        hard_pid: int | None = None
+        hard_daemon: Daemon | None = None
+        try:
+            workspace_path = self.work / "terminal-workspace"
+            other_path = self.work / "other-terminal-workspace"
+            workspace_path.mkdir()
+            other_path.mkdir()
+            workspace = self.ctl(daemon, "workspace", "add", "Terminal workspace", str(workspace_path))
+            other = self.ctl(daemon, "workspace", "add", "Other workspace", str(other_path))
+            process = "printf READY; read line; printf 'GOT:%s' \"$line\""
+            terminal = self.ctl(
+                daemon, "terminal", "create", workspace["id"], "--program", "sh",
+                "--arg=-c", f"--arg={process}",
+            )
+            terminal_id = terminal["id"]
+            self.check(
+                any(item.get("id") == terminal_id for item in self.ctl(daemon, "terminal", "list", workspace["id"])),
+                "created terminal is not listed for its workspace",
+            )
+            self.check(
+                terminal_id not in {item.get("id") for item in self.ctl(daemon, "terminal", "list", other["id"])},
+                "terminal leaked into another workspace listing",
+            )
+            self.wait_until(
+                "PTY initial output",
+                lambda: "READY" in self.ctl(daemon, "terminal", "capture", workspace["id"], terminal_id).get("data", ""),
+                STEP_TIMEOUT,
+            )
+            rejected = self.run_ctl(daemon, ["terminal", "input", other["id"], terminal_id, "wrong\n"])
+            self.check(rejected.returncode != 0, "cross-workspace terminal input was accepted")
+            self.ctl(daemon, "terminal", "resize", workspace["id"], terminal_id, "40", "100")
+            self.ctl(daemon, "terminal", "input", workspace["id"], terminal_id, "from-cli\n")
+            self.wait_until(
+                "PTY CLI input output",
+                lambda: "GOT:from-cli" in self.ctl(daemon, "terminal", "capture", workspace["id"], terminal_id).get("data", ""),
+                STEP_TIMEOUT,
+            )
+            self.ctl(daemon, "terminal", "kill", workspace["id"], terminal_id)
+            self.check(
+                all(item.get("id") != terminal_id for item in self.ctl(daemon, "terminal", "list", workspace["id"])),
+                "killed terminal remained listed",
+            )
+
+            long_lived = self.ctl(
+                daemon, "terminal", "create", workspace["id"], "--program", "sh",
+                "--arg=-c", "--arg=sleep 30 & echo $!; wait",
+            )
+            long_id = long_lived["id"]
+
+            def read_descendant_pid():
+                data = self.ctl(daemon, "terminal", "capture", workspace["id"], long_id).get("data", "")
+                return next((int(line.strip()) for line in data.splitlines() if line.strip().isdigit()), None)
+
+            child_pid = self.wait_until("PTY descendant PID", read_descendant_pid, STEP_TIMEOUT)
+            self.stop_daemon(daemon)
+            self.wait_until(
+                f"PTY descendant {child_pid} cleanup after daemon shutdown",
+                lambda: not _process_exists(child_pid),
+                5.0,
+            )
+
+            hard_daemon = self.start_daemon("terminal-hard-crash")
+            hard_workspace = self.ctl(hard_daemon, "workspace", "add", "Hard crash workspace", str(workspace_path))
+            hard_crash = self.ctl(
+                hard_daemon, "terminal", "create", hard_workspace["id"], "--program", "sh",
+                "--arg=-c", "--arg=sleep 30 & echo $!; wait",
+            )
+            def read_hard_pid() -> int | None:
+                nonlocal hard_pid
+                data = self.ctl(hard_daemon, "terminal", "capture", hard_workspace["id"], hard_crash["id"]).get("data", "")
+                hard_pid = next((int(line.strip()) for line in data.splitlines() if line.strip().isdigit()), hard_pid)
+                return hard_pid
+
+            hard_pid = self.wait_until(
+                "PTY descendant before hard daemon crash", read_hard_pid, STEP_TIMEOUT
+            )
+            hard_daemon.proc.kill()
+            hard_daemon.proc.wait(timeout=5)
+            self.stop_daemon(hard_daemon, graceful=False)
+            self.wait_until(
+                f"PTY descendant {hard_pid} cleanup after hard daemon crash",
+                lambda: not _process_exists(hard_pid),
+                5.0,
+            )
+        finally:
+            if daemon.proc.poll() is None:
+                self.stop_daemon(daemon)
+            if hard_daemon is not None and hard_daemon.proc.poll() is None:
+                self.stop_daemon(hard_daemon, graceful=False)
+            if hard_pid is not None and _process_exists(hard_pid):
+                try:
+                    os.kill(hard_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def scenario_projects(self) -> None:
+        daemon = self.start_daemon("projects")
+        try:
+            root = self.work / "project-root"
+            workspace_path = root / "workspace"
+            outside_path = self.work / "outside-project"
+            workspace_path.mkdir(parents=True)
+            outside_path.mkdir()
+            subprocess.run(["git", "init", "--quiet", "-b", "main"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Talos Smoke"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "talos-smoke@example.invalid"], cwd=root, check=True)
+            (root / "tracked.txt").write_text("fixture\\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=root, check=True)
+            project = self.ctl(daemon, "project", "create", "Smoke project", str(root))
+            self.check(project.get("name") == "Smoke project", f"project create: {project}")
+            listed = self.ctl(daemon, "project", "list")
+            self.check(any(item.get("id") == project.get("id") for item in listed), "project missing from list")
+            self.ctl(daemon, "project", "rename", project["id"], "Renamed project")
+            worktree = self.ctl(daemon, "worktree", "create", project["id"], "Smoke worktree", "feature/smoke", "HEAD")
+            worktree_path = Path(worktree["path"])
+            self.check(worktree_path.is_dir(), "managed worktree path was not created")
+            (worktree_path / "untracked.txt").write_text("preserve me", encoding="utf-8")
+            dirty_remove = self.run_ctl(daemon, ["worktree", "delete", worktree["id"]])
+            self.check(dirty_remove.returncode != 0, "dirty managed worktree was removed")
+            self.check((worktree_path / "untracked.txt").read_text(encoding="utf-8") == "preserve me", "dirty worktree data was lost")
+            (worktree_path / "untracked.txt").unlink()
+            self.ctl(daemon, "worktree", "delete", worktree["id"])
+            self.check(not worktree_path.exists(), "managed worktree path survived delete")
+            missing_restore = self.run_ctl(daemon, ["workspace", "restore", worktree["id"]])
+            self.check(missing_restore.returncode != 0, "deleted managed worktree was restored without a checkout")
+            workspace = self.ctl(daemon, "workspace", "add", "Inside", str(workspace_path))
+            outside = self.ctl(daemon, "workspace", "add", "Outside", str(outside_path))
+            self.ctl(daemon, "workspace", "set-project", workspace["id"], project["id"])
+            rejected = self.run_ctl(daemon, ["workspace", "set-project", outside["id"], project["id"]])
+            self.check(rejected.returncode != 0, "project association accepted a workspace outside its root")
+            rejected_delete = self.run_ctl(daemon, ["project", "delete", project["id"]])
+            self.check(rejected_delete.returncode != 0, "project with associated workspace was deleted")
+            self.ctl(daemon, "workspace", "set-project", workspace["id"], "none")
+            retained_delete = self.run_ctl(daemon, ["project", "delete", project["id"]])
+            self.check(
+                retained_delete.returncode != 0,
+                "project with retained managed-worktree ownership was deleted",
+            )
+            standalone = self.ctl(
+                daemon,
+                "project",
+                "create",
+                "Standalone smoke project",
+                str(outside_path),
+            )
+            self.ctl(daemon, "project", "delete", standalone["id"])
+            remaining = self.ctl(daemon, "project", "list")
+            self.check(
+                [item.get("id") for item in remaining] == [project["id"]],
+                "unlinked project was not deleted or owned project association was lost",
+            )
+        finally:
+            if daemon.proc.poll() is None:
+                self.stop_daemon(daemon)
 
     def scenario_lifecycle(self) -> None:
         daemon = self.start_daemon("main", event_capacity=1)
@@ -696,6 +876,12 @@ class Harness:
         run_id = self.start_prompt(daemon, session_id, "hello smoke")
         state = self.wait_run_terminal(daemon, session_id, run_id)
         self.check(state == "Succeeded", f"first prompt ended as {state}")
+        usage = self.ctl(daemon, "usage")
+        self.check(usage["totals"]["input_tokens"] == 2, f"known input usage was lost: {usage}")
+        self.check(usage["totals"]["output_tokens"] == 1, f"known output usage was lost: {usage}")
+        self.check(usage["totals"]["cost_micros"] is None, f"unknown cost was fabricated: {usage}")
+        scoped_usage = self.ctl(daemon, "usage", "--session", session_id)
+        self.check(scoped_usage["totals"] == usage["totals"], "session-scoped usage differs from global usage")
         events = self.session_events(daemon, session_id)
         assistant = [
             payload["text"]

@@ -18,7 +18,25 @@ filesystem and checksum contract, not a compiled release artifact or CLI/UI
 workflow. The test refuses to run as root, matching the user installer.
 
 CI runs this separately as the **Desktop Linux packaging acceptance** job. The
-current workflow does not assemble or upload a release archive.
+current workflow does not assemble or upload a release archive. For the additional
+local compiled-artifact acceptance, build a Linux release bundle then run:
+
+```sh
+cargo build --release --locked -p talosd -p talosdctl -p talos-desktop --bins
+python3 scripts/packaging-acceptance.py --compiled-artifact --verbose
+```
+
+This creates a temporary checksum-verified archive from the compiled release
+binaries, installs it into an isolated home, runs the real daemon/CLI project,
+worktree, and PTY hard-crash workflows, restarts through the stale lock/socket,
+then replaces prior binaries with the compiled bundle and uninstalls while
+checking retained daemon data. It verifies the packaged `KillSignal`,
+`KillMode=control-group`, and restart directives. It does not launch the desktop
+UI or exercise a live systemd-user manager.
+
+The current environment has no `systemctl` executable: `systemctl --user
+is-system-running` returns `/bin/bash: systemctl: command not found` (exit 127).
+No user service is started or modified during this acceptance.
 
 `talosd-smoke.py` launches the real `talosd`, `talosdctl` and `acp-fixture`
 binaries against temporary Rust-owned homes. It is deterministic, needs no live
@@ -49,9 +67,10 @@ the fixture trace (`traces/*.jsonl`), and each home. `--timeout SECONDS` install
 a script-wide alarm that raises through the normal `finally` cleanup path; use
 `--timeout 300` in CI or any unattended run. `--scenario NAME` runs one scenario
 (repeatable: `lifecycle`, `keyed`, `isolation`, `redaction`, `interrupt`,
-`cancel-permission`). A forced-kill debug root (`--keep`) can retain a stale
-socket, which is intentional: the harness makes no automatic stale-socket
-removal claim.
+`cancel-permission`, `terminal`, `projects`). A forced-kill debug root (`--keep`)
+can retain stale markers until the next daemon start; the daemon then removes a
+confirmed-dead PID marker and refused Unix socket automatically. Active or
+unverifiable paths remain fail-closed.
 
 ## Failure diagnostics
 
@@ -88,7 +107,8 @@ Paths are resolved from the repository root (the script's parent directory).
 ## Covered scenarios
 
 - workspace add/list/show and session create with the fixture ACP provider;
-- prompt, streamed assistant text, usage, follow-up and durable replay;
+- prompt, streamed assistant text, durable replay, and session/global usage CLI
+  aggregation with unknown cost preserved as `null`;
 - deterministic tool lifecycle (`tool_call` running -> `tool_call_update`
   completed), durable replay, run-id attribution for every tool/assistant/usage
   update, a rapid follow-up that must not inherit late tool updates, and no
@@ -113,7 +133,14 @@ Paths are resolved from the repository root (the script's parent directory).
 - wrong and missing bearer tokens, incompatible protocol negotiation, a missing
   provider executable, and two isolated homes;
 - provider stderr/config secret redaction in the durable timeline, diagnostics
-  and daemon logs.
+  and daemon logs;
+- terminal creation/list/input/resize/capture/kill through the compiled CLI,
+  workspace access isolation, and PTY descendant cleanup after both graceful and
+  hard daemon termination (also repeated with the compiled release artifact);
+- project create/list/rename/delete, workspace association path checks, and refusal
+  to delete a project while workspaces remain associated;
+- managed Git worktree creation from a temporary local repository, dirty/untracked
+  checkout refusal, successful non-forced removal, and workspace ownership checks.
 
 The `keyed` scenario treats `request_key` as the durable daemon contract; the
 unkeyed prompt path is exercised separately and does not claim idempotency.
