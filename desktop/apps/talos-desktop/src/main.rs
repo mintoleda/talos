@@ -4,7 +4,20 @@
 //! provider. The UI never blocks on daemon I/O: the backend thread owns the
 //! connection and this thread only drains bounded batches each frame.
 
+// UI geometry intentionally converts bounded floating-point layout/animation
+// values. Several immediate-mode view functions are long because they own one
+// cohesive layout; unused theme/icon helpers are reserved for the component API.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::struct_excessive_bools,
+    clippy::too_many_lines,
+    dead_code
+)]
+
 mod app;
+mod attachments;
 mod backend;
 mod state;
 mod theme;

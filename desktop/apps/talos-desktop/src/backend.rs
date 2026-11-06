@@ -1,39 +1,35 @@
-//! Async bridge between the egui shell and the local `talosd` daemon.
-//!
-//! A dedicated thread owns a current-thread Tokio runtime. The UI thread sends
-//! [`Action`]s through a bounded channel and drains [`Update`]s once per frame;
-//! it never blocks on I/O. The worker auto-starts the daemon when the socket is
-//! missing, reconnects with backoff, and replays durable events after a
-//! reconnect so late events never land in the wrong session.
+//! Bounded, asynchronous local-daemon bridge. Reconnect replays durable history
+//! from per-session delivery cursors; RPC timeouts always retire the connection.
 
+#[cfg(test)]
+use crate::state::ToolState;
+use crate::state::{
+    Entry, PendingState, ProviderSummary, Session, SessionStatus, Usage, ViewModel, Workspace,
+    parse_session,
+};
+use eframe::egui;
+use serde_json::Value;
 use std::{
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     process::{Command as Process, Stdio},
     time::Duration,
 };
-
-use eframe::egui;
-use serde_json::Value;
 use talos_ipc::{Command, EventNotification, ServerFrame, WireEvent};
 use tokio::sync::mpsc;
-
-use crate::state::{
-    Entry, PendingState, ProviderSummary, Session, SessionStatus, ToolState, Usage, ViewModel,
-    Workspace, parse_session,
-};
-
 const BATCH: u32 = 64;
 
-// ---------------------------------------------------------------------------
-// Actions
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Load(String),
+    LoadTimeline {
+        session: String,
+        after: u64,
+    },
     Prompt {
         session: String,
         text: String,
+        images: Vec<String>,
         key: String,
     },
     Cancel(String),
@@ -65,17 +61,40 @@ pub enum Action {
         title: String,
     },
     Archive(String),
+    Rpc(Command),
+    ValidateImages {
+        session: String,
+        paths: Vec<String>,
+    },
     Refresh,
     Shutdown,
 }
-
 impl Action {
     fn command(&self) -> Option<Command> {
         Some(match self {
+            Self::ValidateImages { .. } => return None,
             Self::Load(session) => Command::LoadSession {
                 session_id: session.clone(),
             },
-            Self::Prompt { session, text, key } => Command::Prompt {
+            Self::LoadTimeline { session, after } => Command::ReplaySession {
+                session_id: session.clone(),
+                after: *after,
+                limit: Some(128),
+            },
+            Self::Prompt {
+                session,
+                text,
+                images,
+                key,
+            } if !images.is_empty() => Command::PromptWithImages {
+                session_id: session.clone(),
+                text: text.clone(),
+                image_paths: images.clone(),
+                request_key: Some(key.clone()),
+            },
+            Self::Prompt {
+                session, text, key, ..
+            } => Command::Prompt {
                 session_id: session.clone(),
                 text: text.clone(),
                 request_key: Some(key.clone()),
@@ -117,17 +136,19 @@ impl Action {
                 option_id: option.clone(),
                 value: value.clone(),
             },
-            Self::Rename { .. } | Self::Archive(_) => return None,
+            Self::Rename { session, title } => Command::RenameSession {
+                session_id: session.clone(),
+                title: title.clone(),
+            },
+            Self::Archive(session) => Command::ArchiveSession {
+                session_id: session.clone(),
+            },
+            Self::Rpc(command) => command.clone(),
             Self::Refresh => Command::Snapshot,
-            Self::Shutdown => return None,
+            Self::Shutdown => Command::Shutdown,
         })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Updates
-// ---------------------------------------------------------------------------
-
 enum Update {
     Connected(Value),
     Snapshot(Value),
@@ -140,79 +161,135 @@ enum Update {
     Notice(String),
 }
 
-/// Backend handle owned by the UI thread.
 pub struct Backend {
     pub view: ViewModel,
     sender: mpsc::Sender<Action>,
     receiver: mpsc::Receiver<Update>,
     next_key: u64,
+    key_namespace: String,
+    pub validated_images: Vec<(String, Value)>,
     pub failed_prompt: Option<(String, String)>,
+    pub retry_prompt: Option<Action>,
     pub endpoint: String,
-    pub auto_started: bool,
     pub created_session: Option<String>,
     pub created_workspace: Option<String>,
+    pub generation: u64,
+    pub loading: HashSet<String>,
+    pub ready: HashSet<String>,
+    pub load_errors: std::collections::HashMap<String, String>,
+    pub busy: usize,
+    pub completed: Vec<Action>,
+    pub connection_error: Option<String>,
 }
-
 impl Backend {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(ctx: egui::Context, preview: bool) -> Self {
         let (sender, actions) = mpsc::channel(BATCH as usize);
         let (updates, receiver) = mpsc::channel(512);
-        let endpoint = socket_path().display().to_string();
-        std::thread::Builder::new()
-            .name("talos-desktop-backend".into())
-            .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                runtime.block_on(worker(ctx, actions, updates));
-            })
-            .ok();
+        if !preview {
+            let failure = updates.clone();
+            let paint = ctx.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("talos-desktop-backend".into())
+                .spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime.block_on(worker(ctx, actions, updates)),
+                        Err(error) => {
+                            let _ = failure.blocking_send(Update::Offline(format!(
+                                "Backend runtime: {error}"
+                            )));
+                            paint.request_repaint();
+                        }
+                    }
+                })
+            {
+                return Self::disconnected(
+                    sender,
+                    receiver,
+                    format!("Cannot start backend: {error}"),
+                );
+            }
+        }
+        Self::disconnected(sender, receiver, "Connecting to local daemon…".into())
+    }
+    fn disconnected(
+        sender: mpsc::Sender<Action>,
+        receiver: mpsc::Receiver<Update>,
+        status: String,
+    ) -> Self {
+        let mut view = ViewModel::default();
+        view.status = status;
         Self {
-            view: ViewModel {
-                status: "Connecting…".into(),
-                ..ViewModel::default()
-            },
+            view,
             sender,
             receiver,
             next_key: 0,
+            key_namespace: format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
+            validated_images: Vec::new(),
             failed_prompt: None,
-            endpoint,
-            auto_started: false,
+            retry_prompt: None,
+            endpoint: socket_path().display().to_string(),
             created_session: None,
             created_workspace: None,
+            generation: 0,
+            loading: HashSet::new(),
+            ready: HashSet::new(),
+            load_errors: std::collections::HashMap::new(),
+            busy: 0,
+            completed: Vec::new(),
+            connection_error: None,
         }
     }
-
-    /// Queue an action; returns false (and surfaces a notice) when offline.
     pub fn submit(&mut self, action: Action) -> bool {
-        if self.sender.try_send(action).is_ok() {
-            true
-        } else {
-            self.view.notice = Some("Backend queue is full; try again in a moment.".into());
-            false
+        if !self.view.online && !matches!(action, Action::Refresh | Action::ValidateImages { .. }) {
+            self.view.error = Some(
+                "Daemon offline. Reconnect before making changes; drafts are retained.".into(),
+            );
+            return false;
         }
+        if self.sender.try_send(action.clone()).is_err() {
+            self.view.error =
+                Some("Backend queue unavailable or full. Your edits are retained.".into());
+            return false;
+        }
+        match &action {
+            Action::Load(session) => {
+                self.loading.insert(session.clone());
+                self.ready.remove(session);
+                self.load_errors.remove(session);
+            }
+            Action::LoadTimeline { session, .. } => {
+                self.loading.insert(session.clone());
+            }
+            _ => {}
+        }
+        self.busy += 1;
+        true
     }
-
-    /// Send a prompt with a stable client key for de-duplication.
-    pub fn send(&mut self, session: &str, text: String) -> bool {
+    pub fn send(&mut self, session: &str, text: String, images: Vec<String>) -> bool {
         self.next_key += 1;
-        let key = format!("desktop-{}-{}", std::process::id(), self.next_key);
-        let echoed = text.clone();
-        if self.submit(Action::Prompt {
+        let action = Action::Prompt {
             session: session.into(),
-            text,
-            key,
-        }) {
-            self.view.echo_user_prompt(session, &echoed);
+            text: text.clone(),
+            images,
+            key: format!("desktop-{}-{}", self.key_namespace, self.next_key),
+        };
+        if self.submit(action) {
+            self.view.echo_user_prompt(session, &text);
             true
         } else {
             false
         }
     }
-
     pub fn drain(&mut self) {
         for _ in 0..BATCH {
             let Ok(update) = self.receiver.try_recv() else {
@@ -221,22 +298,26 @@ impl Backend {
             self.apply(update);
         }
     }
-
     fn apply(&mut self, update: Update) {
         match update {
             Update::Connected(snapshot) => {
-                self.auto_started = true;
-                apply_snapshot(&mut self.view, &snapshot, false);
+                self.generation += 1;
+                self.ready.clear();
+                self.loading.clear();
+                self.load_errors.clear();
+                self.connection_error = None;
+                apply_snapshot(&mut self.view, &snapshot, true);
             }
             Update::Snapshot(snapshot) => apply_snapshot(&mut self.view, &snapshot, true),
             Update::Offline(reason) => {
-                if self.view.sessions.is_empty() {
-                    self.view = ViewModel::demo();
-                    self.view.error = Some(reason);
-                } else {
-                    self.view.online = false;
-                    self.view.status = "Reconnecting…".into();
-                    self.view.notice = Some(reason);
+                self.view.online = false;
+                self.view.status = "Disconnected · reconnecting".into();
+                self.connection_error = Some(reason);
+                self.ready.clear();
+                for session in &mut self.view.sessions {
+                    if session.status != SessionStatus::Attention {
+                        session.status = SessionStatus::Offline;
+                    }
                 }
             }
             Update::Notice(message) => self.view.notice = Some(message),
@@ -245,48 +326,86 @@ impl Backend {
                     self.view.apply_event(event);
                 }
             }
-            Update::Result { action, result } => match result {
-                Ok(value) => self.apply_success(action, value),
-                Err(error) => self.apply_failure(action, error),
-            },
-        }
-    }
-
-    fn apply_success(&mut self, action: Action, value: Value) {
-        match action {
-            Action::Load(session) => {
-                let entries = entries_from_snapshot(&value);
-                if !entries.is_empty() {
-                    self.view.entries.insert(session, entries);
+            Update::Result { action, result } => {
+                self.busy = self.busy.saturating_sub(1);
+                match result {
+                    Ok(value) => {
+                        self.completed.push(action.clone());
+                        self.apply_success(action, value);
+                    }
+                    Err(error) => self.apply_failure(action, error),
                 }
             }
-            Action::Prompt { .. } => {}
-            Action::Cancel(session) => {
-                self.view.run.insert(session, false);
+        }
+    }
+    fn apply_success(&mut self, action: Action, value: Value) {
+        match action {
+            Action::ValidateImages { session, .. } => self.validated_images.push((session, value)),
+            Action::Load(session) => {
+                self.loading.remove(&session);
+                self.load_errors.remove(&session);
+                self.ready.insert(session.clone());
+                self.submit(Action::LoadTimeline { session, after: 0 });
             }
+            Action::LoadTimeline { session, after } => {
+                let events = value["events"].as_array();
+                for event in events.into_iter().flatten().filter_map(notification) {
+                    self.view.apply_event(&event);
+                }
+                let next = value["next_cursor"]
+                    .as_u64()
+                    .or_else(|| {
+                        events
+                            .and_then(|events| events.last())
+                            .and_then(|event| event["sequence"].as_u64())
+                    })
+                    .unwrap_or(after);
+                let has_more = value["has_more"]
+                    .as_bool()
+                    .unwrap_or_else(|| events.is_some_and(|events| events.len() == 128));
+                if has_more && next > after {
+                    self.submit(Action::LoadTimeline {
+                        session,
+                        after: next,
+                    });
+                } else {
+                    self.loading.remove(&session);
+                    self.load_errors.remove(&session);
+                    self.ready.insert(session.clone());
+                    self.submit(Action::Rpc(Command::UsageSummary {
+                        session_id: Some(session),
+                    }));
+                }
+            }
+            Action::Prompt { session, .. } => {
+                self.retry_prompt = None;
+                self.view.run.insert(
+                    session,
+                    matches!(
+                        value["status"].as_str(),
+                        Some("starting" | "running" | "queued" | "cancel_requested")
+                    ),
+                );
+            }
+            Action::Cancel(_) => {} // Busy until the durable terminal event arrives.
             Action::Decision { id, session, .. } => {
                 self.view.pending.remove(&id);
-                self.view.entries.entry(session.clone()).and_modify(|entries| {
-                    entries.retain(|entry| {
-                        !matches!(&entry.kind, crate::state::EntryKind::Permission { id: pending, .. } if pending == &id)
-                    });
-                });
+                if let Some(entries) = self.view.entries.get_mut(&session) {
+                    entries.retain(|entry| !matches!(&entry.kind, crate::state::EntryKind::Permission { id: known, .. } if known == &id));
+                }
+                self.view.refresh_attention(&session);
             }
             Action::CreateAgent { workspace, .. } => {
-                if let Some(session) = value.get("session").and_then(parse_session) {
-                    let agent = &value["agent"];
-                    let mut session = session;
-                    session.title = agent
-                        .get("title")
-                        .and_then(Value::as_str)
+                if let Some(mut session) = value.get("session").and_then(parse_session) {
+                    session.title = value["agent"]["title"]
+                        .as_str()
                         .unwrap_or("New agent")
-                        .to_owned();
-                    session.provider = agent
-                        .get("provider")
-                        .and_then(Value::as_str)
+                        .into();
+                    session.provider = value["agent"]["provider"]
+                        .as_str()
                         .unwrap_or("talos")
-                        .to_owned();
-                    session.workspace = workspace.clone();
+                        .into();
+                    session.workspace.clone_from(&workspace);
                     session.cwd = self
                         .view
                         .workspaces
@@ -294,101 +413,148 @@ impl Backend {
                         .find(|item| item.id == workspace)
                         .map(|item| item.path.clone())
                         .unwrap_or_default();
-                    session.status = SessionStatus::Idle;
+                    self.ready.insert(session.id.clone());
                     self.created_session = Some(session.id.clone());
                     self.view.sessions.insert(0, session);
-                    self.view.notice = Some("Agent created.".into());
-                    // The provider's model catalogue is advertised by ACP when
-                    // its session is created. Refresh provider summaries now so
-                    // the composer picker can expose those concrete model IDs.
-                    self.submit(Action::Refresh);
                 }
             }
-            Action::CreateWorkspace { name, path } => {
-                if let Some(id) = value.get("id").and_then(Value::as_str) {
-                    self.created_workspace = Some(id.to_owned());
-                    self.view.workspaces.push(Workspace {
-                        id: id.to_owned(),
-                        name: name.clone(),
-                        path: path.clone(),
-                    });
-                    self.view.notice = Some(format!("Workspace “{name}” added."));
-                }
+            Action::CreateWorkspace { .. } => {
+                self.created_workspace = value["id"].as_str().map(str::to_owned);
             }
             Action::SetModel { session, model } => {
                 if let Some(item) = self.view.session_mut(&session) {
                     item.model = Some(model);
                 }
             }
-            Action::SetConfig { .. } => {}
+            Action::SetConfig {
+                session,
+                option,
+                value,
+            } => {
+                if let Some(options) = self
+                    .view
+                    .config_options
+                    .get_mut(&session)
+                    .and_then(Value::as_array_mut)
+                    && let Some(config) = options.iter_mut().find(|item| item["id"] == option)
+                {
+                    config["currentValue"] = Value::String(value);
+                }
+            }
             Action::Rename { session, title } => {
                 if let Some(item) = self.view.session_mut(&session) {
                     item.title = title;
                 }
             }
             Action::Archive(session) => {
-                self.view.sessions.retain(|item| item.id != session);
-                self.view.entries.remove(&session);
+                if let Some(item) = self.view.session_mut(&session) {
+                    item.archived = true;
+                }
             }
+            Action::Rpc(command) => match command {
+                Command::ListProjects => {
+                    self.view.projects = value.as_array().cloned().unwrap_or_default();
+                }
+                Command::SearchTimeline { .. } => self.view.search = value,
+                Command::ListTerminals { .. } => self.view.terminals = value,
+                Command::CaptureTerminal { .. } => self.view.terminal_capture = value,
+                Command::CreateTerminal { workspace_id, .. }
+                | Command::KillTerminal { workspace_id, .. } => {
+                    self.submit(Action::Rpc(Command::ListTerminals { workspace_id }));
+                }
+                Command::TerminalInput {
+                    workspace_id,
+                    terminal_id,
+                    ..
+                } => {
+                    self.submit(Action::Rpc(Command::CaptureTerminal {
+                        workspace_id,
+                        terminal_id,
+                        limit: Some(65_536),
+                    }));
+                }
+                Command::CreateProject { .. }
+                | Command::RenameProject { .. }
+                | Command::DeleteProject { .. } => {
+                    self.submit(Action::Rpc(Command::ListProjects));
+                }
+                Command::SetWorkspaceProject { .. }
+                | Command::CreateManagedWorktree { .. }
+                | Command::DeleteManagedWorktree { .. }
+                | Command::RenameWorkspace { .. }
+                | Command::ArchiveWorkspace { .. }
+                | Command::RestoreWorkspace { .. } => {
+                    self.submit(Action::Refresh);
+                }
+                Command::ProviderDiagnostics { .. } => self.view.diagnostics = value,
+                Command::UsageSummary { session_id } => {
+                    if let Some(session) = session_id {
+                        self.view.usage.insert(session, parse_usage(&value));
+                    } else {
+                        self.view.usage_summary = value;
+                    }
+                }
+                Command::SetMode {
+                    session_id,
+                    mode_id,
+                } => {
+                    if let Some(item) = self.view.session_mut(&session_id) {
+                        item.mode = Some(mode_id);
+                    }
+                }
+                _ => {}
+            },
             Action::Refresh => apply_snapshot(&mut self.view, &value, true),
             Action::Shutdown => {
                 self.view.online = false;
-                self.view.status = "Daemon stopped".into();
+                self.view.status = "Daemon stopped · Reconnect to start".into();
             }
         }
     }
-
     fn apply_failure(&mut self, action: Action, error: String) {
-        match action {
-            Action::Load(session) => {
-                self.view.entries.entry(session).or_default();
+        match &action {
+            Action::Load(session) | Action::LoadTimeline { session, .. } => {
+                self.loading.remove(session);
+                self.ready.remove(session);
+                self.load_errors.insert(session.clone(), error.clone());
             }
             Action::Prompt { session, text, .. } => {
                 self.view.run.insert(session.clone(), false);
-                self.failed_prompt = Some((session, text));
+                self.failed_prompt = Some((session.clone(), text.clone()));
+                self.retry_prompt = Some(action.clone());
+                if let Some(entries) = self.view.entries.get_mut(session) {
+                    entries.retain(|entry| !entry.id.starts_with("local-"));
+                }
             }
             Action::Decision { id, .. } => {
-                self.view.pending.insert(id, PendingState::Failed);
+                self.view.pending.insert(id.clone(), PendingState::Failed);
+                self.submit(Action::Refresh);
             }
-            Action::SetModel { session, .. }
-            | Action::SetConfig { session, .. }
-            | Action::Rename { session, .. }
-            | Action::CreateAgent {
-                workspace: session, ..
-            } => {
-                let _ = session;
-            }
-            Action::Cancel(_) | Action::Archive(_) | Action::Refresh | Action::Shutdown => {}
-            Action::CreateWorkspace { .. } => {}
+            _ => {}
         }
         self.view.error = Some(error);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot parsing
-// ---------------------------------------------------------------------------
-
-fn apply_snapshot(view: &mut ViewModel, snapshot: &Value, preserve_entries: bool) {
+fn apply_snapshot(view: &mut ViewModel, snapshot: &Value, _preserve_entries: bool) {
     view.online = true;
     view.status = snapshot.get("home").and_then(Value::as_str).map_or_else(
         || "Connected · talosd".into(),
         |home| format!("Connected · {}", compact_path(home)),
     );
-    view.workspaces = snapshot
-        .get("workspaces")
-        .and_then(Value::as_array)
+    view.workspaces = snapshot["workspaces"]
+        .as_array()
         .into_iter()
         .flatten()
         .filter_map(|item| {
             Some(Workspace {
-                id: item.get("id")?.as_str()?.to_owned(),
-                name: item.get("name")?.as_str()?.to_owned(),
-                path: item
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
+                id: item["id"].as_str()?.into(),
+                name: item["name"].as_str()?.into(),
+                path: item["path"].as_str().unwrap_or_default().into(),
+                project: item["project_id"].as_str().map(str::to_owned),
+                archived: item["lifecycle"] == "Archived",
+                managed: item["kind"] == "Worktree"
+                    && item["metadata"]["managedWorktree"]["owner"] == "talosd",
             })
         })
         .collect();
@@ -398,33 +564,41 @@ fn apply_snapshot(view: &mut ViewModel, snapshot: &Value, preserve_entries: bool
         snapshot.get("agents"),
         &view.workspaces,
     );
-    view.pending.clear();
-    for pending in snapshot
-        .get("pending_permissions")
-        .and_then(Value::as_array)
+    view.usage_summary = snapshot["usage"].clone();
+    let pending: HashSet<String> = snapshot["pending_permissions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["id"].as_str().map(str::to_owned))
+        .collect();
+    view.pending.retain(|id, _| pending.contains(id));
+    for entries in view.entries.values_mut() {
+        entries.retain(|entry| !matches!(&entry.kind, crate::state::EntryKind::Permission { id, .. } if !pending.contains(id)));
+    }
+    for request in snapshot["pending_permissions"]
+        .as_array()
         .into_iter()
         .flatten()
     {
-        if let Some(id) = pending.get("id").and_then(Value::as_str) {
-            view.pending.insert(id.to_owned(), PendingState::Idle);
-        }
-    }
-    if let Some(usage) = snapshot.get("usage").and_then(Value::as_object) {
-        for (session, value) in usage {
-            view.usage.insert(session.clone(), parse_usage(value));
+        if let (Some(session), Some(id)) = (request["session_id"].as_str(), request["id"].as_str())
+        {
+            view.pending.entry(id.into()).or_default();
+            view.apply_pending(request);
+            view.refresh_attention(session);
         }
     }
     for session in &view.sessions {
-        if session.status == SessionStatus::Attention {
-            view.run.insert(session.id.clone(), false);
-        }
+        // Snapshot lifecycle does not identify the active run. Replay/live state
+        // is authoritative; Busy/AttentionRequired are a conservative fallback.
+        view.run.insert(
+            session.id.clone(),
+            matches!(
+                session.status,
+                SessionStatus::Running | SessionStatus::Attention
+            ),
+        );
     }
-    if !preserve_entries {
-        view.entries.clear();
-    }
-    view.notice = None;
 }
-
 fn parse_providers(value: Option<&Value>) -> Vec<ProviderSummary> {
     value
         .and_then(Value::as_array)
@@ -500,6 +674,7 @@ fn parse_providers(value: Option<&Value>) -> Vec<ProviderSummary> {
                 name,
                 models,
                 modes,
+                capabilities: item["capabilities"].clone(),
             })
         })
         .collect()
@@ -553,10 +728,17 @@ fn parse_sessions(
                     .find(|workspace| workspace.id == parsed.workspace)
                     .map(|workspace| workspace.path.clone())
                     .unwrap_or_default();
-                parsed.archived = agent
-                    .get("lifecycle")
-                    .and_then(Value::as_str)
-                    .is_some_and(|lifecycle| lifecycle == "Archived");
+                parsed.status = match agent["lifecycle"].as_str() {
+                    Some("Busy" | "Stopping") => SessionStatus::Running,
+                    Some("AttentionRequired") => SessionStatus::Attention,
+                    Some("Failed") => SessionStatus::Error,
+                    _ => SessionStatus::Idle,
+                };
+                parsed.archived = parsed.lifecycle == "Archived"
+                    || agent
+                        .get("lifecycle")
+                        .and_then(Value::as_str)
+                        .is_some_and(|lifecycle| lifecycle == "Archived");
             }
             Some(parsed)
         })
@@ -575,10 +757,10 @@ fn parse_usage(value: &Value) -> Usage {
 }
 
 fn compact_path(path: &str) -> String {
-    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
-        if let Ok(rest) = Path::new(path).strip_prefix(&home) {
-            return format!("~/{}", rest.display());
-        }
+    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+        && let Ok(rest) = Path::new(path).strip_prefix(&home)
+    {
+        return format!("~/{}", rest.display());
     }
     path.to_owned()
 }
@@ -589,11 +771,13 @@ fn entries_from_snapshot(value: &Value) -> Vec<Entry> {
         .get("session")
         .and_then(|session| session.get("id"))
         .and_then(Value::as_str)
+        .or_else(|| value.get("session_id").and_then(Value::as_str))
         .unwrap_or_default()
         .to_owned();
     let mut view = ViewModel::default();
     for event in value
         .get("events")
+        .or_else(|| value.get("timeline"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -630,98 +814,265 @@ fn entries_from_snapshot(value: &Value) -> Vec<Entry> {
     view.entries.remove(&session_id).unwrap_or_default()
 }
 
-// ---------------------------------------------------------------------------
-// Worker
-// ---------------------------------------------------------------------------
+async fn publish(
+    ctx: &egui::Context,
+    updates: &mpsc::Sender<Update>,
+    update: Update,
+) -> Result<(), String> {
+    updates
+        .send(update)
+        .await
+        .map_err(|_| "Desktop closed".to_owned())?;
+    ctx.request_repaint();
+    Ok(())
+}
 
+type LocalClient = talos_ipc::Client<tokio::net::UnixStream>;
+async fn rpc(client: &mut LocalClient, command: Command) -> Result<Value, String> {
+    tokio::time::timeout(Duration::from_secs(45), client.call(command))
+        .await
+        .map_err(|_| {
+            "Request timed out; outcome may be unknown. Reconnecting before further requests."
+                .to_owned()
+        })?
+        .map_err(|error| error.to_string())
+}
+async fn connect() -> Result<LocalClient, String> {
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(5),
+        talos_ipc::unix::connect(&socket_path(), auth_token()),
+    )
+    .await
+    .map_err(|_| "Daemon connection timed out".to_owned())?
+    .map_err(|e| e.to_string())?;
+    tokio::time::timeout(Duration::from_secs(5), client.negotiate())
+        .await
+        .map_err(|_| "Daemon handshake timed out".to_owned())?
+        .map_err(|e| e.to_string())?;
+    Ok(client)
+}
 async fn worker(
     ctx: egui::Context,
     mut actions: mpsc::Receiver<Action>,
     updates: mpsc::Sender<Update>,
 ) {
+    let mut cursors = BTreeMap::new();
     loop {
-        match connect_and_run(&ctx, &mut actions, &updates).await {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                let _ = updates.send(Update::Offline(error)).await;
-                ctx.request_repaint();
+        ensure_daemon(&updates, &ctx).await;
+        let result = async {
+            let mut commands = connect().await?;
+            let mut stream = connect().await?;
+            tokio::select! {
+                result = command_loop(&ctx, &mut commands, &mut actions, &updates) => result,
+                result = event_loop(&ctx, &mut stream, &updates, &mut cursors) => result.map(|()| false),
             }
-        }
-        // Backoff before reconnecting; also drains shutdown requests.
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_millis(1200)) => {}
-            action = actions.recv() => {
-                match action {
-                    None | Some(Action::Shutdown) => return,
-                    Some(action) => {
-                        let _ = updates.send(Update::Offline("Daemon unavailable; action dropped.".into())).await;
-                        let _ = action;
+        }.await;
+        match result {
+            Ok(true) => {
+                // An explicit stop must stay stopped. Refresh is the explicit
+                // start/reconnect action; closing the window just drops sender.
+                loop {
+                    match actions.recv().await {
+                        None => return,
+                        Some(Action::Refresh) => {
+                            let _ = publish(
+                                &ctx,
+                                &updates,
+                                Update::Result {
+                                    action: Action::Refresh,
+                                    result: Err("Starting daemon…".into()),
+                                },
+                            )
+                            .await;
+                            break;
+                        }
+                        Some(action) => {
+                            let _ = publish(
+                                &ctx,
+                                &updates,
+                                Update::Result {
+                                    action,
+                                    result: Err("Daemon is stopped".into()),
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+            Ok(false) => return,
+            Err(error) => {
+                if publish(&ctx, &updates, Update::Offline(error))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(1200)) => {}
+                    action = actions.recv() => match action {
+                        None => return,
+                        Some(action) => { let _ = publish(&ctx, &updates, Update::Result { action, result: Err("Daemon unavailable. Edits were retained.".into()) }).await; }
                     }
                 }
             }
         }
     }
 }
-
-/// Connect, stream and serve actions. Returns `Ok(true)` when the app asked to
-/// exit, `Ok(false)` when the connection dropped and should be retried.
-async fn connect_and_run(
+async fn command_loop(
     ctx: &egui::Context,
+    client: &mut LocalClient,
     actions: &mut mpsc::Receiver<Action>,
     updates: &mpsc::Sender<Update>,
 ) -> Result<bool, String> {
-    ensure_daemon(updates, ctx).await;
-    let socket = socket_path();
-    let token = auth_token();
-    let mut client = talos_ipc::unix::connect(&socket, token)
-        .await
-        .map_err(|error| format!("Connect to talosd: {error}"))?;
-    client
-        .negotiate()
-        .await
-        .map_err(|error| format!("Protocol negotiation failed: {error}"))?;
-    let snapshot = client
-        .call(Command::Snapshot)
-        .await
-        .map_err(|error| format!("Snapshot failed: {error}"))?;
-    let _ = updates.send(Update::Connected(snapshot)).await;
-    ctx.request_repaint();
-
-    loop {
-        tokio::select! {
-            action = actions.recv() => {
-                let Some(action) = action else { return Ok(true) };
-                if matches!(action, Action::Shutdown) {
-                    return Ok(true);
-                }
-                let Some(command) = action.command() else { continue };
-                let result = tokio::time::timeout(Duration::from_secs(60), client.call(command))
-                    .await
-                    .map_err(|_| "Request timed out".to_owned())
-                    .and_then(|result| result.map_err(|error| error.to_string()));
-                let _ = updates.send(Update::Result { action, result }).await;
-                ctx.request_repaint();
-                // Drain events the client buffered while awaiting the response.
-                loop {
-                    match tokio::time::timeout(Duration::from_millis(1), client.next_frame()).await {
-                        Ok(Ok(ServerFrame::Event(event))) => {
-                            let _ = updates.send(Update::Events(vec![event])).await;
-                        }
-                        Ok(Ok(ServerFrame::Response(_))) => {}
-                        Ok(Err(_)) | Err(_) => break,
-                    }
-                }
+    while let Some(action) = actions.recv().await {
+        let Some(command) = action.command() else {
+            if let Action::ValidateImages { paths, .. } = &action {
+                let paths = paths.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || crate::attachments::validate(&paths))
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r);
+                publish(ctx, updates, Update::Result { action, result }).await?;
             }
-            frame = client.next_frame() => {
-                match frame {
-                    Ok(ServerFrame::Event(event)) => {
-                        let _ = updates.send(Update::Events(vec![event])).await;
-                        ctx.request_repaint();
-                    }
-                    Ok(ServerFrame::Response(_)) => {}
-                    Err(error) => return Err(format!("Connection lost: {error}")),
-                }
+            continue;
+        };
+        let result = rpc(client, command.clone()).await;
+        let connection_failure = result
+            .as_ref()
+            .err()
+            .filter(|error| !error.starts_with("remote error"))
+            .cloned();
+        let success = result.is_ok();
+        publish(
+            ctx,
+            updates,
+            Update::Result {
+                action: action.clone(),
+                result,
+            },
+        )
+        .await?;
+        if let Some(error) = connection_failure {
+            return Err(error);
+        }
+        if action == Action::Shutdown && success {
+            return Ok(true);
+        }
+        if success
+            && !matches!(
+                command,
+                Command::Snapshot
+                    | Command::CaptureTerminal { .. }
+                    | Command::TerminalInput { .. }
+                    | Command::ResizeTerminal { .. }
+                    | Command::ListTerminals { .. }
+                    | Command::SearchTimeline { .. }
+                    | Command::ListProjects
+                    | Command::UsageSummary { .. }
+                    | Command::ProviderDiagnostics { .. }
+            )
+        {
+            let snapshot = rpc(client, Command::Snapshot).await?;
+            publish(ctx, updates, Update::Snapshot(snapshot)).await?;
+        }
+    }
+    Ok(false)
+}
+async fn replay(
+    ctx: &egui::Context,
+    client: &mut LocalClient,
+    updates: &mpsc::Sender<Update>,
+    cursors: &mut BTreeMap<String, u64>,
+) -> Result<(), String> {
+    loop {
+        let page = rpc(
+            client,
+            Command::ReplaySessions {
+                after: cursors.clone(),
+                limit: Some(128),
+            },
+        )
+        .await?;
+        let events: Vec<_> = page["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(notification)
+            .collect();
+        let mut next = cursors.clone();
+        let mut delivered = Vec::new();
+        for event in events {
+            let Some(session) = event.event.payload["session_id"].as_str() else {
+                continue;
+            };
+            let cursor = next.entry(session.into()).or_default();
+            if event.cursor > *cursor {
+                *cursor = event.cursor;
+                delivered.push(event);
+            }
+        }
+        if delivered.is_empty() && page["has_more"] == true {
+            return Err("Replay did not advance; refusing to skip history".into());
+        }
+        publish(ctx, updates, Update::Events(delivered)).await?;
+        *cursors = next;
+        if page["has_more"] != true {
+            return Ok(());
+        }
+    }
+}
+fn notification(event: &Value) -> Option<EventNotification> {
+    Some(EventNotification {
+        version: talos_ipc::PROTOCOL_VERSION,
+        cursor: event["sequence"].as_u64()?,
+        event_id: event["id"].as_str()?.into(),
+        event: WireEvent {
+            kind: "timeline".into(),
+            payload: event.clone(),
+        },
+    })
+}
+async fn event_loop(
+    ctx: &egui::Context,
+    client: &mut LocalClient,
+    updates: &mpsc::Sender<Update>,
+    cursors: &mut BTreeMap<String, u64>,
+) -> Result<(), String> {
+    replay(ctx, client, updates, cursors).await?;
+    let snapshot = rpc(client, Command::Snapshot).await?;
+    publish(ctx, updates, Update::Connected(snapshot)).await?;
+    loop {
+        let frame = client.next_frame().await.map_err(|e| e.to_string())?;
+        if let ServerFrame::Event(event) = frame {
+            if event.event.kind == "replay_required" {
+                replay(ctx, client, updates, cursors).await?;
+                let snapshot = rpc(client, Command::Snapshot).await?;
+                publish(ctx, updates, Update::Snapshot(snapshot)).await?;
+                continue;
+            }
+            let Some(session) = event.event.payload["session_id"].as_str() else {
+                continue;
+            };
+            let known = cursors.get(session).copied().unwrap_or_default();
+            if event.cursor <= known {
+                continue;
+            }
+            if event.cursor != known + 1 {
+                replay(ctx, client, updates, cursors).await?;
+                continue;
+            }
+            let session = session.to_owned();
+            let cursor = event.cursor;
+            let permission = event.event.payload["kind"]
+                .get("PermissionResolved")
+                .is_some();
+            publish(ctx, updates, Update::Events(vec![event])).await?;
+            cursors.insert(session, cursor);
+            if permission {
+                let snapshot = rpc(client, Command::Snapshot).await?;
+                publish(ctx, updates, Update::Snapshot(snapshot)).await?;
             }
         }
     }
@@ -742,10 +1093,10 @@ fn socket_path() -> PathBuf {
 }
 
 fn auth_token() -> Option<String> {
-    if let Ok(token) = std::env::var("TALOSD_AUTH_TOKEN") {
-        if !token.is_empty() {
-            return Some(token);
-        }
+    if let Ok(token) = std::env::var("TALOSD_AUTH_TOKEN")
+        && !token.is_empty()
+    {
+        return Some(token);
     }
     std::fs::read_to_string(home_dir().join("auth.token"))
         .ok()
@@ -757,16 +1108,16 @@ fn daemon_binary() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("TALOSD_BIN") {
         return Some(PathBuf::from(path));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join(if cfg!(windows) {
-                "talosd.exe"
-            } else {
-                "talosd"
-            });
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        let candidate = parent.join(if cfg!(windows) {
+            "talosd.exe"
+        } else {
+            "talosd"
+        });
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
     let path = std::env::var_os("PATH")?;
@@ -836,6 +1187,7 @@ async fn ensure_daemon(updates: &mpsc::Sender<Update>, ctx: &egui::Context) {
 /// Group timeline entries for rendering: adjacent completed tools collapse into
 /// one activity block to keep the reading column calm.
 #[must_use]
+#[cfg(test)]
 pub fn group_tools(entries: &[Entry]) -> Vec<Vec<&Entry>> {
     let mut groups: Vec<Vec<&Entry>> = Vec::new();
     for entry in entries {
@@ -846,19 +1198,18 @@ pub fn group_tools(entries: &[Entry]) -> Vec<Vec<&Entry>> {
                 ..
             }
         );
-        if is_quiet_tool {
-            if let Some(last) = groups.last_mut() {
-                if matches!(
-                    last.first().map(|entry| &entry.kind),
-                    Some(crate::state::EntryKind::Tool {
-                        state: ToolState::Completed,
-                        ..
-                    })
-                ) {
-                    last.push(entry);
-                    continue;
-                }
-            }
+        if is_quiet_tool
+            && let Some(last) = groups.last_mut()
+            && matches!(
+                last.first().map(|entry| &entry.kind),
+                Some(crate::state::EntryKind::Tool {
+                    state: ToolState::Completed,
+                    ..
+                })
+            )
+        {
+            last.push(entry);
+            continue;
         }
         groups.push(vec![entry]);
     }
@@ -968,6 +1319,7 @@ mod tests {
             id: "w1".into(),
             name: "paseo".into(),
             path: "/repo".into(),
+            ..Workspace::default()
         }];
         let parsed = parse_sessions(Some(&sessions), Some(&agents), &workspaces);
         assert_eq!(parsed[0].title, "Fix parser");

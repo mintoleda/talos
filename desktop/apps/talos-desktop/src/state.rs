@@ -5,7 +5,7 @@
 //! drafts, open popovers) lives in the application struct instead, so this type
 //! stays cheap to clone and easy to test.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -41,6 +41,7 @@ impl SessionStatus {
 #[derive(Clone, Debug, Default)]
 pub struct Session {
     pub id: String,
+    pub agent_id: String,
     pub title: String,
     pub detail: String,
     pub model: Option<String>,
@@ -51,6 +52,7 @@ pub struct Session {
     pub time: String,
     pub status: SessionStatus,
     pub archived: bool,
+    pub lifecycle: String,
 }
 
 impl Session {
@@ -129,7 +131,11 @@ pub enum EntryKind {
         code: Option<String>,
         message: String,
     },
-    Usage(Usage),
+    Attachment {
+        name: String,
+        mime: String,
+        size: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -138,13 +144,6 @@ pub struct Entry {
     pub run: Option<String>,
     pub at: String,
     pub kind: EntryKind,
-}
-
-impl Entry {
-    #[must_use]
-    pub fn is_assistant(&self) -> bool {
-        matches!(self.kind, EntryKind::Assistant { .. })
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -164,6 +163,9 @@ pub struct Workspace {
     pub id: String,
     pub name: String,
     pub path: String,
+    pub project: Option<String>,
+    pub archived: bool,
+    pub managed: bool,
 }
 
 #[derive(Default)]
@@ -172,7 +174,12 @@ pub struct ViewModel {
     pub entries: HashMap<String, Vec<Entry>>,
     pub workspaces: Vec<Workspace>,
     pub providers: Vec<ProviderSummary>,
-    pub catalog: Value,
+    pub projects: Vec<Value>,
+    pub search: Value,
+    pub terminals: Value,
+    pub terminal_capture: Value,
+    pub diagnostics: Value,
+    pub usage_summary: Value,
     pub config_options: HashMap<String, Value>,
     pub pending: HashMap<String, PendingState>,
     pub usage: HashMap<String, Usage>,
@@ -181,7 +188,7 @@ pub struct ViewModel {
     pub error: Option<String>,
     pub notice: Option<String>,
     pub online: bool,
-    pub unsupported: Vec<String>,
+    seen: HashSet<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +200,13 @@ pub struct ProviderSummary {
     pub message: Option<String>,
     pub models: Vec<ModelSummary>,
     pub modes: Vec<(String, String)>,
+    pub capabilities: Value,
+}
+
+impl ProviderSummary {
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.get(capability).and_then(Value::as_bool) == Some(true)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +217,31 @@ pub struct ModelSummary {
 }
 
 impl ViewModel {
+    /// Pending-list snapshots carry request identity; resolution events only
+    /// carry an outcome and cannot identify simultaneous requests in one run.
+    pub fn apply_pending(&mut self, request: &Value) {
+        let (Some(session), Some(id)) = (request["session_id"].as_str(), request["id"].as_str())
+        else {
+            return;
+        };
+        self.push_entry(
+            session,
+            Entry {
+                id: id.into(),
+                run: request["run_id"].as_str().map(str::to_owned),
+                at: String::new(),
+                kind: EntryKind::Permission {
+                    id: id.into(),
+                    action: request["action"].as_str().unwrap_or("Permission").into(),
+                    target: request["target"].as_str().unwrap_or_default().into(),
+                    risk: request["risk"].as_str().unwrap_or("Unknown").into(),
+                    reason: request["details"]["reason"]
+                        .as_str()
+                        .map_or_else(|| pretty_value(&request["details"]), str::to_owned),
+                },
+            },
+        );
+    }
     #[must_use]
     pub fn running(&self, session: &str) -> bool {
         self.run.get(session).copied().unwrap_or(false)
@@ -238,7 +277,6 @@ impl ViewModel {
         let mut sessions: Vec<&Session> = self
             .sessions
             .iter()
-            .filter(|session| !session.archived)
             .filter(|session| {
                 workspace.is_none_or(|id| session.workspace.is_empty() || session.workspace == id)
             })
@@ -259,6 +297,13 @@ impl ViewModel {
         let Some(session_id) = payload.get("session_id").and_then(Value::as_str) else {
             return;
         };
+        if !event.event_id.is_empty()
+            && !self
+                .seen
+                .insert((session_id.to_owned(), event.event_id.clone()))
+        {
+            return;
+        }
         let run = payload
             .get("run_id")
             .and_then(Value::as_str)
@@ -425,6 +470,7 @@ impl ViewModel {
                             .map(pretty_value)
                     })
                     .unwrap_or_default();
+                self.pending.entry(id.clone()).or_default();
                 self.set_status(session, SessionStatus::Attention);
                 self.push_entry(
                     session,
@@ -461,6 +507,7 @@ impl ViewModel {
                 self.run.insert(session.into(), running);
                 if !running {
                     self.finish_streams(session);
+                    self.resolve_permission(session, run.as_deref());
                 }
                 let status = match state {
                     "Failed" => SessionStatus::Error,
@@ -481,6 +528,30 @@ impl ViewModel {
                 };
                 self.usage.insert(session.into(), usage);
             }
+            "Attachment" => self.push_entry(
+                session,
+                Entry {
+                    id: event_id.into(),
+                    run,
+                    at,
+                    kind: EntryKind::Attachment {
+                        name: content
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Image")
+                            .into(),
+                        mime: content
+                            .get("mime_type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("image")
+                            .into(),
+                        size: content
+                            .get("size_bytes")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                    },
+                },
+            ),
             "Notice" => {
                 let message = content
                     .get("message")
@@ -545,12 +616,11 @@ impl ViewModel {
                 session.into(),
                 payload.get("options").cloned().unwrap_or_default(),
             );
-        } else if kind == "provider_mode_changed" {
-            if let Some(mode) = payload.get("modeId").and_then(Value::as_str) {
-                if let Some(item) = self.session_mut(session) {
-                    item.mode = Some(mode.to_owned());
-                }
-            }
+        } else if kind == "provider_mode_changed"
+            && let Some(mode) = payload.get("modeId").and_then(Value::as_str)
+            && let Some(item) = self.session_mut(session)
+        {
+            item.mode = Some(mode.to_owned());
         }
     }
 
@@ -672,7 +742,7 @@ impl ViewModel {
         })
     }
 
-    fn refresh_attention(&mut self, session: &str) {
+    pub fn refresh_attention(&mut self, session: &str) {
         let attention = self.has_pending_permission(session);
         let running = self.running(session);
         if let Some(item) = self.session_mut(session) {
@@ -689,10 +759,15 @@ impl ViewModel {
     }
 
     fn set_status(&mut self, session: &str, status: SessionStatus) {
-        if let Some(item) = self.session_mut(session) {
-            if item.status != SessionStatus::Attention || status != SessionStatus::Idle {
-                item.status = status;
-            }
+        let status = if self.has_pending_permission(session) {
+            SessionStatus::Attention
+        } else {
+            status
+        };
+        if let Some(item) = self.session_mut(session)
+            && (item.status != SessionStatus::Attention || status != SessionStatus::Idle)
+        {
+            item.status = status;
         }
     }
 
@@ -700,6 +775,9 @@ impl ViewModel {
     pub fn echo_user_prompt(&mut self, session: &str, text: &str) {
         self.run.insert(session.into(), true);
         self.set_status(session, SessionStatus::Running);
+        if text.is_empty() {
+            return;
+        }
         self.push_entry(
             session,
             Entry {
@@ -735,11 +813,13 @@ impl ViewModel {
                 id: "paseo-rs".into(),
                 name: "paseo-rs".into(),
                 path: "/home/adetola/repos/paseo-rs".into(),
+                ..Workspace::default()
             },
             Workspace {
                 id: "talos".into(),
                 name: "talos".into(),
                 path: "/home/adetola/repos/talos".into(),
+                ..Workspace::default()
             },
         ];
         model.providers = vec![
@@ -754,6 +834,7 @@ impl ViewModel {
                     label: "DeepSeek Chat".into(),
                     default: true,
                 }],
+                capabilities: serde_json::json!({"images":true,"model_selection":true,"modes":true,"config_options":true}),
                 modes: vec![
                     ("ask".into(), "Ask".into()),
                     ("auto".into(), "Auto".into()),
@@ -771,6 +852,7 @@ impl ViewModel {
                     label: "Claude Sonnet".into(),
                     default: true,
                 }],
+                capabilities: Value::Null,
                 modes: Vec::new(),
             },
         ];
@@ -787,6 +869,7 @@ impl ViewModel {
                 time: "now".into(),
                 status: SessionStatus::Running,
                 archived: false,
+                ..Session::default()
             },
             Session {
                 id: "demo-2".into(),
@@ -800,6 +883,7 @@ impl ViewModel {
                 time: "12m".into(),
                 status: SessionStatus::Attention,
                 archived: false,
+                ..Session::default()
             },
             Session {
                 id: "demo-3".into(),
@@ -813,6 +897,7 @@ impl ViewModel {
                 time: "1h".into(),
                 status: SessionStatus::Idle,
                 archived: false,
+                ..Session::default()
             },
         ];
         let entries = vec![
@@ -910,6 +995,8 @@ pub fn parse_session(value: &Value) -> Option<Session> {
         .map(str::to_owned);
     Some(Session {
         id,
+        agent_id: value["agent_id"].as_str().unwrap_or_default().into(),
+        lifecycle: value["lifecycle"].as_str().unwrap_or("New").into(),
         title: value
             .get("title")
             .and_then(Value::as_str)
