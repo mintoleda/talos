@@ -7,12 +7,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
     time::Duration,
 };
-use talos_domain::{Workspace, WorkspaceId, WorkspaceKind, WorkspaceLifecycle};
+use talos_domain::{Project, ProjectId, Workspace, WorkspaceId, WorkspaceKind, WorkspaceLifecycle};
 use talos_store::SqliteStore;
 use thiserror::Error;
 use uuid::Uuid;
@@ -26,6 +27,9 @@ const BACKUP_FILE_PREFIX: &str = "state.sqlite3.pre-import-";
 /// Shared with `talosd`; `create_new` is the exclusion primitive on both sides.
 const LOCK_FILE_NAME: &str = "talosd.lock";
 const PROJECTS_METADATA_KEY: &str = "legacy_import_projects";
+const JOURNAL_VERSION: u32 = 2;
+
+mod legacy_sessions;
 
 #[derive(Debug, Error)]
 pub enum MigrationError {
@@ -37,7 +41,7 @@ pub enum MigrationError {
     JournalCorrupt,
     #[error("migration journal could not be written")]
     JournalWrite(#[source] serde_json::Error),
-    #[error("source and destination paths overlap")]
+    #[error("migration source, sessions source, and destination paths must not overlap")]
     PathOverlap,
     #[error("migration path contains a symbolic link or an unexpected file type")]
     UnsafePath,
@@ -63,6 +67,8 @@ pub enum MigrationError {
     DestinationRestoreFailed,
     #[error("destination records could not be verified after import")]
     IncompleteImport,
+    #[error("historical session conflicts with an existing imported session")]
+    HistoricalSessionConflict,
     #[error("legacy importer database has active sidecars; close the old importer and retry")]
     LegacyDatabaseBusy,
 }
@@ -80,6 +86,7 @@ pub struct Report {
     pub dry_run: bool,
     pub source_fingerprint: String,
     pub project_records: usize,
+    pub imported_projects: usize,
     pub workspace_records: usize,
     pub imported_workspaces: usize,
     pub already_imported: bool,
@@ -88,6 +95,23 @@ pub struct Report {
     pub destination_backup: Option<PathBuf>,
     pub issues: Vec<Issue>,
     pub unsupported: Vec<String>,
+    /// Version of the additive report fields below.
+    #[serde(default)]
+    pub report_version: u32,
+    #[serde(default)]
+    pub sessions_source: Option<PathBuf>,
+    #[serde(default)]
+    pub sessions_source_fingerprint: Option<String>,
+    #[serde(default)]
+    pub session_candidates: usize,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    #[serde(default)]
+    pub imported_sessions: usize,
+    #[serde(default)]
+    pub imported_session_ids: Vec<String>,
+    #[serde(default)]
+    pub attachment_hashes: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct JournalEntry {
@@ -98,6 +122,8 @@ struct JournalEntry {
     database: String,
     #[serde(default)]
     workspace_ids: Vec<String>,
+    #[serde(default)]
+    project_ids: Vec<String>,
     #[serde(default)]
     destination_backup: Option<String>,
 }
@@ -113,23 +139,87 @@ struct PendingImport {
     #[serde(default)]
     workspace_ids: Vec<String>,
     #[serde(default)]
+    project_ids: Vec<String>,
+    #[serde(default)]
     destination_backup: Option<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Journal {
+    #[serde(default = "legacy_journal_version")]
+    version: u32,
     #[serde(default)]
     entries: Vec<JournalEntry>,
     #[serde(default)]
     pending: Option<PendingImport>,
+    #[serde(default)]
+    session_entries: Vec<SessionJournalEntry>,
+    #[serde(default)]
+    pending_session: Option<PendingSessionImport>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SessionJournalEntry {
+    source_key: String,
+    fingerprint: String,
+    session_id: String,
+    #[serde(default)]
+    attachment_hashes: Vec<String>,
+    imported_at: DateTime<Utc>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingSessionImport {
+    source_key: String,
+    fingerprint: String,
+    session_id: String,
+    #[serde(default)]
+    attachment_hashes: Vec<String>,
 }
 fn legacy_database_name() -> String {
     LEGACY_DATABASE_FILE_NAME.into()
+}
+fn legacy_journal_version() -> u32 {
+    1
 }
 
 /// Inventory or import the conservative portable subset. Scanning never follows symlinks.
 // Keep the safety checks and ordered apply steps together for auditability.
 #[allow(clippy::too_many_lines)]
 pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report, MigrationError> {
+    migrate_inner(source, destination, apply)
+}
+
+/// Inventory or import project/workspace data plus an explicitly selected
+/// legacy sessions directory. The sessions source is never inferred.
+pub fn migrate_with_sessions(
+    source: &Path,
+    destination: &Path,
+    apply: bool,
+    sessions_source: Option<&Path>,
+) -> Result<Report, MigrationError> {
+    if let Some(sessions_source) = sessions_source {
+        let (source_root, destination_root) = validate_paths(source, destination, apply)?;
+        let sessions_absolute = absolute_path(sessions_source)?;
+        reject_symlink_components(&sessions_absolute)?;
+        let sessions_root = normalize_lexical(&sessions_absolute);
+        reject_symlink_components(&sessions_root)?;
+        if sessions_root == destination_root
+            || sessions_root.starts_with(&destination_root)
+            || destination_root.starts_with(&sessions_root)
+            || sessions_root == source_root
+            || sessions_root.starts_with(&source_root)
+            || source_root.starts_with(&sessions_root)
+        {
+            return Err(MigrationError::PathOverlap);
+        }
+    }
+    let mut report = migrate_inner(source, destination, apply)?;
+    if let Some(sessions_source) = sessions_source {
+        legacy_sessions::import_sessions(sessions_source, destination, apply, &mut report)?;
+    }
+    Ok(report)
+}
+
+#[allow(clippy::too_many_lines)] // Keep the ordered base import preflight/apply flow together.
+fn migrate_inner(source: &Path, destination: &Path, apply: bool) -> Result<Report, MigrationError> {
     let (source_root, destination_root) = validate_paths(source, destination, apply)?;
     let mut issues = Vec::new();
     if !source_root.exists() {
@@ -157,7 +247,12 @@ pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report,
     ensure_source_unchanged(&source_files, &fingerprint)?;
     let journal_path = destination_root.join(JOURNAL_FILE_NAME);
     let journal = load_journal(&journal_path)?;
-    let converted = prepare_workspaces(&workspaces, &mut issues);
+    let (converted_projects, project_ids) = prepare_projects(&projects, &mut issues);
+    let converted = prepare_workspaces(&workspaces, &project_ids, &mut issues);
+    let expected_project_ids = converted_projects
+        .iter()
+        .map(|project| project.id.to_string())
+        .collect::<Vec<_>>();
     let expected_ids = converted
         .iter()
         .map(|workspace| workspace.id.to_string())
@@ -169,6 +264,9 @@ pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report,
             return Err(MigrationError::JournalMismatch);
         }
         if !pending.workspace_ids.is_empty() && pending.workspace_ids != expected_ids {
+            return Err(MigrationError::JournalMismatch);
+        }
+        if !pending.project_ids.is_empty() && pending.project_ids != expected_project_ids {
             return Err(MigrationError::JournalMismatch);
         }
         if pending
@@ -205,7 +303,7 @@ pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report,
     let already_imported = journal
         .entries
         .iter()
-        .any(|entry| entry.matches(&fingerprint))
+        .any(|entry| entry.matches(&fingerprint) && entry.project_ids == expected_project_ids)
         && target_present;
     let journal_backup =
         journal_backup_name(&journal, &fingerprint).map(|name| destination_root.join(name));
@@ -216,18 +314,29 @@ pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report,
         dry_run: !apply,
         source_fingerprint: fingerprint.clone(),
         project_records: projects.len(),
+        imported_projects: 0,
         workspace_records: workspaces.len(),
         imported_workspaces: 0,
         already_imported,
         destination_backup: journal_backup,
         issues,
         unsupported: unsupported_features(),
+        report_version: 1,
+        sessions_source: None,
+        sessions_source_fingerprint: None,
+        session_candidates: 0,
+        session_ids: Vec::new(),
+        imported_sessions: 0,
+        imported_session_ids: Vec::new(),
+        attachment_hashes: Vec::new(),
     };
 
     if apply {
         let plan = ImportPlan {
             source_files: &source_files,
             fingerprint: &fingerprint,
+            converted_projects: &converted_projects,
+            expected_project_ids: &expected_project_ids,
             converted: &converted,
             expected_ids: &expected_ids,
             safe_projects: &safe_projects,
@@ -238,6 +347,7 @@ pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report,
             legacy_present,
         };
         let outcome = apply_import(&destination_root, &plan)?;
+        report.imported_projects = outcome.imported_projects;
         report.imported_workspaces = outcome.imported_workspaces;
         report.already_imported = outcome.already_imported;
         report.destination_backup = outcome.destination_backup;
@@ -251,15 +361,17 @@ pub fn migrate(source: &Path, destination: &Path, apply: bool) -> Result<Report,
 fn unsupported_features() -> Vec<String> {
     vec![
         "credentials and identity/token files".into(),
-        "agents, sessions, prompts, timeline and runtime/provider state".into(),
+        "legacy agents and sessions are not imported unless --sessions-source is explicitly supplied; imported sessions are archived historical records without native provider handles or live runs".into(),
         "permission requests and stale claims".into(),
-        "attachments, worktrees, plugins, model caches, schedules and desktop state".into(),
+        "non-inline attachment payloads, worktrees, plugins, model caches, schedules and desktop state are not imported".into(),
     ]
 }
 
 struct ImportPlan<'a> {
     source_files: &'a [(&'a str, PathBuf)],
     fingerprint: &'a str,
+    converted_projects: &'a [Project],
+    expected_project_ids: &'a [String],
     converted: &'a [Workspace],
     expected_ids: &'a [String],
     safe_projects: &'a Value,
@@ -271,6 +383,7 @@ struct ImportPlan<'a> {
 }
 
 struct ApplyOutcome {
+    imported_projects: usize,
     imported_workspaces: usize,
     already_imported: bool,
     destination_backup: Option<PathBuf>,
@@ -355,10 +468,12 @@ fn apply_existing_destination(
     // The caller has made a verified backup and restores it if this operation fails.
     let DestinationState {
         mut store,
-        existing,
+        existing_projects,
+        existing_workspaces,
         metadata: existing_metadata,
     } = open_destination_state(db_path)?;
-    validate_conflicts(plan.converted, &existing)?;
+    validate_project_conflicts(plan.converted_projects, &existing_projects)?;
+    validate_workspace_conflicts(plan.converted, &existing_workspaces)?;
     if existing_metadata
         .as_ref()
         .is_some_and(|metadata| metadata != plan.safe_projects)
@@ -368,8 +483,10 @@ fn apply_existing_destination(
 
     if plan.already_imported
         && import_is_complete(
+            plan.converted_projects,
+            &existing_projects,
             plan.converted,
-            &existing,
+            &existing_workspaces,
             existing_metadata.as_ref(),
             plan.safe_projects,
         )
@@ -386,6 +503,7 @@ fn apply_existing_destination(
         }
         write_journal(plan.journal_path, &updated)?;
         return Ok(ApplyOutcome {
+            imported_projects: 0,
             imported_workspaces: 0,
             already_imported: true,
             destination_backup: None,
@@ -397,6 +515,7 @@ fn apply_existing_destination(
         fingerprint: plan.fingerprint.into(),
         database: DATABASE_FILE_NAME.into(),
         workspace_ids: plan.expected_ids.to_vec(),
+        project_ids: plan.expected_project_ids.to_vec(),
         destination_backup: backup_name.map(str::to_owned),
     };
     let mut pending_journal = plan.journal.clone();
@@ -404,27 +523,26 @@ fn apply_existing_destination(
     write_journal(plan.journal_path, &pending_journal)?;
     *pending_written = true;
 
-    let imported = apply_to_store(
+    let (imported_projects, imported_workspaces) = apply_to_store(
         &mut store,
         db_path,
+        plan.converted_projects,
         plan.converted,
         plan.safe_projects,
-        &existing,
+        &existing_projects,
+        &existing_workspaces,
         existing_metadata.as_ref(),
     )?;
-    let imported_workspaces = finalize_import(plan, imported, backup_name)?;
+    finalize_import(plan, backup_name)?;
     Ok(ApplyOutcome {
+        imported_projects,
         imported_workspaces,
         already_imported: false,
         destination_backup: None,
     })
 }
 
-fn finalize_import(
-    plan: &ImportPlan<'_>,
-    imported: usize,
-    backup_name: Option<&str>,
-) -> Result<usize, MigrationError> {
+fn finalize_import(plan: &ImportPlan<'_>, backup_name: Option<&str>) -> Result<(), MigrationError> {
     ensure_source_unchanged(plan.source_files, plan.fingerprint)?;
     let mut updated = plan.journal.clone();
     updated.pending = None;
@@ -436,10 +554,11 @@ fn finalize_import(
         imported_at: Utc::now(),
         database: DATABASE_FILE_NAME.into(),
         workspace_ids: plan.expected_ids.to_vec(),
+        project_ids: plan.expected_project_ids.to_vec(),
         destination_backup: backup_name.map(str::to_owned),
     });
     write_journal(plan.journal_path, &updated)?;
-    Ok(imported)
+    Ok(())
 }
 
 fn validate_paths(
@@ -819,7 +938,12 @@ fn load_journal(path: &Path) -> Result<Journal, MigrationError> {
         Ok(metadata) if !metadata.is_file() => Err(MigrationError::JournalCorrupt),
         Ok(_) => {
             let bytes = fs::read(path)?;
-            serde_json::from_slice(&bytes).map_err(|_| MigrationError::JournalCorrupt)
+            let journal: Journal =
+                serde_json::from_slice(&bytes).map_err(|_| MigrationError::JournalCorrupt)?;
+            if journal.version > JOURNAL_VERSION {
+                return Err(MigrationError::JournalCorrupt);
+            }
+            Ok(journal)
         }
     }
 }
@@ -827,7 +951,9 @@ fn load_journal(path: &Path) -> Result<Journal, MigrationError> {
 fn write_journal(path: &Path, journal: &Journal) -> Result<(), MigrationError> {
     let parent = path.parent().ok_or(MigrationError::UnsafePath)?;
     reject_symlink_components(parent)?;
-    let bytes = serde_json::to_vec_pretty(journal).map_err(MigrationError::JournalWrite)?;
+    let mut versioned = journal.clone();
+    versioned.version = JOURNAL_VERSION;
+    let bytes = serde_json::to_vec_pretty(&versioned).map_err(MigrationError::JournalWrite)?;
     let temporary = parent.join(format!(".{JOURNAL_FILE_NAME}.tmp.{}", Uuid::new_v4()));
     let result = (|| -> Result<(), MigrationError> {
         let mut file = OpenOptions::new()
@@ -918,18 +1044,132 @@ fn remove_database_files(path: &Path) {
     }
 }
 
-fn prepare_workspaces(records: &[Value], issues: &mut Vec<Issue>) -> Vec<Workspace> {
+fn prepare_projects(
+    records: &[Value],
+    issues: &mut Vec<Issue>,
+) -> (Vec<Project>, HashMap<String, ProjectId>) {
+    let mut converted = Vec::new();
+    let mut ambiguous_ids = HashSet::new();
+    for record in records {
+        match convert_project(record) {
+            Ok(project) => {
+                let Some(legacy_id) = project_legacy_id(&project).map(str::to_owned) else {
+                    continue;
+                };
+                if ambiguous_ids.contains(&legacy_id) {
+                    continue;
+                }
+                if let Some(existing) = converted
+                    .iter()
+                    .find(|existing| project_legacy_id(existing) == Some(legacy_id.as_str()))
+                {
+                    if !project_equivalent(existing, &project) {
+                        issues.push(Issue {
+                            path: "projects/projects.json".into(),
+                            category: "duplicate_project_id".into(),
+                            message:
+                                "conflicting project records share an ID; neither was imported"
+                                    .into(),
+                        });
+                        ambiguous_ids.insert(legacy_id.clone());
+                        converted.retain(|existing| {
+                            project_legacy_id(existing) != Some(legacy_id.as_str())
+                        });
+                    }
+                    continue;
+                }
+                converted.push(project);
+            }
+            Err(category) => issues.push(Issue {
+                path: "projects/projects.json".into(),
+                category,
+                message: "record could not be safely represented; source was left unchanged".into(),
+            }),
+        }
+    }
+
+    // UUID parsing can make differently cased legacy strings resolve to one target ID.
+    // Treat that mapping as ambiguous instead of linking a workspace to an arbitrary row.
+    let mut target_id_counts = HashMap::<ProjectId, usize>::new();
+    for project in &converted {
+        *target_id_counts.entry(project.id).or_default() += 1;
+    }
+    let duplicate_target_ids = target_id_counts
+        .into_iter()
+        .filter_map(|(id, count)| (count > 1).then_some(id))
+        .collect::<HashSet<_>>();
+    for project in converted
+        .iter()
+        .filter(|project| duplicate_target_ids.contains(&project.id))
+    {
+        if let Some(legacy_id) = project_legacy_id(project) {
+            ambiguous_ids.insert(legacy_id.to_owned());
+        }
+    }
+    if !duplicate_target_ids.is_empty() {
+        issues.push(Issue {
+            path: "projects/projects.json".into(),
+            category: "duplicate_project_id".into(),
+            message: "project IDs map to the same target ID; conflicting records were not imported"
+                .into(),
+        });
+    }
+    converted.retain(|project| {
+        !ambiguous_ids.contains(project_legacy_id(project).unwrap_or_default())
+            && !duplicate_target_ids.contains(&project.id)
+    });
+
+    let mut id_map = HashMap::new();
+    for project in &converted {
+        if let Some(legacy_id) = project_legacy_id(project) {
+            id_map.insert(legacy_id.to_owned(), project.id);
+            if let Ok(uuid) = Uuid::parse_str(legacy_id) {
+                id_map.insert(uuid.to_string(), project.id);
+            }
+        }
+    }
+    (converted, id_map)
+}
+
+fn prepare_workspaces(
+    records: &[Value],
+    project_ids: &HashMap<String, ProjectId>,
+    issues: &mut Vec<Issue>,
+) -> Vec<Workspace> {
     let mut converted = Vec::new();
     for record in records {
         match convert_workspace(record) {
-            Ok(workspace) => {
+            Ok(mut workspace) => {
+                if let Some(legacy_project_id) =
+                    workspace.metadata.get("projectId").and_then(Value::as_str)
+                {
+                    workspace.project_id = project_ids.get(legacy_project_id).copied();
+                    if workspace.project_id.is_none() {
+                        issues.push(Issue {
+                            path: "projects/workspaces.json".into(),
+                            category: "unresolved_project_reference".into(),
+                            message: "workspace refers to a project that was not imported".into(),
+                        });
+                    }
+                } else if workspace
+                    .metadata
+                    .get("projectId")
+                    .is_some_and(|value| !value.is_null())
+                {
+                    issues.push(Issue {
+                        path: "projects/workspaces.json".into(),
+                        category: "unresolved_project_reference".into(),
+                        message: "workspace project reference is invalid".into(),
+                    });
+                }
                 if converted
                     .iter()
                     .any(|existing: &Workspace| existing.id == workspace.id)
                 {
-                    let equivalent = converted
-                        .iter()
-                        .any(|existing: &Workspace| workspace_equivalent(existing, &workspace));
+                    let equivalent = converted.iter().any(|existing: &Workspace| {
+                        workspace_equivalent(existing, &workspace)
+                            && existing.project_id == workspace.project_id
+                    });
                     if !equivalent {
                         issues.push(Issue {
                             path: "projects/workspaces.json".into(),
@@ -951,14 +1191,51 @@ fn prepare_workspaces(records: &[Value], issues: &mut Vec<Issue>) -> Vec<Workspa
     converted
 }
 
-fn validate_conflicts(
+fn validate_project_conflicts(
+    candidates: &[Project],
+    existing: &[Project],
+) -> Result<(), MigrationError> {
+    for (index, candidate) in candidates.iter().enumerate() {
+        for other in &candidates[..index] {
+            if candidate.id == other.id {
+                if !project_equivalent(candidate, other) {
+                    return Err(MigrationError::DestinationConflict);
+                }
+            } else if candidate.root_path == other.root_path
+                || project_legacy_id(candidate)
+                    .is_some_and(|value| Some(value) == project_legacy_id(other))
+            {
+                return Err(MigrationError::DestinationConflict);
+            }
+        }
+        for current in existing {
+            if current.id == candidate.id {
+                if !project_equivalent(current, candidate) {
+                    return Err(MigrationError::DestinationConflict);
+                }
+            } else if current.root_path == candidate.root_path
+                || project_legacy_id(current)
+                    .is_some_and(|value| Some(value) == project_legacy_id(candidate))
+            {
+                return Err(MigrationError::DestinationConflict);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_workspace_conflicts(
     candidates: &[Workspace],
     existing: &[Workspace],
 ) -> Result<(), MigrationError> {
     for candidate in candidates {
         for current in existing {
             if current.id == candidate.id {
-                if !workspace_equivalent(current, candidate) {
+                if !workspace_equivalent(current, candidate)
+                    || (current.project_id.is_some()
+                        && candidate.project_id.is_some()
+                        && current.project_id != candidate.project_id)
+                {
                     return Err(MigrationError::DestinationConflict);
                 }
             } else if current.path == candidate.path
@@ -972,16 +1249,33 @@ fn validate_conflicts(
 }
 
 fn import_is_complete(
-    candidates: &[Workspace],
-    existing: &[Workspace],
+    project_candidates: &[Project],
+    existing_projects: &[Project],
+    workspace_candidates: &[Workspace],
+    existing_workspaces: &[Workspace],
     existing_metadata: Option<&Value>,
     expected_metadata: &Value,
 ) -> bool {
-    candidates.iter().all(|candidate| {
-        existing
+    project_candidates.iter().all(|candidate| {
+        existing_projects
             .iter()
-            .any(|current| workspace_equivalent(current, candidate))
+            .any(|current| project_equivalent(current, candidate))
+    }) && workspace_candidates.iter().all(|candidate| {
+        existing_workspaces
+            .iter()
+            .any(|current| workspace_import_complete(current, candidate))
     }) && existing_metadata == Some(expected_metadata)
+}
+
+fn project_equivalent(left: &Project, right: &Project) -> bool {
+    left.id == right.id
+        && left.name == right.name
+        && left.root_path == right.root_path
+        && left.metadata == right.metadata
+}
+
+fn project_legacy_id(project: &Project) -> Option<&str> {
+    project.metadata.get("legacy_id").and_then(Value::as_str)
 }
 
 fn workspace_equivalent(left: &Workspace, right: &Workspace) -> bool {
@@ -992,13 +1286,20 @@ fn workspace_equivalent(left: &Workspace, right: &Workspace) -> bool {
         && left.lifecycle == right.lifecycle
         && left.metadata == right.metadata
 }
+fn workspace_import_complete(existing: &Workspace, candidate: &Workspace) -> bool {
+    workspace_equivalent(existing, candidate)
+        && candidate
+            .project_id
+            .is_none_or(|project_id| existing.project_id == Some(project_id))
+}
 fn legacy_id(workspace: &Workspace) -> Option<&str> {
     workspace.metadata.get("legacy_id").and_then(Value::as_str)
 }
 
 struct DestinationState {
     store: Option<SqliteStore>,
-    existing: Vec<Workspace>,
+    existing_projects: Vec<Project>,
+    existing_workspaces: Vec<Workspace>,
     metadata: Option<Value>,
 }
 
@@ -1013,7 +1314,11 @@ fn open_destination_state(db_path: &Path) -> Result<DestinationState, MigrationE
     {
         return Err(MigrationError::DestinationUnhealthy);
     }
-    let existing = match &store {
+    let existing_projects = match &store {
+        Some(store) => store.list_projects()?,
+        None => Vec::new(),
+    };
+    let existing_workspaces = match &store {
         Some(store) => store.list_workspaces()?,
         None => Vec::new(),
     };
@@ -1023,19 +1328,23 @@ fn open_destination_state(db_path: &Path) -> Result<DestinationState, MigrationE
     };
     Ok(DestinationState {
         store,
-        existing,
+        existing_projects,
+        existing_workspaces,
         metadata,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_to_store(
     store: &mut Option<SqliteStore>,
     db_path: &Path,
-    converted: &[Workspace],
+    projects: &[Project],
+    workspaces: &[Workspace],
     safe_projects: &Value,
-    existing: &[Workspace],
+    existing_projects: &[Project],
+    existing_workspaces: &[Workspace],
     existing_metadata: Option<&Value>,
-) -> Result<usize, MigrationError> {
+) -> Result<(usize, usize), MigrationError> {
     if store.is_none() {
         *store = Some(SqliteStore::open(db_path)?);
     }
@@ -1043,16 +1352,27 @@ fn apply_to_store(
     if !store.integrity_check()? {
         return Err(MigrationError::DestinationUnhealthy);
     }
-    let mut imported = 0;
-    for workspace in converted {
-        if existing
+    let mut imported_projects = 0;
+    for project in projects {
+        if existing_projects
             .iter()
-            .any(|current| workspace_equivalent(current, workspace))
+            .any(|current| project_equivalent(current, project))
         {
             continue;
         }
+        store.save_project(project)?;
+        imported_projects += 1;
+    }
+    let mut imported_workspaces = 0;
+    for workspace in workspaces {
+        let current = existing_workspaces
+            .iter()
+            .find(|current| current.id == workspace.id);
+        if current.is_some_and(|current| workspace_import_complete(current, workspace)) {
+            continue;
+        }
         store.save_workspace(workspace)?;
-        imported += 1;
+        imported_workspaces += 1;
     }
     if existing_metadata != Some(safe_projects) {
         store.set_config_metadata(PROJECTS_METADATA_KEY, safe_projects)?;
@@ -1060,18 +1380,26 @@ fn apply_to_store(
     if !store.integrity_check()? {
         return Err(MigrationError::DestinationUnhealthy);
     }
-    let written = store.list_workspaces()?;
-    if converted.iter().any(|candidate| {
-        !written
+    let written_projects = store.list_projects()?;
+    if projects.iter().any(|candidate| {
+        !written_projects
             .iter()
-            .any(|current| workspace_equivalent(current, candidate))
+            .any(|current| project_equivalent(current, candidate))
+    }) {
+        return Err(MigrationError::IncompleteImport);
+    }
+    let written_workspaces = store.list_workspaces()?;
+    if workspaces.iter().any(|candidate| {
+        !written_workspaces
+            .iter()
+            .any(|current| workspace_import_complete(current, candidate))
     }) {
         return Err(MigrationError::IncompleteImport);
     }
     if store.config_metadata(PROJECTS_METADATA_KEY)?.as_ref() != Some(safe_projects) {
         return Err(MigrationError::IncompleteImport);
     }
-    Ok(imported)
+    Ok((imported_projects, imported_workspaces))
 }
 
 fn ensure_source_unchanged(
@@ -1172,6 +1500,48 @@ fn safe_project_metadata(record: &Value) -> Value {
     Value::Object(safe)
 }
 
+fn convert_project(record: &Value) -> Result<Project, String> {
+    let object = record.as_object().ok_or("not_an_object")?;
+    let legacy_id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or("missing_id")?;
+    let id = Uuid::parse_str(legacy_id).map_or_else(
+        |_| {
+            let derived = format!("legacy-project:{legacy_id}");
+            ProjectId::from_uuid(Uuid::from_bytes(stable_id(derived.as_bytes())))
+        },
+        ProjectId::from_uuid,
+    );
+    let root_path = ["rootPath", "root_path", "path", "cwd"]
+        .into_iter()
+        .filter_map(|key| object.get(key).and_then(Value::as_str))
+        .find(|path| !path.is_empty())
+        .ok_or("missing_path")?;
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            Path::new(root_path)
+                .file_name()
+                .and_then(|part| part.to_str())
+                .unwrap_or("Imported project")
+        });
+    let mut project = Project::new(name, root_path).map_err(|_| "invalid_project")?;
+    let mut metadata = safe_project_metadata(record)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    metadata.insert("legacy_id".into(), Value::String(legacy_id.into()));
+    project.id = id;
+    project.metadata = Value::Object(metadata);
+    project.created_at = timestamp(object.get("createdAt")).unwrap_or_else(Utc::now);
+    project.updated_at = timestamp(object.get("updatedAt")).unwrap_or(project.created_at);
+    Ok(project)
+}
+
 fn convert_workspace(record: &Value) -> Result<Workspace, String> {
     let object = record.as_object().ok_or("not_an_object")?;
     let legacy_id = object
@@ -1238,6 +1608,7 @@ fn convert_workspace(record: &Value) -> Result<Workspace, String> {
     metadata.insert("legacy_id".into(), Value::String(legacy_id.into()));
     Ok(Workspace {
         id,
+        project_id: None,
         name: name.into(),
         path: path.into(),
         kind,
@@ -1338,6 +1709,215 @@ mod tests {
             db.list_workspaces().unwrap()[0].lifecycle,
             WorkspaceLifecycle::Archived
         );
+    }
+
+    #[test]
+    fn projects_are_imported_linked_and_verified_on_rerun() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("legacy");
+        let dest = temp.path().join("new");
+        let valid_project_id = "ABCDEF11-2222-4333-8444-555555555555";
+        write_source(
+            &source,
+            &format!(
+                r#"[
+                    {{"id":"workspace-one","name":"repo","cwd":"/repo","kind":"directory","projectId":"{valid_project_id}"}},
+                    {{"id":"workspace-two","name":"other","cwd":"/other","kind":"local_checkout","projectId":"old-project"}}
+                ]"#
+            ),
+            &format!(
+                r#"[
+                    {{"id":"{valid_project_id}","name":"repo","rootPath":"/repo"}},
+                    {{"id":"old-project","name":"other","path":"/other"}}
+                ]"#
+            ),
+        );
+        let source_before = records(&source);
+
+        let report = migrate(&source, &dest, true).unwrap();
+        assert_eq!(report.imported_projects, 2);
+        assert_eq!(report.imported_workspaces, 2);
+        assert_eq!(records(&source), source_before);
+
+        let legacy_project_record = json!({
+            "id": "old-project",
+            "name": "other",
+            "path": "/other"
+        });
+        let projects = convert_project(&legacy_project_record).unwrap();
+        assert_eq!(
+            convert_project(&legacy_project_record).unwrap().id,
+            projects.id
+        );
+        let legacy_workspace_id = convert_workspace(&json!({
+            "id": "workspace-one",
+            "name": "repo",
+            "cwd": "/repo",
+            "kind": "directory"
+        }))
+        .unwrap()
+        .id;
+        let db = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
+        let imported_projects = db.list_projects().unwrap();
+        assert_eq!(imported_projects.len(), 2);
+        assert!(imported_projects.iter().any(|project| {
+            project.id.to_string() == valid_project_id.to_lowercase()
+                && project.root_path == "/repo"
+                && project.metadata["legacy_id"] == valid_project_id
+        }));
+        assert!(imported_projects.iter().any(|project| {
+            project.id == projects.id
+                && project.root_path == "/other"
+                && project.metadata["legacy_id"] == "old-project"
+        }));
+        let workspaces = db.list_workspaces().unwrap();
+        assert_eq!(workspaces.len(), 2);
+        assert!(workspaces.iter().any(|workspace| {
+            workspace.path == "/repo"
+                && workspace.id == legacy_workspace_id
+                && workspace.project_id
+                    == Some(ProjectId::from_uuid(
+                        Uuid::parse_str(valid_project_id).unwrap(),
+                    ))
+        }));
+        assert!(workspaces.iter().any(|workspace| {
+            workspace.path == "/other" && workspace.project_id == Some(projects.id)
+        }));
+
+        let rerun = migrate(&source, &dest, true).unwrap();
+        assert!(rerun.already_imported);
+        assert_eq!(rerun.imported_projects, 0);
+        assert_eq!(rerun.imported_workspaces, 0);
+        let journal = load_journal(&dest.join(JOURNAL_FILE_NAME)).unwrap();
+        assert_eq!(journal.entries.len(), 1);
+        assert_eq!(journal.entries[0].project_ids.len(), 2);
+
+        // A journal hit does not certify missing project rows or broken workspace links.
+        {
+            let mut db = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
+            let workspace = workspaces
+                .iter()
+                .find(|workspace| workspace.path == "/other")
+                .unwrap();
+            db.set_workspace_project(workspace.id, None).unwrap();
+            assert_eq!(
+                db.delete_project(projects.id).unwrap(),
+                talos_store::ProjectDeleteResult::Deleted
+            );
+        }
+        let repaired = migrate(&source, &dest, true).unwrap();
+        assert!(!repaired.already_imported);
+        assert_eq!(repaired.imported_projects, 1);
+        assert_eq!(repaired.imported_workspaces, 1);
+        let db = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
+        assert_eq!(db.list_projects().unwrap().len(), 2);
+        assert!(db.list_workspaces().unwrap().iter().any(
+            |workspace| workspace.path == "/other" && workspace.project_id == Some(projects.id)
+        ));
+        assert_eq!(records(&source), source_before);
+    }
+
+    #[test]
+    fn old_completed_journal_imports_new_project_rows_and_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("legacy");
+        let dest = temp.path().join("new");
+        write_source(
+            &source,
+            r#"[{"id":"workspace-one","name":"repo","cwd":"/repo","kind":"directory","projectId":"project-one"}]"#,
+            r#"[{"id":"project-one","name":"repo","path":"/repo"}]"#,
+        );
+        fs::create_dir_all(&dest).unwrap();
+        drop(SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap());
+        let journal = format!(
+            r#"{{"entries":[{{"fingerprint":"{}","database":"{}","workspace_ids":["{}"],"imported_at":"2024-01-01T00:00:00Z"}}]}}"#,
+            source_fingerprint(&source),
+            DATABASE_FILE_NAME,
+            convert_workspace(
+                &json!({"id":"workspace-one","name":"repo","cwd":"/repo","kind":"directory"})
+            )
+            .unwrap()
+            .id,
+        );
+        fs::write(dest.join(JOURNAL_FILE_NAME), journal).unwrap();
+
+        let report = migrate(&source, &dest, true).unwrap();
+        assert!(!report.already_imported);
+        assert_eq!(report.imported_projects, 1);
+        assert_eq!(report.imported_workspaces, 1);
+        let db = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
+        let projects = db.list_projects().unwrap();
+        let workspaces = db.list_workspaces().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].project_id, Some(projects[0].id));
+        let journal = load_journal(&dest.join(JOURNAL_FILE_NAME)).unwrap();
+        assert_eq!(
+            journal.entries[0].project_ids,
+            vec![projects[0].id.to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_project_roots_fail_before_pending_journal_is_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("legacy");
+        let dest = temp.path().join("new");
+        write_source(
+            &source,
+            "[]",
+            r#"[{"id":"project-one","name":"one","path":"/same-root"},{"id":"project-two","name":"two","path":"/same-root"}]"#,
+        );
+        fs::create_dir_all(&dest).unwrap();
+        drop(SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap());
+
+        assert!(matches!(
+            migrate(&source, &dest, true),
+            Err(MigrationError::DestinationConflict)
+        ));
+        assert!(!dest.join(JOURNAL_FILE_NAME).exists());
+        let db = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
+        assert_eq!(db.list_projects().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn conflicting_project_row_blocks_project_and_workspace_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("legacy");
+        let dest = temp.path().join("new");
+        let project_record = json!({"id":"same-project","name":"new name","path":"/repo"});
+        write_source(
+            &source,
+            r#"[{"id":"new-workspace","name":"checkout","cwd":"/repo/checkout","kind":"directory","projectId":"same-project"}]"#,
+            r#"[{"id":"same-project","name":"new name","path":"/repo"}]"#,
+        );
+        let source_before = records(&source);
+        let mut existing_project = convert_project(&project_record).unwrap();
+        existing_project.name = "existing name".into();
+        fs::create_dir_all(&dest).unwrap();
+        {
+            let mut db = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
+            db.save_project(&existing_project).unwrap();
+            db.set_config_metadata(
+                PROJECTS_METADATA_KEY,
+                &Value::Array(vec![safe_project_metadata(&project_record)]),
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            migrate(&source, &dest, true),
+            Err(MigrationError::DestinationConflict)
+        ));
+        let db = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
+        assert_eq!(db.list_projects().unwrap(), vec![existing_project]);
+        assert_eq!(db.list_workspaces().unwrap().len(), 0);
+        assert_eq!(
+            db.config_metadata(PROJECTS_METADATA_KEY).unwrap(),
+            Some(Value::Array(vec![safe_project_metadata(&project_record)]))
+        );
+        assert!(!dest.join(JOURNAL_FILE_NAME).exists());
+        assert_eq!(records(&source), source_before);
     }
 
     #[test]
@@ -1509,6 +2089,44 @@ mod tests {
         ));
         assert!(!temp.path().join(DATABASE_FILE_NAME).exists());
         assert!(!temp.path().join(JOURNAL_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn rejects_future_journal_version_without_rewriting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("legacy");
+        let destination = temp.path().join("destination");
+        write_source(&source, "[]", "[]");
+        fs::create_dir_all(&destination).unwrap();
+        let journal_path = destination.join(JOURNAL_FILE_NAME);
+        let future = br#"{"version":999,"future_field":{"keep":true},"entries":[]}"#;
+        fs::write(&journal_path, future).unwrap();
+
+        assert!(matches!(
+            migrate(&source, &destination, true),
+            Err(MigrationError::JournalCorrupt)
+        ));
+        assert_eq!(fs::read(journal_path).unwrap(), future);
+        assert!(!destination.join(DATABASE_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn rejects_sessions_source_overlapping_destination_before_base_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("legacy");
+        write_source(&source, "[]", "[]");
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let sentinel = sessions.join("source-sentinel");
+        fs::write(&sentinel, b"untouched").unwrap();
+        let destination = sessions.join("destination");
+
+        assert!(matches!(
+            migrate_with_sessions(&source, &destination, true, Some(&sessions)),
+            Err(MigrationError::PathOverlap)
+        ));
+        assert_eq!(fs::read(sentinel).unwrap(), b"untouched");
+        assert!(!destination.exists());
     }
 
     #[cfg(unix)]
@@ -1828,13 +2446,17 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let journal = Journal {
+            version: legacy_journal_version(),
             entries: Vec::new(),
             pending: Some(PendingImport {
                 fingerprint,
                 database: DATABASE_FILE_NAME.into(),
                 workspace_ids: vec![first.id.to_string(), second.id.to_string()],
+                project_ids: Vec::new(),
                 destination_backup: Some(backup_name),
             }),
+            session_entries: Vec::new(),
+            pending_session: None,
         };
         write_journal(&dest.join(JOURNAL_FILE_NAME), &journal).unwrap();
         let report = migrate(&source, &dest, true).unwrap();
@@ -1870,8 +2492,8 @@ mod tests {
         let dest = temp.path().join("new");
         write_source(
             &source,
-            r#"[{"id":"one","name":"one","cwd":"/one","kind":"directory"}]"#,
-            "[]",
+            r#"[{"id":"one","name":"one","cwd":"/one","kind":"directory","projectId":"old-project"}]"#,
+            r#"[{"id":"old-project","name":"one","path":"/one"}]"#,
         );
         fs::create_dir_all(&dest).unwrap();
         let legacy_db = dest.join(LEGACY_DATABASE_FILE_NAME);
@@ -1880,6 +2502,18 @@ mod tests {
         )
         .unwrap();
         create_database(&legacy_db, &legacy_only);
+        {
+            let mut db = SqliteStore::open(&legacy_db).unwrap();
+            db.set_config_metadata(
+                PROJECTS_METADATA_KEY,
+                &Value::Array(vec![safe_project_metadata(&json!({
+                    "id":"old-project",
+                    "name":"one",
+                    "path":"/one"
+                }))]),
+            )
+            .unwrap();
+        }
         remove_wal_sidecars(&legacy_db);
         let legacy_bytes = fs::read(&legacy_db).unwrap();
         let journal = format!(
@@ -1899,6 +2533,7 @@ mod tests {
 
         let report = migrate(&source, &dest, true).unwrap();
         assert!(!report.already_imported);
+        assert_eq!(report.imported_projects, 1);
         assert_eq!(report.imported_workspaces, 1);
         assert_eq!(fs::read(&legacy_db).unwrap(), legacy_bytes);
         let db = SqliteStore::open(dest.join(DATABASE_FILE_NAME)).unwrap();
@@ -1911,6 +2546,15 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"legacy-only".into()));
         assert!(names.contains(&"one".into()));
+        let projects = db.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        let imported = db
+            .list_workspaces()
+            .unwrap()
+            .into_iter()
+            .find(|workspace| workspace.name == "one")
+            .unwrap();
+        assert_eq!(imported.project_id, Some(projects[0].id));
         let journal = load_journal(&dest.join(JOURNAL_FILE_NAME)).unwrap();
         assert_eq!(journal.entries.len(), 2);
         assert_eq!(journal.entries[1].database, DATABASE_FILE_NAME);
