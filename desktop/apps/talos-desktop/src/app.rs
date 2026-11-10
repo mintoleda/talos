@@ -126,7 +126,7 @@ impl Desktop {
     pub fn new(ctx: egui::Context, preview: bool) -> Self {
         theme::install(&ctx, false);
         ctx.set_zoom_factor(1.0);
-        let mut backend = Backend::new(ctx, preview);
+        let mut backend = Backend::new(move || ctx.request_repaint(), preview);
         if preview {
             backend.view = ViewModel::demo();
             backend.view.online = true;
@@ -1167,11 +1167,6 @@ impl Desktop {
                         .truncate(),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("Enter to send  ·  Shift+Enter newline")
-                                .font(theme::ui(10.0))
-                                .color(theme::FAINT),
-                        );
                         if let Some(session) = self.session() {
                             ui.label(
                                 RichText::new(format!(

@@ -8,6 +8,7 @@ members = [
     "crates/talos-ipc",
     "apps/talosd",
     "apps/talos-desktop",
+    "apps/talos-gpui",
     "apps/talosdctl",
     "crates/paseo-migrate",
     "apps/paseo-migrate",

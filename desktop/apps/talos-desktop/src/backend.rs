@@ -7,7 +7,15 @@ use crate::state::{
     Entry, PendingState, ProviderSummary, Session, SessionStatus, Usage, ViewModel, Workspace,
     parse_session,
 };
-use eframe::egui;
+/// Frontend-neutral wake handle. The egui and GPUI shells supply their own notifier.
+#[derive(Clone)]
+struct UiWake(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl UiWake {
+    fn request_repaint(&self) {
+        (self.0)();
+    }
+}
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -172,6 +180,7 @@ pub struct Backend {
     pub retry_prompt: Option<Action>,
     pub endpoint: String,
     pub created_session: Option<String>,
+    pub agent_creation_failed: bool,
     pub created_workspace: Option<String>,
     pub generation: u64,
     pub loading: HashSet<String>,
@@ -182,7 +191,8 @@ pub struct Backend {
     pub connection_error: Option<String>,
 }
 impl Backend {
-    pub fn new(ctx: egui::Context, preview: bool) -> Self {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static, preview: bool) -> Self {
+        let ctx = UiWake(std::sync::Arc::new(wake));
         let (sender, actions) = mpsc::channel(BATCH as usize);
         let (updates, receiver) = mpsc::channel(512);
         if !preview {
@@ -239,6 +249,7 @@ impl Backend {
             retry_prompt: None,
             endpoint: socket_path().display().to_string(),
             created_session: None,
+            agent_creation_failed: false,
             created_workspace: None,
             generation: 0,
             loading: HashSet::new(),
@@ -263,6 +274,7 @@ impl Backend {
             return false;
         }
         match &action {
+            Action::CreateAgent { .. } => self.agent_creation_failed = false,
             Action::Load(session) => {
                 self.loading.insert(session.clone());
                 self.ready.remove(session);
@@ -376,15 +388,10 @@ impl Backend {
                     }));
                 }
             }
-            Action::Prompt { session, .. } => {
+            Action::Prompt { .. } => {
+                // Acceptance can arrive after a terminal event on the event connection.
+                // send() marks optimistic activity; durable RunState events own lifecycle.
                 self.retry_prompt = None;
-                self.view.run.insert(
-                    session,
-                    matches!(
-                        value["status"].as_str(),
-                        Some("starting" | "running" | "queued" | "cancel_requested")
-                    ),
-                );
             }
             Action::Cancel(_) => {} // Busy until the durable terminal event arrives.
             Action::Decision { id, session, .. } => {
@@ -513,6 +520,7 @@ impl Backend {
     #[allow(clippy::needless_pass_by_value)]
     fn apply_failure(&mut self, action: Action, error: String) {
         match &action {
+            Action::CreateAgent { .. } => self.agent_creation_failed = true,
             Action::Load(session) | Action::LoadTimeline { session, .. } => {
                 self.loading.remove(session);
                 self.ready.remove(session);
@@ -588,15 +596,15 @@ fn apply_snapshot(view: &mut ViewModel, snapshot: &Value, _preserve_entries: boo
         }
     }
     for session in &view.sessions {
-        // Snapshot lifecycle does not identify the active run. Replay/live state
-        // is authoritative; Busy/AttentionRequired are a conservative fallback.
-        view.run.insert(
-            session.id.clone(),
+        // Snapshots and event updates travel on separate connections. A snapshot
+        // may predate an already-applied terminal event, so it is only a fallback
+        // for sessions without replay/live/optimistic lifecycle state.
+        view.run.entry(session.id.clone()).or_insert_with(|| {
             matches!(
                 session.status,
                 SessionStatus::Running | SessionStatus::Attention
-            ),
-        );
+            )
+        });
     }
 }
 fn parse_providers(value: Option<&Value>) -> Vec<ProviderSummary> {
@@ -815,7 +823,7 @@ fn entries_from_snapshot(value: &Value) -> Vec<Entry> {
 }
 
 async fn publish(
-    ctx: &egui::Context,
+    ctx: &UiWake,
     updates: &mpsc::Sender<Update>,
     update: Update,
 ) -> Result<(), String> {
@@ -851,11 +859,7 @@ async fn connect() -> Result<LocalClient, String> {
         .map_err(|e| e.to_string())?;
     Ok(client)
 }
-async fn worker(
-    ctx: egui::Context,
-    mut actions: mpsc::Receiver<Action>,
-    updates: mpsc::Sender<Update>,
-) {
+async fn worker(ctx: UiWake, mut actions: mpsc::Receiver<Action>, updates: mpsc::Sender<Update>) {
     let mut cursors = BTreeMap::new();
     loop {
         ensure_daemon(&updates, &ctx).await;
@@ -920,7 +924,7 @@ async fn worker(
     }
 }
 async fn command_loop(
-    ctx: &egui::Context,
+    ctx: &UiWake,
     client: &mut LocalClient,
     actions: &mut mpsc::Receiver<Action>,
     updates: &mpsc::Sender<Update>,
@@ -981,7 +985,7 @@ async fn command_loop(
     Ok(false)
 }
 async fn replay(
-    ctx: &egui::Context,
+    ctx: &UiWake,
     client: &mut LocalClient,
     updates: &mpsc::Sender<Update>,
     cursors: &mut BTreeMap<String, u64>,
@@ -1035,7 +1039,7 @@ fn notification(event: &Value) -> Option<EventNotification> {
     })
 }
 async fn event_loop(
-    ctx: &egui::Context,
+    ctx: &UiWake,
     client: &mut LocalClient,
     updates: &mpsc::Sender<Update>,
     cursors: &mut BTreeMap<String, u64>,
@@ -1132,7 +1136,7 @@ fn daemon_binary() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-async fn ensure_daemon(updates: &mpsc::Sender<Update>, ctx: &egui::Context) {
+async fn ensure_daemon(updates: &mpsc::Sender<Update>, ctx: &UiWake) {
     let socket = socket_path();
     if socket.exists() {
         return;
@@ -1232,6 +1236,34 @@ pub fn format_tokens(tokens: u64) -> String {
 mod tests {
     use super::*;
     use crate::state::EntryKind;
+
+    #[test]
+    fn late_prompt_acceptance_does_not_restart_a_finished_run() {
+        let mut backend = Backend::new(|| {}, true);
+        backend.view.run.insert("s1".into(), false);
+        backend.apply_success(
+            Action::Prompt {
+                session: "s1".into(),
+                text: "hello".into(),
+                images: Vec::new(),
+                key: "key".into(),
+            },
+            serde_json::json!({"status": "running"}),
+        );
+        assert!(!backend.view.running("s1"));
+    }
+
+    #[test]
+    fn snapshot_does_not_overwrite_durable_run_state() {
+        let mut view = ViewModel::default();
+        view.run.insert("s1".into(), false);
+        let snapshot = serde_json::json!({
+            "sessions": [{"id": "s1", "agent_id": "a1"}],
+            "agents": [{"id": "a1", "lifecycle": "Busy"}],
+        });
+        apply_snapshot(&mut view, &snapshot, true);
+        assert!(!view.running("s1"));
+    }
 
     #[test]
     fn token_formatting() {
