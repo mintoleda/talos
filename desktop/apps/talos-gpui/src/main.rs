@@ -15,10 +15,12 @@ mod attachments;
 #[allow(dead_code, clippy::cast_precision_loss)]
 #[path = "../../talos-desktop/src/backend.rs"]
 mod backend;
+mod glass;
 #[allow(dead_code)]
 #[path = "../../talos-desktop/src/state.rs"]
 mod state;
 mod workflow;
+use glass::{GlassMode, GlassSettings, frosted};
 
 use std::{
     borrow::Cow,
@@ -28,8 +30,7 @@ use std::{
 
 use backend::{Action, Backend};
 use gpui::{
-    AnyElement, App, AssetSource, Bounds, Context, Corners, Element, Entity, FontWeight,
-    GlobalElementId, InspectorElementId, IntoElement, LayoutId, PathPromptOptions, Pixels, Render,
+    AssetSource, Bounds, Context, Entity, FontWeight, IntoElement, PathPromptOptions, Render,
     ScrollHandle, SharedString, Window, WindowBounds, WindowOptions, div, hsla, prelude::*, px,
     rgb, size,
 };
@@ -89,85 +90,6 @@ impl AssetSource for Assets {
             .filter(|asset| asset.starts_with(path))
             .map(|asset| SharedString::from(*asset))
             .collect())
-    }
-}
-
-/// Keeps blur and the translucent surface in one scene layer so later text and
-/// controls cannot be reordered beneath the blur pass.
-fn frosted(corner_radius: f32, blur_radius: f32, child: impl IntoElement) -> Frosted {
-    Frosted {
-        corner_radius,
-        blur_radius,
-        child: child.into_any_element(),
-    }
-}
-
-struct Frosted {
-    corner_radius: f32,
-    blur_radius: f32,
-    child: AnyElement,
-}
-
-impl Element for Frosted {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<gpui::ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, ()) {
-        (self.child.request_layout(window, cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        self.child.prepaint(window, cx);
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        window.paint_layer(bounds, |window| {
-            window.paint_backdrop_blur(
-                bounds,
-                Corners::all(px(self.corner_radius)),
-                px(self.blur_radius),
-            );
-            self.child.paint(window, cx);
-        });
-    }
-}
-
-impl IntoElement for Frosted {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 
@@ -581,6 +503,7 @@ impl AppView {
 
     fn shell(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let width = f32::from(window.viewport_size().width);
+        let glass = *cx.global::<GlassSettings>();
         let title = self
             .session()
             .map_or("New conversation", |s| s.title.as_str())
@@ -594,18 +517,19 @@ impl AppView {
             .map_or("Choose workspace", |w| w.name.as_str())
             .to_owned();
         div()
+            .id("talos-shell")
             .relative()
             .flex()
             .size_full()
             .overflow_hidden()
-            .bg(hsla(0.36, 0.16, 0.025, 0.98))
+            .bg(glass.wash(0.58))
             .child(
                 div()
                     .relative()
                     .flex()
                     .size_full()
                     .when(width >= 760. || self.sidebar_open, |d| {
-                        d.child(frosted(0.0, 52.0, self.sidebar(cx)))
+                        d.child(frosted(0.0, 18.0, self.sidebar(cx)))
                     })
                     .child(
                         div()
@@ -626,7 +550,7 @@ impl AppView {
                                     .px(px(22.))
                                     .border_b_1()
                                     .border_color(hsla(0.0, 0.0, 1.0, 0.07))
-                                    .bg(hsla(0.36, 0.12, 0.025, 0.92))
+                                    .bg(glass.wash(0.38))
                                     .child(
                                         div()
                                             .flex()
@@ -661,6 +585,13 @@ impl AppView {
                                             ),
                                     ),
                             )
+                            // Paint the reading surface before floating materials so their
+                            // snapshots contain the conversation, not an empty backdrop.
+                            .child(if self.selected.is_none() {
+                                self.new_surface(cx).into_any_element()
+                            } else {
+                                self.conversation_surface(cx).into_any_element()
+                            })
                             .when_some(self.menu, |d, menu| d.child(self.menu_surface(menu, cx)))
                             .when_some(
                                 self.notice
@@ -678,7 +609,7 @@ impl AppView {
                                             .justify_center()
                                             .child(frosted(
                                                 12.0,
-                                                48.0,
+                                                16.0,
                                                 div()
                                                     .w_full()
                                                     .max_w(px(720.))
@@ -690,7 +621,16 @@ impl AppView {
                                                     .rounded(px(12.))
                                                     .border_1()
                                                     .border_color(hsla(0.07, 0.42, 0.55, 0.2))
-                                                    .bg(hsla(0.06, 0.35, 0.11, 0.94))
+                                                    .bg(hsla(
+                                                        0.06,
+                                                        0.35,
+                                                        0.11,
+                                                        if glass.mode == GlassMode::Opaque {
+                                                            1.0
+                                                        } else {
+                                                            0.78
+                                                        },
+                                                    ))
                                                     .shadow_lg()
                                                     .child(label(
                                                         notice,
@@ -710,12 +650,7 @@ impl AppView {
                                             )),
                                     )
                                 },
-                            )
-                            .child(if self.selected.is_none() {
-                                self.new_surface(cx).into_any_element()
-                            } else {
-                                self.conversation_surface(cx).into_any_element()
-                            }),
+                            ),
                     ),
             )
     }
@@ -788,7 +723,7 @@ impl AppView {
             .flex_col()
             .p(px(16.))
             .gap(px(14.))
-            .bg(hsla(0.36, 0.12, 0.045, 0.94))
+            .bg(cx.global::<GlassSettings>().wash(0.30))
             .border_r_1()
             .border_color(hsla(0.0, 0.0, 1.0, 0.07))
             .child(sidebar_action(
@@ -806,6 +741,12 @@ impl AppView {
             .child(div().h(px(4.)))
             .child(label("RECENT", 9.5, MUTED, FontWeight::BOLD))
             .child(list)
+            .child(sidebar_action(
+                "appearance",
+                "icons/settings.svg",
+                "Appearance & diagnostics",
+                cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Diagnostics, cx)),
+            ))
     }
     fn new_surface(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -1068,12 +1009,12 @@ impl AppView {
         }
         frosted(
             24.0,
-            52.0,
+            18.0,
             div()
                 .w_full()
                 .min_h(px(56.))
                 .rounded(px(24.))
-                .bg(hsla(0.36, 0.16, 0.11, 0.92))
+                .bg(cx.global::<GlassSettings>().wash(0.30))
                 .border_1()
                 .border_color(hsla(0.0, 0.0, 1.0, 0.12))
                 .shadow_lg()
@@ -1096,6 +1037,7 @@ impl AppView {
                         .min_w_0()
                         .flex()
                         .flex_col()
+                        .text_color(rgb(INK))
                         .justify_center()
                         .font_family("Inter")
                         .text_size(px(14.))
@@ -1106,6 +1048,7 @@ impl AppView {
                                 .max_h(px(176.))
                                 .flex()
                                 .items_center()
+                                .text_color(rgb(0xF4F6F5))
                                 .child(Textarea::new(&self.editor)),
                         )
                         .child(chips),
@@ -1241,12 +1184,29 @@ impl AppView {
             Menu::Diagnostics => {
                 content = content.child(label(format!("{}\nEndpoint: {}\n{}", self.backend.view.status, self.backend.endpoint,
                     self.backend.connection_error.as_deref().unwrap_or("No connection error")), 12., SECONDARY, FontWeight::NORMAL))
-                    .child(label("GPUI experiment: plain-text timeline; no file/skill autocomplete or terminal UI yet.", 11., MUTED, FontWeight::NORMAL));
+                    .child(label("GPUI experiment: plain-text timeline; no file/skill autocomplete or terminal UI yet.", 11., MUTED, FontWeight::NORMAL))
+                    .child(label("MATERIAL", 10., MUTED, FontWeight::BOLD));
+                for (mode, title) in [
+                    (
+                        GlassMode::Frosted,
+                        "Frosted glass · soft blur & charcoal tint",
+                    ),
+                    (GlassMode::Opaque, "Opaque · maximum readability"),
+                ] {
+                    content = content.child(button(
+                        title,
+                        title,
+                        cx.listener(move |_, _, window, cx| {
+                            GlassSettings::set_mode(mode, window, cx);
+                            cx.notify();
+                        }),
+                    ));
+                }
             }
         }
         frosted(
             14.0,
-            52.0,
+            16.0,
             div()
                 .absolute()
                 .top(px(76.))
@@ -1255,7 +1215,7 @@ impl AppView {
                 .max_w(px(370.))
                 .p(px(14.))
                 .rounded(px(14.))
-                .bg(hsla(0.36, 0.16, 0.105, 0.94))
+                .bg(cx.global::<GlassSettings>().wash(0.42))
                 .border_1()
                 .border_color(hsla(0.0, 0.0, 1.0, 0.12))
                 .shadow_lg()
@@ -1339,50 +1299,6 @@ fn model_picker_label(model: &str, model_id: Option<&str>) -> (String, bool) {
         first.to_uppercase().collect::<String>() + characters.as_str()
     });
     (label, true)
-}
-
-#[cfg(test)]
-mod composer_tests {
-    use super::{config_value, model_picker_label};
-
-    #[test]
-    fn configured_model_is_read_from_root_even_with_a_trailing_comma() {
-        assert_eq!(
-            config_value(
-                "provider = \"openai-codex\",\nmodel = \"gpt-6.1-sol\",\n[server]\nmodel = \"ignored\"",
-                "model"
-            ),
-            Some("gpt-6.1-sol".into())
-        );
-    }
-
-    #[test]
-    fn openai_models_show_brand_and_compact_name() {
-        assert_eq!(
-            model_picker_label("GPT 5.6 Luna", Some("openai/gpt-5.6-luna")),
-            ("Luna 5.6".into(), true)
-        );
-        assert_eq!(
-            model_picker_label("openai/gpt-5.6-luna", Some("openai/gpt-5.6-luna")),
-            ("Luna 5.6".into(), true)
-        );
-    }
-
-    #[test]
-    fn configured_openai_model_name_is_capitalized() {
-        assert_eq!(
-            model_picker_label("gpt-6.1-sol", Some("gpt-6.1-sol")),
-            ("Sol 6.1".into(), true)
-        );
-    }
-
-    #[test]
-    fn other_models_keep_their_label_without_openai_branding() {
-        assert_eq!(
-            model_picker_label("Claude Sonnet", Some("claude-sonnet")),
-            ("Claude Sonnet".into(), false)
-        );
-    }
 }
 
 fn label(
@@ -1502,6 +1418,9 @@ fn panel(title: &str, text: &str, color: u32) -> gpui::Div {
 fn main() {
     gpui_platform::application().with_assets(Assets).run(|cx| {
         gpui_base::init(cx);
+        let glass = GlassSettings::from_env();
+        cx.set_global(glass);
+        let demo = std::env::args().any(|argument| argument == "--glass-demo");
         let fonts: Vec<Cow<'static, [u8]>> = [
             include_bytes!("../../../assets/fonts/Inter-Regular.ttf").as_slice(),
             include_bytes!("../../../assets/fonts/Inter-Medium.ttf").as_slice(),
@@ -1516,21 +1435,79 @@ fn main() {
             eprintln!("Could not register Talos UI fonts: {error}");
         }
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(720.), px(560.))),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Talos".into()),
-                    appears_transparent: true,
-                    ..Default::default()
-                }),
-                window_background: gpui::WindowBackgroundAppearance::Transparent,
-                app_id: Some("talos".into()),
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(720.), px(560.))),
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some(
+                    if demo {
+                        "Talos · Frosted Material Lab"
+                    } else {
+                        "Talos"
+                    }
+                    .into(),
+                ),
+                appears_transparent: true,
                 ..Default::default()
+            }),
+            window_background: if glass.mode == GlassMode::Opaque {
+                gpui::WindowBackgroundAppearance::Opaque
+            } else {
+                gpui::WindowBackgroundAppearance::Transparent
             },
-            |window, cx| cx.new(|cx| AppView::new(window, cx)),
-        )
-        .expect("open Talos GPUI window");
+            app_id: Some("talos".into()),
+            ..Default::default()
+        };
+        if demo {
+            cx.open_window(options, |_, cx| cx.new(|_| glass::GlassDemo))
+                .expect("open Talos material lab");
+        } else {
+            cx.open_window(options, |window, cx| cx.new(|cx| AppView::new(window, cx)))
+                .expect("open Talos GPUI window");
+        }
     });
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::{config_value, model_picker_label};
+
+    #[test]
+    fn configured_model_is_read_from_root_even_with_a_trailing_comma() {
+        assert_eq!(
+            config_value(
+                "provider = \"openai-codex\",\nmodel = \"gpt-6.1-sol\",\n[server]\nmodel = \"ignored\"",
+                "model"
+            ),
+            Some("gpt-6.1-sol".into())
+        );
+    }
+
+    #[test]
+    fn openai_models_show_brand_and_compact_name() {
+        assert_eq!(
+            model_picker_label("GPT 5.6 Luna", Some("openai/gpt-5.6-luna")),
+            ("Luna 5.6".into(), true)
+        );
+        assert_eq!(
+            model_picker_label("openai/gpt-5.6-luna", Some("openai/gpt-5.6-luna")),
+            ("Luna 5.6".into(), true)
+        );
+    }
+
+    #[test]
+    fn configured_openai_model_name_is_capitalized() {
+        assert_eq!(
+            model_picker_label("gpt-6.1-sol", Some("gpt-6.1-sol")),
+            ("Sol 6.1".into(), true)
+        );
+    }
+
+    #[test]
+    fn other_models_keep_their_label_without_openai_branding() {
+        assert_eq!(
+            model_picker_label("Claude Sonnet", Some("claude-sonnet")),
+            ("Claude Sonnet".into(), false)
+        );
+    }
 }

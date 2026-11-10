@@ -47,7 +47,42 @@ revisions.
   becomes available after the first message creates the session.
 - Image selection goes through shared validation; click an image chip to remove it.
 - `/new` starts a fresh conversation; `/workspace` opens the folder picker.
-  The gear opens connection diagnostics rather than a fake settings screen.
+  The gear opens appearance controls and connection diagnostics.
+
+## Frosted appearance
+
+Frosted glass is the default: soft backdrop blur, a quiet charcoal tint and
+hairline borders. No refraction, pointer-reactive highlights, or idle animation.
+The sidebar, composer and floating menus use the existing pinned renderer;
+no local GPUI fork, shader patch, or additional dependency is required.
+
+The window and root wash stay translucent so Mango's compositor blur can show
+through. GPUI's own blur only samples previously painted **app content**.
+Floating menus paint after the conversation, with blur and sharp controls kept
+inside one scene layer. Opaque mode disables both transparent window appearance
+and the app's backdrop-blur passes.
+
+Use **Appearance & diagnostics** at the bottom of the sidebar to switch modes
+for the current run, or choose the initial mode:
+
+```sh
+TALOS_GLASS=frosted RUST_FONTCONFIG_DLOPEN=1 cargo run -p talos-gpui
+TALOS_GLASS=opaque RUST_FONTCONFIG_DLOPEN=1 cargo run -p talos-gpui
+```
+
+Preferences are session-only. Unknown values (including the retired `full`
+setting) fall back to frosted. No compositor settings or real user data are
+changed. Without compositor blur, desktop translucency may appear sharp;
+choose opaque mode if that affects readability.
+
+For a deterministic, **daemon-free** visual comparison over app-rendered content:
+
+```sh
+RUST_FONTCONFIG_DLOPEN=1 cargo run -p talos-gpui -- --glass-demo
+```
+
+The lab includes two overlapping rounded panels and frosted/opaque toggles.
+It does not create agents, contact providers, or read credentials.
 
 ## Known evaluation gaps
 
@@ -74,8 +109,11 @@ homes, then exercises this frontend's bridge for creation, streaming, permission
 deny, cancel, and history loading through a fresh connection. It is not a GUI
 input test or evidence of live-model acceptance.
 
-Latest local verification: formatting, strict workspace Clippy, build, fixture
-bridge smoke, and serial workspace tests passed (269 tests, 2 opt-in tests ignored).
+Latest frosted-material verification: formatting, strict workspace Clippy, build,
+fixture bridge smoke, and serial workspace tests passed (276 tests, 2 opt-in tests
+ignored; the bridge smoke separately passed one opt-in test). Wayland screenshots
+were inspected for the material lab and an isolated offline app at 175% scale.
+This is visual evidence, not a performance benchmark or full input acceptance.
 Parallel workspace runs intermittently failed in the existing daemon lock and
 socket-concurrency tests; those failures remain open, not a passing parallel gate.
 A separate X11 window check verified Enter-created sessions, streamed replies and
