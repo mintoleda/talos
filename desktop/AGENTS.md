@@ -7,5 +7,6 @@
 - Keep provider-neutral domain types and capability-driven UI behavior.
 - Use idiomatic Rust, typed errors, cancellation-safe async code, bounded channels, and no `unsafe` code.
 - The desktop frontend must use `egui`/`eframe`; preserve the visual and motion direction in `docs/design/egui-ui.md`.
+- For a requested local GPUI desktop refresh, build from `desktop/` with `RUST_FONTCONFIG_DLOPEN=1 cargo build -p talosd -p talos-gpui`. If the per-user GPUI development launcher/desktop entry exists, update it to use the current worktree's `target/debug/talos-gpui` (and matching `talosd`), validate the `.desktop` file with `desktop-file-validate` when available, and do not repoint the packaged `talos-desktop` release entry.
 - Run `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` (from `desktop/`) before declaring a workstream complete. Run `go build ./... && go test ./...` from the repository root when touching Go code.
 - Agents working concurrently must stay within their assigned crate/files and avoid broad formatting of unrelated files.
