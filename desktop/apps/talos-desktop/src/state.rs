@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
-pub const PLACEHOLDER: &str = "Ask anything. @ files, $ skills, / commands";
+pub const PLACEHOLDER: &str = "Ask...";
 
 // ---------------------------------------------------------------------------
 // Sessions

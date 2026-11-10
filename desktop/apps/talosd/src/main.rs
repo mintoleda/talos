@@ -955,11 +955,15 @@ impl Daemon {
             ) => Vec::new(),
             Err(error) => return Err(core_error(error)),
         };
-        let session_modes = self
-            .service
-            .list_modes(&provider_id)
-            .await
-            .map_err(core_error)?;
+        let session_modes = match self.service.list_modes(&provider_id).await {
+            Ok(modes) => modes,
+            Err(
+                CoreError::Provider(ProviderError::Unsupported { .. })
+                | CoreError::ProviderUnavailable(_)
+                | CoreError::ProviderNotRegistered(_),
+            ) => Vec::new(),
+            Err(error) => return Err(core_error(error)),
+        };
 
         let object = value
             .as_object_mut()
@@ -3236,6 +3240,24 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), shutdown.notified())
             .await
             .expect("shutdown should notify the accept loop");
+        bridge.abort();
+        daemon.service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_keeps_unavailable_provider_without_catalogue() {
+        let (daemon, bridge, _temp) = fixture_daemon().await;
+        let mut diagnostic = FixtureProvider {
+            id: ProviderId::new("missing-provider").unwrap(),
+        }
+        .diagnostic()
+        .await;
+        diagnostic.descriptor.available = false;
+        diagnostic.executable_found = false;
+        let value = daemon.snapshot_provider(&diagnostic).await.unwrap();
+        assert_eq!(value["available"], false);
+        assert_eq!(value["models"], json!([]));
+        assert_eq!(value["modes"], json!([]));
         bridge.abort();
         daemon.service.shutdown().await;
     }

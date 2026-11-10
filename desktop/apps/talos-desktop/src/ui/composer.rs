@@ -13,6 +13,7 @@ use crate::state::{ProviderSummary, Session, Usage, can_send, draft_lines};
 use crate::theme;
 use crate::ui::icons::{self, Icon};
 use crate::ui::motion;
+use serde_json::Value;
 
 /// Everything the composer needs for one frame.
 pub struct ComposerState<'a> {
@@ -218,6 +219,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut ComposerState<'_>) -> Option<Composer
                         action = Some(ComposerAction::Attach);
                     }
                     model_selector(ui, state, &mut action);
+                    thinking_selector(ui, state, &mut action);
                     config_selector(ui, state, &mut action);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let send = send_button(ui, ready, running);
@@ -653,6 +655,127 @@ pub fn suggestion_chip(ui: &mut egui::Ui, label: &str) -> Response {
     .on_hover_text("Insert this prompt")
 }
 
+fn thinking_selector(
+    ui: &mut egui::Ui,
+    state: &ComposerState<'_>,
+    action: &mut Option<ComposerAction>,
+) {
+    let Some(session) = state.session else { return };
+    let Some(provider) = state.providers.iter().find(|p| p.id == session.provider) else {
+        return;
+    };
+    if !provider.supports("config_options") {
+        return;
+    }
+    let Some(option) = state
+        .config_options
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|option| is_thinking_option(option))
+    else {
+        return;
+    };
+    let Some(id) = option["id"].as_str() else {
+        return;
+    };
+    let current = option["currentValue"].as_str().unwrap_or("Default");
+    let label = option["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|choice| choice["value"].as_str() == Some(current))
+        .and_then(|choice| choice["name"].as_str())
+        .unwrap_or(current);
+    let enabled = state.online && !state.running && !session.archived;
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(
+            (label.chars().count() as f32 * 7.0 + 42.0).clamp(72.0, 112.0),
+            36.0,
+        ),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    if response.hovered() && enabled {
+        ui.painter().rect_filled(rect, 8.0, theme::HOVER);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    icons::paint(
+        ui.painter(),
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 13.0, rect.center().y),
+            Vec2::splat(14.0),
+        ),
+        Icon::Cpu,
+        theme::ORANGE,
+        1.5,
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 24.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        theme::medium(12.0),
+        theme::SECONDARY,
+    );
+    icons::paint(
+        ui.painter(),
+        egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 8.0, rect.center().y),
+            Vec2::splat(9.0),
+        ),
+        Icon::ChevronDown,
+        theme::FAINT,
+        1.3,
+    );
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, "Thinking level"));
+    let response = response.on_hover_text(format!("Thinking · {label}"));
+    egui::Popup::menu(&response)
+        .id(egui::Id::unique(("thinking-menu", state.session_id)))
+        .show(|ui| {
+            ui.label(
+                RichText::new("Thinking level")
+                    .font(theme::medium(12.0))
+                    .color(theme::MUTED),
+            );
+            for choice in option["options"].as_array().into_iter().flatten() {
+                let Some(value) = choice["value"].as_str() else {
+                    continue;
+                };
+                let choice_label = choice["name"].as_str().unwrap_or(value);
+                if ui
+                    .selectable_label(current == value, choice_label)
+                    .clicked()
+                {
+                    *action = Some(ComposerAction::SetConfig {
+                        option: id.to_owned(),
+                        value: value.to_owned(),
+                    });
+                    ui.close();
+                }
+            }
+        });
+}
+
+fn is_thinking_option(option: &Value) -> bool {
+    let id = option["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let name = option["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let category = option["category"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    id == "thought_level" || name.contains("thinking") || category.contains("thinking")
+}
+
 fn config_selector(
     ui: &mut egui::Ui,
     state: &ComposerState<'_>,
@@ -681,6 +804,9 @@ fn config_selector(
             }
             if provider.supports("config_options") {
                 for option in state.config_options.as_array().into_iter().flatten() {
+                    if is_thinking_option(option) {
+                        continue;
+                    }
                     let (Some(id), Some(name)) = (option["id"].as_str(), option["name"].as_str())
                     else {
                         continue;
@@ -720,5 +846,21 @@ mod picker_tests {
         assert!(model_matches("codex", "GPT Luna", "openai-codex/model"));
         assert!(model_matches("", "GPT Luna", "codex/model"));
         assert!(!model_matches("claude", "GPT Luna", "codex/model"));
+    }
+
+    #[test]
+    fn identifies_thinking_config_options() {
+        assert!(super::is_thinking_option(
+            &serde_json::json!({ "id": "thought_level" })
+        ));
+        assert!(super::is_thinking_option(
+            &serde_json::json!({ "name": "Thinking budget" })
+        ));
+        assert!(super::is_thinking_option(
+            &serde_json::json!({ "category": "thinking" })
+        ));
+        assert!(!super::is_thinking_option(
+            &serde_json::json!({ "id": "temperature", "name": "Temperature" })
+        ));
     }
 }
