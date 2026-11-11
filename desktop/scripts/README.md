@@ -22,7 +22,7 @@ current workflow does not assemble or upload a release archive. For the addition
 local compiled-artifact acceptance, build a Linux release bundle then run:
 
 ```sh
-cargo build --release --locked -p talosd -p talosdctl -p talos-desktop --bins
+RUST_FONTCONFIG_DLOPEN=1 cargo build --release --locked -p talosd -p talosdctl -p talos-gpui --bins
 python3 scripts/packaging-acceptance.py --compiled-artifact --verbose
 ```
 

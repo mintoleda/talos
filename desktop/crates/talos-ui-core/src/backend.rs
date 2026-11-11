@@ -2,12 +2,12 @@
 //! from per-session delivery cursors; RPC timeouts always retire the connection.
 
 #[cfg(test)]
-use crate::state::ToolState;
+use crate::state::{Entry, ToolState};
 use crate::state::{
-    Entry, PendingState, ProviderSummary, Session, SessionStatus, Usage, ViewModel, Workspace,
+    PendingState, ProviderSummary, Session, SessionStatus, Usage, ViewModel, Workspace,
     parse_session,
 };
-/// Frontend-neutral wake handle. The egui and GPUI shells supply their own notifier.
+/// Frontend-neutral wake handle. The GPUI shell supplies its native notifier.
 #[derive(Clone)]
 struct UiWake(std::sync::Arc<dyn Fn() + Send + Sync>);
 
@@ -199,7 +199,7 @@ impl Backend {
             let failure = updates.clone();
             let paint = ctx.clone();
             if let Err(error) = std::thread::Builder::new()
-                .name("talos-desktop-backend".into())
+                .name("talos-ui-backend".into())
                 .spawn(move || {
                     match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -352,6 +352,7 @@ impl Backend {
             }
         }
     }
+    #[allow(clippy::too_many_lines)]
     fn apply_success(&mut self, action: Action, value: Value) {
         match action {
             Action::ValidateImages { session, .. } => self.validated_images.push((session, value)),
@@ -774,6 +775,7 @@ fn compact_path(path: &str) -> String {
 }
 
 /// Convert a `SessionSnapshot` payload into timeline entries.
+#[cfg(test)]
 fn entries_from_snapshot(value: &Value) -> Vec<Entry> {
     let session_id = value
         .get("session")
@@ -1222,6 +1224,7 @@ pub fn group_tools(entries: &[Entry]) -> Vec<Vec<&Entry>> {
 
 /// Formats a token count compactly (`1.2k`, `18.4k`, `1.1M`).
 #[must_use]
+#[allow(clippy::cast_precision_loss)]
 pub fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)

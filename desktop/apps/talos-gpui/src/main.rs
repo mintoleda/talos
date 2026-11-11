@@ -5,22 +5,16 @@
     clippy::unused_self
 )]
 
-// Share the proven IPC/replay implementation, not a second agent runtime.
-// Both frontends provide native wake callbacks; no egui runtime is used here.
+// Share the frontend-neutral daemon bridge and projection, not a second agent runtime.
 #[cfg(test)]
 mod acceptance;
-#[allow(dead_code)]
-#[path = "../../talos-desktop/src/attachments.rs"]
-mod attachments;
-#[allow(dead_code, clippy::cast_precision_loss)]
-#[path = "../../talos-desktop/src/backend.rs"]
-mod backend;
 mod glass;
-#[allow(dead_code)]
-#[path = "../../talos-desktop/src/state.rs"]
-mod state;
 mod workflow;
 use glass::{GlassMode, GlassSettings, frosted};
+use talos_ui_core::{
+    backend::{Action, Backend},
+    state::{self, EntryKind, PendingState},
+};
 
 use std::{
     borrow::Cow,
@@ -28,14 +22,12 @@ use std::{
     path::PathBuf,
 };
 
-use backend::{Action, Backend};
 use gpui::{
     AssetSource, Bounds, Context, Entity, FontWeight, IntoElement, PathPromptOptions, Render,
     ScrollHandle, SharedString, Window, WindowBounds, WindowOptions, div, hsla, prelude::*, px,
     rgb, size,
 };
 use gpui_base::input::{InputEditorStyle, InputEvent, Textarea, TextareaState};
-use state::{EntryKind, PendingState};
 use workflow::PendingPrompt;
 
 // Dark, depth-first tokens: the canvas is the quietest plane and controls lift

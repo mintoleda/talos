@@ -1,12 +1,12 @@
 # Project instructions
 
-- `desktop/` is the Rust workspace inside the Talos monorepo: the native `egui` desktop app (`talos-desktop`), its local daemon (`talosd`), CLI (`talosdctl`) and supporting crates. The Go agent runtime lives at the repository root (`cmd/`, `internal/`).
+- `desktop/` is the Rust workspace inside the Talos monorepo: the native GPUI desktop app (`talos-gpui`), its local daemon (`talosd`), CLI (`talosdctl`) and supporting crates. The Go agent runtime lives at the repository root (`cmd/`, `internal/`).
 - The desktop reaches Talos only through `talos acp` (ACP over stdio). Do not reimplement Go runtime behavior in Rust; runtime fixes belong in `internal/`. Changes spanning both sides must keep `docs/architecture/talos-acp.md` and `../docs/paseo-integration.md` in sync.
 - Do not modify the installed runtime under `~/.paseo` or the real `~/.talos` home; tests and smoke runs use isolated temporary homes.
 - Talos/ACP is the primary backend; Claude Code is the only secondary provider.
 - Keep provider-neutral domain types and capability-driven UI behavior.
 - Use idiomatic Rust, typed errors, cancellation-safe async code, bounded channels, and no `unsafe` code.
-- The desktop frontend must use `egui`/`eframe`; preserve the visual and motion direction in `docs/design/egui-ui.md`.
-- For a requested local GPUI desktop refresh, build from `desktop/` with `RUST_FONTCONFIG_DLOPEN=1 cargo build -p talosd -p talos-gpui`. If the per-user GPUI development launcher/desktop entry exists, update it to use the current worktree's `target/debug/talos-gpui` (and matching `talosd`), validate the `.desktop` file with `desktop-file-validate` when available, and do not repoint the packaged `talos-desktop` release entry.
+- The desktop frontend is GPUI (`talos-gpui`); keep shared UI bridge/projection code in `crates/talos-ui-core` and preserve the visual direction documented in `apps/talos-gpui/README.md`.
+- For a requested local GPUI desktop refresh, build from `desktop/` with `RUST_FONTCONFIG_DLOPEN=1 cargo build -p talosd -p talos-gpui`. If the per-user GPUI development launcher/desktop entry exists, update it to use the current worktree's `target/debug/talos-gpui` (and matching `talosd`), validate the `.desktop` file with `desktop-file-validate` when available, and keep it consistent with `packaging/desktop/talos-gpui.desktop`.
 - Run `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` (from `desktop/`) before declaring a workstream complete. Run `go build ./... && go test ./...` from the repository root when touching Go code.
 - Agents working concurrently must stay within their assigned crate/files and avoid broad formatting of unrelated files.

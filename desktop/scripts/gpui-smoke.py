@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run GPUI's daemon-bridge acceptance against a temporary ACP fixture home.
 
-Build first: cargo test -p talos-gpui --no-run && cargo build -p talosd -p talosdctl -p talos-acp --bins
+Build first: RUST_FONTCONFIG_DLOPEN=1 cargo test -p talos-gpui --no-run && cargo build -p talosd -p talosdctl -p talos-acp --bins
 No real provider credentials or homes are accessed. This does not test GUI input.
 """
 import argparse

@@ -1,12 +1,12 @@
 //! Opt-in real-daemon acceptance for the bridge used by the GPUI frontend.
 //! scripts/gpui-smoke.py supplies an isolated fixture home; no paid provider calls.
-use crate::{
-    backend::{Action, Backend},
-    state::EntryKind,
-};
 use std::{
     sync::mpsc,
     time::{Duration, Instant},
+};
+use talos_ui_core::{
+    backend::{Action, Backend},
+    state::EntryKind,
 };
 
 fn wait(backend: &mut Backend, wakes: &mpsc::Receiver<()>, predicate: impl Fn(&Backend) -> bool) {

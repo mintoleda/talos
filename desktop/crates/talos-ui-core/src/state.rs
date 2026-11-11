@@ -323,6 +323,7 @@ impl ViewModel {
         self.apply_kind(session_id, name, content, &event.event_id, run, at);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_kind(
         &mut self,
         session: &str,
@@ -802,6 +803,7 @@ impl ViewModel {
     /// A representative offline preview so the shell can be inspected without
     /// a daemon. Never presented as live data: the status bar says "Preview".
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn demo() -> Self {
         let mut model = Self {
             status: "Preview · daemon offline".into(),
@@ -916,9 +918,9 @@ impl ViewModel {
                 kind: EntryKind::Tool {
                     call_id: "call-1".into(),
                     name: "Read".into(),
-                    target: "apps/talos-desktop/src/main.rs".into(),
+                    target: "apps/talos-gpui/src/main.rs".into(),
                     state: ToolState::Completed,
-                    input: "{\"path\":\"apps/talos-desktop/src/main.rs\"}".into(),
+                    input: "{\"path\":\"apps/talos-gpui/src/main.rs\"}".into(),
                     output: "read 695 lines".into(),
                 },
             },

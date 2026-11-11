@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=Talos Desktop
-Comment=Native Talos desktop preview
-Exec=talos-desktop
+Name=Talos
+Comment=Native Talos desktop
+Exec=talos-gpui
 Icon=utilities-terminal
 Terminal=false
 Categories=Development;
 StartupNotify=true
-StartupWMClass=talos-desktop
+StartupWMClass=talos

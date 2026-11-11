@@ -7,7 +7,7 @@ CI runs the backend gates with Rust 1.95.0 on Ubuntu 24.04 and a separate Linux 
 These steps apply when a release bundle is available; the current CI workflow
 does not produce one.
 
-Download the artifact, verify the archive against its adjacent checksum (`sha256sum -c talos-desktop-linux-x86_64-*.tar.gz.sha256`), and extract it. From the extracted directory:
+Download the artifact, verify the archive against its adjacent checksum (`sha256sum -c talos-gpui-linux-x86_64-*.tar.gz.sha256`), and extract it. From the extracted directory:
 
 ```sh
 bash packaging/install-user.sh
@@ -15,10 +15,10 @@ systemctl --user daemon-reload
 systemctl --user enable --now talosd.service
 systemctl --user status talosd.service
 ~/.local/bin/talosdctl health
-~/.local/bin/talos-desktop
+~/.local/bin/talos-gpui
 ```
 
-Run as the desktop user, **never with sudo**. The installer replaces only `~/.local/bin/{talosd,talosdctl,talos-desktop}`, `~/.config/systemd/user/talosd.service`, and `~/.local/share/applications/talos-desktop.desktop`; it does not start/enable the service or touch daemon data. Re-running it upgrades those destinations. Before upgrading running binaries, stop the service with `systemctl --user stop talosd.service`, install the new files, then start it again. For manual operation without systemd, run `~/.local/bin/talosd` in a terminal, then use `~/.local/bin/talosdctl health` in another.
+Run as the desktop user, **never with sudo**. The installer replaces only `~/.local/bin/{talosd,talosdctl,talos-gpui}`, `~/.config/systemd/user/talosd.service`, and `~/.local/share/applications/talos-gpui.desktop`; it does not start/enable the service or touch daemon data. Re-running it upgrades those destinations. Before upgrading running binaries, stop the service with `systemctl --user stop talosd.service`, install the new files, then start it again. For manual operation without systemd, run `~/.local/bin/talosd` in a terminal, then use `~/.local/bin/talosdctl health` in another.
 
 To uninstall, stop and disable the service, then run the bundle's uninstaller:
 
@@ -34,10 +34,10 @@ The **user** service runs as your account (`systemctl --user`, not `sudo systemc
 
 On startup, talosd serializes recovery with a persistent private `talosd.guard` file lock. It removes a regular `talosd.lock` marker only when its recorded daemon PID is confirmed absent; unknown/importer markers and live or unverifiable PIDs fail closed. It removes `talosd.sock` only when it is a Unix socket and a connection is refused. Live, timed-out, inaccessible, symlink, and non-socket paths are preserved. This allows a normal process crash to restart without manual file deletion while avoiding guesses about active owners. The compiled-artifact acceptance exercises this restart path in a temporary home.
 
-The desktop launcher resolves `talos-desktop` via the desktop session's `PATH`: ensure `~/.local/bin` is available there, or start the binary by absolute path. Fixture packaging acceptance uses stub binaries. A local compiled-artifact acceptance is also available after building Linux release binaries:
+The desktop launcher resolves `talos-gpui` via the desktop session's `PATH`: ensure `~/.local/bin` is available there, or start the binary by absolute path. Fixture packaging acceptance uses stub binaries. A local compiled-artifact acceptance is also available after building Linux release binaries:
 
 ```sh
-cargo build --release --locked -p talosd -p talosdctl -p talos-desktop --bins
+RUST_FONTCONFIG_DLOPEN=1 cargo build --release --locked -p talosd -p talosdctl -p talos-gpui --bins
 python3 scripts/packaging-acceptance.py --compiled-artifact --verbose
 ```
 
@@ -47,9 +47,9 @@ It validates compiled install, replacement of prior binaries during upgrade, uni
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-cargo build --release --locked -p talosd -p talosdctl -p talos-desktop
+RUST_FONTCONFIG_DLOPEN=1 cargo clippy --workspace --all-targets --locked -- -D warnings
+RUST_FONTCONFIG_DLOPEN=1 cargo test --workspace --locked
+RUST_FONTCONFIG_DLOPEN=1 cargo build --release --locked -p talosd -p talosdctl -p talos-gpui
 ```
 
 Requires Rust 1.95.0+ and Linux desktop development headers (see `.github/workflows/ci.yml`). Windows IPC is not supported yet; macOS and non-x86_64 Linux releases, signed packages, and distribution-specific installers are not produced by this pipeline. No cross-platform installation claim is made.
