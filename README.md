@@ -86,9 +86,9 @@ make app            # production renderer/main bundles → app/out/
 `talos serve` still serves the static UI from `app/out/renderer` when present
 (browser byproduct). The daemon keeps running after you quit the Electron window.
 
-### native desktop (Rust, egui)
+### native desktop (Rust, GPUI)
 
-`desktop/` is a Rust workspace containing a native `egui` desktop app, a local
+`desktop/` is a Rust workspace containing the native `talos-gpui` app, a local
 daemon/CLI, and storage. It drives Talos headlessly through `talos acp` (Agent
 Client Protocol over stdio), with Claude Code as the only secondary provider.
 It is intended to replace the Electron app once it reaches parity.

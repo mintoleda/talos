@@ -9,7 +9,7 @@ Talos is launched as `talos acp`. Claude Code is the only secondary provider, la
 ## Architecture
 
 ```text
-talos-desktop (egui) ─┐
+talos-gpui ────────────┐
                       ├─ local versioned IPC ─ talosd
 talosdctl ────────────┘                         │
                                                ├─ talos-core (use cases/provider registry)
@@ -27,7 +27,7 @@ Shared domain types are provider-neutral. ACP owns newline-delimited bidirection
 2. **ACP/Talos** — robust stdio transport, typed RPC, Talos session adapter, fake ACP fixture tests.
 3. **Core + providers** — Talos/Claude Code registry and default selection, agent orchestration, event fan-out, cancellation, and persistence integration.
 4. **Daemon + IPC** — local authenticated endpoint, snapshots/commands/events, reconnect/replay, lifecycle and diagnostics.
-5. **egui desktop** — navigation, history, timeline/tool/permission surfaces, responsive shell, reference-inspired prompt bar and reduced-motion-aware animation.
+5. **GPUI desktop** — navigation, history, timeline/tool/permission surfaces, responsive shell, reference-inspired prompt bar and reduced-motion-aware animation.
 6. **CLI + migration + packaging** — diagnostics, provider/session commands, read-only legacy inventory/import, desktop launch and release artifacts.
 
 ## Delivery sequence — backend first, UI last
@@ -48,7 +48,7 @@ completion; fixture tests do not establish live-provider or restart acceptance.
 4. **P3 — migration and distribution:** read-only inventory, backup and recoverable
    import, source-preservation tests and fresh-home Linux install/upgrade checks.
 5. **P4 — desktop integration and QA (M1/M2 UI):** only after P0–P3 pass, finish
-   the egui shell/composer, timeline/tools/diffs, permission/attachment/terminal
+   the GPUI shell/composer, timeline/tools/diffs, permission/attachment/terminal
    surfaces, accessibility, responsive layout and release acceptance. Preserve
    existing UI work in the meantime; defer its cleanup and expansion to this phase.
 
@@ -70,4 +70,4 @@ Refined industrial minimalism: near-black canvas, translucent charcoal surfaces,
 
 ## Definition of done
 
-The rebuild is considered usable when a fresh install can create or import a workspace, run and resume Talos sessions, stream text/tools/usage, resolve permissions, cancel safely, persist history, explicitly select Claude Code when desired, and complete the same workflow through both the egui app and CLI without modifying the legacy `~/.paseo` tree. Full parity remains tracked explicitly in `docs/architecture/feature-parity.md`.
+The rebuild is considered usable when a fresh install can create or import a workspace, run and resume Talos sessions, stream text/tools/usage, resolve permissions, cancel safely, persist history, explicitly select Claude Code when desired, and complete the same workflow through both the GPUI app and CLI without modifying the legacy `~/.paseo` tree. Full parity remains tracked explicitly in `docs/architecture/feature-parity.md`.

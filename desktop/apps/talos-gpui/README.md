@@ -1,10 +1,8 @@
-# Talos GPUI experiment
+# Talos GPUI desktop
 
-A separate, functional GPUI frontend for evaluating the native desktop alternative.
-The existing `talos-desktop` / egui app remains available; this is not a port back
-to egui. Both frontends reuse the same daemon bridge, projection and attachment
-validation. The bridge accepts a frontend-native wake callback, so GPUI does not
-link egui/eframe or poll for updates while idle.
+The native desktop frontend for Talos. It reuses the frontend-neutral daemon
+bridge, projection and attachment validation in `talos-ui-core`; the bridge
+accepts a native wake callback and does not poll for updates while idle.
 
 ## Run
 
@@ -31,7 +29,7 @@ revisions.
 ## Connected workflow
 
 - Connects to `talosd` using its authenticated local IPC; starts the sibling daemon
-  when needed, using the same configuration/discovery as the egui frontend.
+  when needed, using the shared configuration and discovery.
 - Uses `TALOSD_HOME`, `TALOSD_SOCKET`, `TALOSD_AUTH_TOKEN` and `TALOSD_BIN` overrides.
   Normal runs use `~/.talosd`; tests use temporary homes. Provider credentials and
   the `talos acp` executable must be configured separately for live model calls.

@@ -1,5 +1,13 @@
 # Implementation status and execution checklist
 
+Historical snapshots below may refer to the former egui binary `talos-desktop`;
+that frontend has been removed. The sole desktop app is now `talos-gpui`, with
+shared bridge/projection code in `crates/talos-ui-core`.
+
+Current-tree verification: formatting, strict full-workspace Clippy, full-workspace
+tests, isolated GPUI daemon-bridge smoke, and fixture packaging acceptance pass.
+The GPUI smoke does not cover GUI input, live providers, or full accessibility QA.
+
 This is the execution tracker for [PLAN.md](PLAN.md). The feature requirements
 remain in [feature-parity.md](architecture/feature-parity.md); file ownership is
 in [workstreams.md](architecture/workstreams.md).
@@ -428,7 +436,7 @@ recorded source-preservation evidence. Ready for desktop integration.
 
 ## P4 — desktop integration and release QA (UI last)
 
-Depends on P3; workstreams B/C/D start here. Existing code is a starting point,
+Depends on P3; workstream B continues here. Existing code is a starting point,
 not evidence that the desktop acceptance gate is complete.
 
 - [x] Desktop permission-state test, formatting, and strict lint gates pass in the final workspace run above.
