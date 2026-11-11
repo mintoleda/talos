@@ -17,11 +17,11 @@ fi
 
 bin="$HOME/.local/bin"
 service="$HOME/.config/systemd/user/talosd.service"
-desktop="$HOME/.local/share/applications/talos-desktop.desktop"
+desktop="$HOME/.local/share/applications/talos-gpui.desktop"
 targets=(
   "$bin/talosd"
   "$bin/talosdctl"
-  "$bin/talos-desktop"
+  "$bin/talos-gpui"
   "$service"
   "$desktop"
 )

@@ -23,8 +23,8 @@ or UI-only lint cleanup during P0–P3. Backend acceptance must not depend on th
 unfinished desktop. Broader M3 work remains separately deferred.
 
 Owner roles below are assignments for execution, not completion statuses. For
-P0–P3 regression checks use `cargo test --workspace --exclude talos-desktop` and
-`cargo clippy --workspace --all-targets --exclude talos-desktop -- -D warnings`; the
+P0–P3 regression checks use `cargo test --workspace --exclude talos-gpui` and
+`cargo clippy --workspace --all-targets --exclude talos-gpui -- -D warnings`; the
 full workspace checks remain mandatory before release.
 
 ## Architecture contract
@@ -36,7 +36,8 @@ full workspace checks remain mandatory before release.
 - `talos-ipc` — versioned newline-JSON IPC between daemon and clients.
 - `apps/talosd` — daemon.
 - `apps/talosdctl` (`talosdctl`) — operator CLI.
-- `apps/talos-desktop` — egui desktop client.
+- `apps/talos-gpui` — GPUI desktop client.
+- `crates/talos-ui-core` — frontend-neutral IPC bridge, view projection and attachment validation.
 - `apps/paseo-migrate`, `crates/paseo-migrate` — read-only legacy inventory.
 
 Talos (`talos acp`) is the default provider. Claude Code is the only secondary
@@ -70,32 +71,14 @@ Deliverables:
    permission scoping and usage aggregation, CLI parsing tests. Keep public docs
    current.
 
-## Workstream B — egui shell and composer (deferred to P4)
+## Workstream B — GPUI desktop and interaction QA (P4)
 
-Owner files: `apps/talos-desktop/src/main.rs`, `app.rs`, `backend.rs`, `state.rs`,
-`theme.rs`, `ui/mod.rs`, `ui/composer.rs`, `ui/sidebar.rs`, `ui/overlays.rs`.
+Owner files: `apps/talos-gpui/**`, `crates/talos-ui-core/**`.
 
-Deliverables: 60 px rail, resizable 286 px history, centered timeline, inspector,
-settings, command palette, reference-fidelity composer, responsive 720/1040/1440
-breakpoints, keyboard map, reduced motion and high contrast.
-
-## Workstream C — icon and widget kit (deferred to P4)
-
-Owner files: `apps/talos-desktop/src/ui/icons.rs`, `apps/talos-desktop/src/ui/widgets.rs`.
-
-Deliverables: hand-painted 24-grid vector icons for every `Icon` variant, square
-icon buttons with hover wash, tooltips, presence dots, chips, section labels,
-keyboard hints, dividers. No emoji glyphs in the shell.
-
-## Workstream D — timeline and markdown (deferred to P4)
-
-Owner files: `apps/talos-desktop/src/ui/timeline.rs`, `apps/talos-desktop/src/ui/markdown.rs`.
-
-Deliverables: markdown rendering with code blocks and copy affordances; user
-turns; streamed assistant blocks with a caret; collapsible reasoning; tool cards
-with states and expandable output; high-salience permission cards with
-allow-once/deny and in-flight state; error/notice blocks; scroll assist and a
-"new messages" pill; empty and offline states.
+Deliverables: close the documented GPUI evaluation gaps; verify responsive layout,
+keyboard and accessibility behavior, markdown/tool presentation, offline/reconnect
+states, and desktop input workflows. Keep the daemon bridge toolkit-neutral in
+`talos-ui-core`; UI rendering and interaction belong in the GPUI app.
 
 ## Workstream E — QA, docs, packaging (non-UI P0–P3; desktop QA P4)
 

@@ -39,7 +39,8 @@ Start as a Cargo workspace with these crates (some can begin as modules if the w
 | `talos-process` | Child-process supervision, terminal/workspace process lifecycle, OS-specific process handling | Domain policy, UI |
 | `talos-ipc` | Versioned daemon-client protocol, framing, local socket setup/authentication | Provider implementations, UI toolkit |
 | `talosd` | Composition root, Tokio runtime, IPC server, workers, shutdown | UI toolkit |
-| `talos-desktop` | Desktop shell, view state, IPC client, rendering/input | Store and provider implementations |
+| `talos-gpui` | GPUI desktop shell and rendering/input | Store and provider implementations |
+| `talos-ui-core` | Frontend-neutral view state, IPC client and attachment validation | UI toolkit |
 | `talosdctl` | Headless client commands, diagnostics, import/export | Store internals (all mutations through daemon) |
 | `talos-test-support` | Fake ports, fixtures, deterministic clocks/process harnesses | Production dependency graph |
 

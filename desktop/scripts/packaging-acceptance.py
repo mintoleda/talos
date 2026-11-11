@@ -20,13 +20,13 @@ from typing import Iterable
 
 
 DESKTOP_ROOT = Path(__file__).resolve().parents[1]
-BINARIES = ("talosd", "talosdctl", "talos-desktop")
+BINARIES = ("talosd", "talosdctl", "talos-gpui")
 INSTALLED_FILES = (
     ".local/bin/talosd",
     ".local/bin/talosdctl",
-    ".local/bin/talos-desktop",
+    ".local/bin/talos-gpui",
     ".config/systemd/user/talosd.service",
-    ".local/share/applications/talos-desktop.desktop",
+    ".local/share/applications/talos-gpui.desktop",
 )
 
 
@@ -89,7 +89,7 @@ def write_fixture_bundle(root: Path, version: str) -> tuple[Path, Path]:
     packaging = bundle / "packaging"
     shutil.copytree(DESKTOP_ROOT / "packaging", packaging)
 
-    archive = root / f"talos-desktop-linux-x86_64-{version}.tar.gz"
+    archive = root / f"talos-gpui-linux-x86_64-{version}.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
         for path in sorted(bundle.rglob("*")):
             tar.add(path, arcname=path.relative_to(bundle), recursive=False)
@@ -199,7 +199,7 @@ def assert_installed(home: Path, version: str) -> None:
         require(stat.S_IMODE(path.stat().st_mode) == 0o755, f"Wrong mode on {path}")
 
     service = home / ".config/systemd/user/talosd.service"
-    desktop = home / ".local/share/applications/talos-desktop.desktop"
+    desktop = home / ".local/share/applications/talos-gpui.desktop"
     require(
         service.read_bytes()
         == (DESKTOP_ROOT / "packaging/systemd/talosd.service").read_bytes(),
@@ -208,7 +208,7 @@ def assert_installed(home: Path, version: str) -> None:
     validate_systemd_unit(service)
     require(
         desktop.read_bytes()
-        == (DESKTOP_ROOT / "packaging/desktop/talos-desktop.desktop").read_bytes(),
+        == (DESKTOP_ROOT / "packaging/desktop/talos-gpui.desktop").read_bytes(),
         "Installed desktop entry differs from the release bundle",
     )
     require(stat.S_IMODE(service.stat().st_mode) == 0o644, "Wrong systemd unit mode")
@@ -315,7 +315,7 @@ def write_compiled_bundle(root: Path) -> Path:
         require(source.is_file() and os.access(source, os.X_OK), f"Missing compiled release binary: {source}")
         shutil.copy2(source, bundle / binary)
     shutil.copytree(DESKTOP_ROOT / "packaging", bundle / "packaging")
-    archive = root / "talos-desktop-linux-x86_64-compiled.tar.gz"
+    archive = root / "talos-gpui-linux-x86_64-compiled.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
         for path in sorted(bundle.rglob("*")):
             tar.add(path, arcname=path.relative_to(bundle), recursive=False)
@@ -543,7 +543,7 @@ def exercise_compiled_cli(bundle: Path, root: Path) -> None:
             old_version.write_text(f"#!/bin/sh\nprintf '%s\\n' '{binary} previous release'\n", encoding="utf-8")
             old_version.chmod(0o755)
         service = home / ".config/systemd/user/talosd.service"
-        desktop_entry = home / ".local/share/applications/talos-desktop.desktop"
+        desktop_entry = home / ".local/share/applications/talos-gpui.desktop"
         service.write_bytes(b"previous service unit\n")
         desktop_entry.write_bytes(b"previous desktop entry\n")
         install(bundle, home)
@@ -555,7 +555,7 @@ def exercise_compiled_cli(bundle: Path, root: Path) -> None:
         )
         require(
             desktop_entry.read_bytes()
-            == (bundle / "packaging/desktop/talos-desktop.desktop").read_bytes(),
+            == (bundle / "packaging/desktop/talos-gpui.desktop").read_bytes(),
             "Compiled upgrade did not replace the desktop entry",
         )
         retained = [path for path in daemon_home.rglob("*") if path.is_file()]

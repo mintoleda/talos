@@ -1,6 +1,6 @@
 # Talos desktop (Rust)
 
-The native Rust desktop for Talos: a polished `egui` interface and a provider-neutral agent control plane. It lives in the Talos monorepo under `desktop/`; the Go agent runtime is at the repository root.
+The native Rust desktop for Talos: the `talos-gpui` interface and a provider-neutral agent control plane. It lives in the Talos monorepo under `desktop/`; the Go agent runtime is at the repository root.
 
 ## Direction
 
@@ -30,9 +30,9 @@ make desktop-accept   # process acceptance against the ACP fixture
 Or from `desktop/`:
 
 ```bash
-cargo check --workspace
-cargo test --workspace
-cargo run -p talos-desktop          # desktop UI
+RUST_FONTCONFIG_DLOPEN=1 cargo check --workspace
+RUST_FONTCONFIG_DLOPEN=1 cargo test --workspace
+RUST_FONTCONFIG_DLOPEN=1 cargo run -p talos-gpui # desktop UI
 cargo run -p talosd         # local daemon
 cargo run -p talosdctl -- --help
 ```

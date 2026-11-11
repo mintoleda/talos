@@ -3,15 +3,15 @@
 talos:
 	go build -o talos ./cmd/talos
 
-# Native Rust desktop app (egui) and its local daemon/CLI.
+# Native GPUI desktop app and its local daemon/CLI.
 desktop: talos
-	cd desktop && cargo run -p talos-desktop
+	cd desktop && RUST_FONTCONFIG_DLOPEN=1 cargo run -p talos-gpui
 
 desktop-check:
-	cd desktop && cargo check --workspace
+	cd desktop && RUST_FONTCONFIG_DLOPEN=1 cargo check --workspace
 
 desktop-test:
-	cd desktop && cargo test --workspace
+	cd desktop && RUST_FONTCONFIG_DLOPEN=1 cargo test --workspace
 
 desktop-accept:
 	cd desktop && cargo build --locked -p talosd -p talosdctl -p talos-acp --bins

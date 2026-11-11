@@ -2,7 +2,7 @@
 
 > **Monorepo update.** The Paseo interface layer is now the Rust workspace in
 > [`desktop/`](../desktop/README.md) inside this repository, not a separate
-> product. In this document "Paseo" means that desktop (egui app `talos-desktop`, daemon
+> product. In this document "Paseo" means that desktop (GPUI app `talos-gpui`, daemon
 > `talosd`, CLI `talosdctl`); the installed JavaScript Paseo remains a supported
 > ACP client but is no longer the target. See [Monorepo layout](#monorepo-layout).
 
@@ -33,7 +33,7 @@ talos/
 ├── internal/         Go runtime: loop, providers, tools, safety, sessions, MCP
 │   ├── acp/          ACP v1 server used by the desktop
 │   └── stack/        runtime constructor shared by TUI, daemon and ACP
-├── desktop/          Rust workspace: egui app, talosd, talosdctl, store, ACP client
+├── desktop/          Rust workspace: GPUI app, talosd, talosdctl, store, ACP client
 ├── docs/
 └── Makefile          `talos`, `desktop*` targets
 ```
