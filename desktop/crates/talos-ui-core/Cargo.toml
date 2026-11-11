@@ -1,0 +1,16 @@
+[package]
+name = "talos-ui-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+directories.workspace = true
+serde_json.workspace = true
+talos-ipc = { path = "../talos-ipc" }
+tokio.workspace = true
+
+[lints]
+workspace = true

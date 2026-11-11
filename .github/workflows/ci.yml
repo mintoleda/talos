@@ -43,9 +43,9 @@ jobs:
         with:
           workspaces: desktop
       - name: Backend strict lint baseline
-        run: cargo clippy --workspace --all-targets --exclude talos-desktop --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude talos-gpui --locked -- -D warnings
       - name: Backend tests
-        run: cargo test --workspace --exclude talos-desktop --locked
+        run: cargo test --workspace --exclude talos-gpui --locked
       - name: Build process acceptance binaries
         run: cargo build --locked -p talosd -p talosdctl -p talos-acp --bins
       - name: Isolated daemon and CLI acceptance
@@ -67,12 +67,9 @@ jobs:
       - name: Fresh-home install, upgrade, uninstall, checksum, and retention
         run: python3 scripts/packaging-acceptance.py --verbose
 
-  # The full-workspace gates are still known-failing (see desktop/docs/STATUS.md).
-  # They run here for signal only until the desktop UI workstream closes them.
-  desktop-ui:
-    name: Desktop UI gates (non-blocking)
+  desktop-gpui:
+    name: Desktop GPUI gates
     runs-on: ubuntu-24.04
-    continue-on-error: true
     defaults:
       run:
         working-directory: desktop
@@ -81,7 +78,7 @@ jobs:
       - name: Native Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config desktop-file-utils libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev
+          sudo apt-get install -y pkg-config desktop-file-utils libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libfontconfig1-dev libxcb1-dev
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.95.0'
@@ -92,10 +89,12 @@ jobs:
       - name: Validate Linux integration assets
         run: |
           bash -n packaging/install-user.sh
-          desktop-file-validate packaging/desktop/talos-desktop.desktop
+          desktop-file-validate packaging/desktop/talos-gpui.desktop
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Build GPUI app
+        run: RUST_FONTCONFIG_DLOPEN=1 cargo build --locked -p talos-gpui
       - name: Clippy (all targets, warnings denied)
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: RUST_FONTCONFIG_DLOPEN=1 cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace --locked
+        run: RUST_FONTCONFIG_DLOPEN=1 cargo test --workspace --locked
