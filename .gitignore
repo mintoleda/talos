@@ -1,6 +1,7 @@
 plans/
 agent/settings.json
 AGENTS.md
+!/AGENTS.md
 TODOS.md
 /talos
 /harness
