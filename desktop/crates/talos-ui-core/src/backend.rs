@@ -19,6 +19,7 @@ impl UiWake {
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashSet},
+    os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     process::{Command as Process, Stdio},
     time::Duration,
@@ -185,7 +186,11 @@ pub struct Backend {
     pub generation: u64,
     pub loading: HashSet<String>,
     pub ready: HashSet<String>,
+    /// Sessions whose model change has not yet been acknowledged.
+    pub setting_models: HashSet<String>,
     pub load_errors: std::collections::HashMap<String, String>,
+    pub model_catalog_loading: HashSet<String>,
+    pub model_catalog_errors: std::collections::HashMap<String, String>,
     pub busy: usize,
     pub completed: Vec<Action>,
     pub connection_error: Option<String>,
@@ -254,7 +259,10 @@ impl Backend {
             generation: 0,
             loading: HashSet::new(),
             ready: HashSet::new(),
+            setting_models: HashSet::new(),
             load_errors: std::collections::HashMap::new(),
+            model_catalog_loading: HashSet::new(),
+            model_catalog_errors: std::collections::HashMap::new(),
             busy: 0,
             completed: Vec::new(),
             connection_error: None,
@@ -268,6 +276,11 @@ impl Backend {
             );
             return false;
         }
+        if matches!(&action, Action::Prompt { session, .. } if self.setting_models.contains(session))
+        {
+            self.view.error = Some("Wait for the model change to finish before sending.".into());
+            return false;
+        }
         if self.sender.try_send(action.clone()).is_err() {
             self.view.error =
                 Some("Backend queue unavailable or full. Your edits are retained.".into());
@@ -275,6 +288,9 @@ impl Backend {
         }
         match &action {
             Action::CreateAgent { .. } => self.agent_creation_failed = false,
+            Action::SetModel { session, .. } => {
+                self.setting_models.insert(session.clone());
+            }
             Action::Load(session) => {
                 self.loading.insert(session.clone());
                 self.ready.remove(session);
@@ -282,6 +298,10 @@ impl Backend {
             }
             Action::LoadTimeline { session, .. } => {
                 self.loading.insert(session.clone());
+            }
+            Action::Rpc(Command::ListModels { provider_id }) => {
+                self.model_catalog_loading.insert(provider_id.clone());
+                self.model_catalog_errors.remove(provider_id);
             }
             _ => {}
         }
@@ -429,6 +449,7 @@ impl Backend {
                 self.created_workspace = value["id"].as_str().map(str::to_owned);
             }
             Action::SetModel { session, model } => {
+                self.setting_models.remove(&session);
                 if let Some(item) = self.view.session_mut(&session) {
                     item.model = Some(model);
                 }
@@ -461,6 +482,19 @@ impl Backend {
             Action::Rpc(command) => match command {
                 Command::ListProjects => {
                     self.view.projects = value.as_array().cloned().unwrap_or_default();
+                }
+                Command::ListModels { provider_id } => {
+                    self.model_catalog_loading.remove(&provider_id);
+                    self.model_catalog_errors.remove(&provider_id);
+                    if let Some(provider) = self
+                        .view
+                        .providers
+                        .iter_mut()
+                        .find(|provider| provider.id == provider_id)
+                    {
+                        provider.models =
+                            parse_model_summaries(value.as_array().map(Vec::as_slice));
+                    }
                 }
                 Command::SearchTimeline { .. } => self.view.search = value,
                 Command::ListTerminals { .. } => self.view.terminals = value,
@@ -522,10 +556,18 @@ impl Backend {
     fn apply_failure(&mut self, action: Action, error: String) {
         match &action {
             Action::CreateAgent { .. } => self.agent_creation_failed = true,
+            Action::SetModel { session, .. } => {
+                self.setting_models.remove(session);
+            }
             Action::Load(session) | Action::LoadTimeline { session, .. } => {
                 self.loading.remove(session);
                 self.ready.remove(session);
                 self.load_errors.insert(session.clone(), error.clone());
+            }
+            Action::Rpc(Command::ListModels { provider_id }) => {
+                self.model_catalog_loading.remove(provider_id);
+                self.model_catalog_errors
+                    .insert(provider_id.clone(), error.clone());
             }
             Action::Prompt { session, text, .. } => {
                 self.view.run.insert(session.clone(), false);
@@ -630,30 +672,7 @@ fn parse_providers(value: Option<&Value>) -> Vec<ProviderSummary> {
                 .filter(|models| !models.is_empty());
             let raw_models =
                 detailed_models.or_else(|| item.get("models").and_then(Value::as_array));
-            let models = raw_models
-                .into_iter()
-                .flatten()
-                .filter_map(|model| {
-                    let id = model
-                        .get("id")
-                        .or_else(|| model.get("model_id"))?
-                        .as_str()?
-                        .to_owned();
-                    Some(crate::state::ModelSummary {
-                        label: model
-                            .get("label")
-                            .or_else(|| model.get("name"))
-                            .and_then(Value::as_str)
-                            .unwrap_or(&id)
-                            .to_owned(),
-                        id,
-                        default: model
-                            .get("is_default")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    })
-                })
-                .collect();
+            let models = parse_model_summaries(raw_models.map(Vec::as_slice));
             let mode_options = item
                 .get("modes")
                 .and_then(Value::as_array)
@@ -689,8 +708,36 @@ fn parse_providers(value: Option<&Value>) -> Vec<ProviderSummary> {
         .collect()
 }
 
+fn parse_model_summaries(models: Option<&[Value]>) -> Vec<crate::state::ModelSummary> {
+    models
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model
+                .get("id")
+                .or_else(|| model.get("model_id"))?
+                .as_str()?
+                .to_owned();
+            Some(crate::state::ModelSummary {
+                label: model
+                    .get("label")
+                    .or_else(|| model.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&id)
+                    .to_owned(),
+                id,
+                default: model
+                    .get("is_default")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
 fn parse_sessions(
     sessions: Option<&Value>,
+
     agents: Option<&Value>,
     workspaces: &[Workspace],
 ) -> Vec<Session> {
@@ -1140,8 +1187,15 @@ fn daemon_binary() -> Option<PathBuf> {
 
 async fn ensure_daemon(updates: &mpsc::Sender<Update>, ctx: &UiWake) {
     let socket = socket_path();
-    if socket.exists() {
+    if tokio::net::UnixStream::connect(&socket).await.is_ok() {
         return;
+    }
+    // A leftover Unix socket path is not proof that the daemon is alive. Remove
+    // stale socket nodes so the daemon can bind its endpoint on startup.
+    if let Ok(metadata) = std::fs::symlink_metadata(&socket)
+        && metadata.file_type().is_socket()
+    {
+        let _ = std::fs::remove_file(&socket);
     }
     let Some(binary) = daemon_binary() else {
         let _ = updates
@@ -1240,6 +1294,90 @@ mod tests {
     use super::*;
     use crate::state::EntryKind;
 
+    fn isolated_backend() -> (Backend, mpsc::Receiver<Action>) {
+        let (sender, actions) = mpsc::channel(16);
+        let (_updates, receiver) = mpsc::channel(16);
+        let mut backend = Backend::disconnected(sender, receiver, "Test".into());
+        backend.view.online = true;
+        (backend, actions)
+    }
+
+    #[test]
+    fn model_change_blocks_first_prompt_until_acknowledged() {
+        let (mut backend, mut actions) = isolated_backend();
+        let change = Action::SetModel {
+            session: "s1".into(),
+            model: "vendor/chosen".into(),
+        };
+        assert!(backend.submit(change.clone()));
+        assert!(matches!(
+            actions.try_recv().unwrap(),
+            Action::SetModel { .. }
+        ));
+        assert!(backend.setting_models.contains("s1"));
+        assert!(!backend.send("s1", "first message".into(), vec![]));
+        assert!(actions.try_recv().is_err());
+        assert!(!backend.view.entries.contains_key("s1"));
+        backend.apply(Update::Result {
+            action: change,
+            result: Ok(serde_json::json!({})),
+        });
+        assert!(!backend.setting_models.contains("s1"));
+        assert!(backend.send("s1", "first message".into(), vec![]));
+        assert!(matches!(actions.try_recv().unwrap(), Action::Prompt { .. }));
+    }
+
+    #[test]
+    fn rejected_model_change_preserves_previous_model_and_allows_retry() {
+        let (mut backend, mut actions) = isolated_backend();
+        backend.view = ViewModel::demo();
+        backend.view.online = true;
+        let previous = backend.view.session("demo-1").unwrap().model.clone();
+        let change = Action::SetModel {
+            session: "demo-1".into(),
+            model: "invalid".into(),
+        };
+        assert!(backend.submit(change.clone()));
+        actions.try_recv().unwrap();
+        backend.apply(Update::Result {
+            action: change,
+            result: Err("Model unavailable".into()),
+        });
+        assert!(!backend.setting_models.contains("demo-1"));
+        assert_eq!(backend.view.session("demo-1").unwrap().model, previous);
+        assert_eq!(backend.view.error.as_deref(), Some("Model unavailable"));
+        assert!(backend.submit(Action::SetModel {
+            session: "demo-1".into(),
+            model: "valid".into()
+        }));
+    }
+
+    #[test]
+    fn preparing_session_never_submits_a_prompt() {
+        let (mut backend, mut actions) = isolated_backend();
+        let create = Action::CreateAgent {
+            workspace: "w1".into(),
+            provider: Some("talos".into()),
+            title: None,
+        };
+        assert!(backend.submit(create.clone()));
+        assert!(matches!(
+            actions.try_recv().unwrap(),
+            Action::CreateAgent { .. }
+        ));
+        backend.apply(Update::Result {
+            action: create,
+            result: Ok(serde_json::json!({
+                "session": {"id": "s1", "agent_id": "a1"},
+                "agent": {"provider": "talos"}
+            })),
+        });
+        assert_eq!(backend.created_session.as_deref(), Some("s1"));
+        assert!(backend.ready.contains("s1"));
+        assert!(actions.try_recv().is_err());
+        assert!(!backend.view.entries.contains_key("s1"));
+    }
+
     #[test]
     fn late_prompt_acceptance_does_not_restart_a_finished_run() {
         let mut backend = Backend::new(|| {}, true);
@@ -1321,6 +1459,19 @@ mod tests {
         assert_eq!(parsed[0].models[0].label, "Model 1");
         assert_eq!(parsed[0].modes[0].0, "auto");
         assert!(parsed[0].default);
+    }
+
+    #[test]
+    fn independent_model_catalogue_preserves_full_ids_and_labels() {
+        let catalogue = serde_json::json!([
+            {"id": "openai/gpt-6.1-sol", "label": "gpt-6.1-sol"},
+            {"id": "deepseek/deepseek-v4-pro", "label": "DeepSeek V4 Pro"}
+        ]);
+        let parsed = parse_model_summaries(catalogue.as_array().map(Vec::as_slice));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "openai/gpt-6.1-sol");
+        assert_eq!(parsed[0].label, "gpt-6.1-sol");
+        assert_eq!(parsed[1].id, "deepseek/deepseek-v4-pro");
     }
 
     #[test]

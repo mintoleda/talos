@@ -198,6 +198,13 @@ pub trait ProviderSession: Send + Sync {
 pub trait AgentProvider: Send + Sync {
     fn id(&self) -> &ProviderId;
     async fn diagnostic(&self) -> ProviderDiagnostic;
+    /// Discover models without creating a user conversation when supported.
+    async fn discover_models(&self) -> Result<Vec<ProviderModel>, ProviderError> {
+        Err(ProviderError::Unsupported {
+            provider: self.id().to_string(),
+            feature: "independent model discovery",
+        })
+    }
     async fn create_session(
         &self,
         cwd: &Path,
@@ -278,6 +285,38 @@ impl AgentProvider for AcpProvider {
         }
     }
 
+    async fn discover_models(&self) -> Result<Vec<ProviderModel>, ProviderError> {
+        let client = AcpClient::spawn(self.process_config()).await?;
+        let result = async {
+            client.initialize().await?;
+            client.list_models().await
+        }
+        .await;
+        client.shutdown(Duration::from_secs(1)).await;
+        let catalog = match result {
+            Ok(catalog) => catalog,
+            Err(AcpError::UnsupportedCapability(_)) => {
+                return Err(ProviderError::Unsupported {
+                    provider: self.id.to_string(),
+                    feature: "independent model discovery",
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(catalog
+            .models
+            .into_iter()
+            .map(|model| ProviderModel {
+                id: model.model_id.clone(),
+                label: model.name,
+                description: model.description,
+                thinking_options: Vec::new(),
+                default_thinking_option_id: None,
+                available: true,
+            })
+            .collect())
+    }
+
     async fn create_session(
         &self,
         cwd: &Path,
@@ -313,14 +352,19 @@ impl AgentProvider for AcpProvider {
 }
 
 impl AcpProvider {
+    fn process_config(&self) -> ProcessConfig {
+        let mut process = ProcessConfig::new(&self.config.command);
+        process.args.clone_from(&self.config.args);
+        process.env.clone_from(&self.config.env);
+        process.cwd.clone_from(&self.config.cwd);
+        process
+    }
+
     async fn spawn_client(
         &self,
         permissions: Arc<dyn PermissionHandler>,
     ) -> Result<AcpClient, ProviderError> {
-        let mut process = ProcessConfig::new(&self.config.command);
-        process.args = self.config.args.clone();
-        process.env = self.config.env.clone();
-        process.cwd = self.config.cwd.clone();
+        let process = self.process_config();
         let bridge: Arc<dyn AcpPermissionHandler> = Arc::new(AcpPermissionBridge {
             handler: permissions,
         });

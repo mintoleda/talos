@@ -12,6 +12,23 @@ import (
 	"github.com/mintoleda/talos/internal/session"
 )
 
+func TestBuildRequiresModelSelectionBeforeCreatingTranscript(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := t.TempDir()
+	built, err := Build(context.Background(), BuildOpts{
+		Cfg: &config.Config{BaseDir: filepath.Join(home, ".talos")},
+		Dir: dir, SessionID: "unconfigured", NoTools: true,
+	})
+	if built != nil || err == nil || !strings.Contains(err.Error(), "no model selected") {
+		t.Fatalf("unconfigured build = %v, %v", built, err)
+	}
+	path := filepath.Join(session.SessionsDir(), session.ProjectHash(dir), "unconfigured.jsonl")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("unconfigured build created a transcript: %v", err)
+	}
+}
+
 func TestBuildRestoresDirectoryModelUnlessExplicitlyOverridden(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

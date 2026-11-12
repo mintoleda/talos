@@ -251,6 +251,15 @@ pub struct SessionModels {
     pub extra: Map<String, Value>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogResponse {
+    #[serde(default)]
+    pub models: Vec<ModelInfo>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {

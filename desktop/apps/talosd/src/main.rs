@@ -943,18 +943,13 @@ impl Daemon {
     async fn snapshot_provider(&self, diagnostic: &ProviderDiagnostic) -> Result<Value, RpcError> {
         let mut value = provider_diagnostic_value(diagnostic);
         let provider_id = diagnostic.descriptor.id.clone();
-        // Snapshot is best-effort: a provider that cannot list models (or is
-        // currently unavailable) still renders with an empty picker rather than
-        // failing the whole snapshot.
-        let detailed_models = match self.service.list_models(&provider_id).await {
-            Ok(models) => models,
-            Err(
-                CoreError::Provider(ProviderError::Unsupported { .. })
-                | CoreError::ProviderUnavailable(_)
-                | CoreError::ProviderNotRegistered(_),
-            ) => Vec::new(),
-            Err(error) => return Err(core_error(error)),
-        };
+        // Snapshots only reuse models already advertised by live sessions. The
+        // model picker requests independent discovery on demand.
+        let detailed_models = self
+            .service
+            .list_session_models(&provider_id)
+            .await
+            .map_err(core_error)?;
         let session_modes = match self.service.list_modes(&provider_id).await {
             Ok(modes) => modes,
             Err(

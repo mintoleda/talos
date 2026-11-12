@@ -34,18 +34,29 @@ revisions.
   Normal runs use `~/.talosd`; tests use temporary homes. Provider credentials and
   the `talos acp` executable must be configured separately for live model calls.
 - Choose a workspace, or open a folder to register one. Send creates a real agent
-  session and forwards the first prompt; recent rows are actual persisted sessions.
+  session if needed and forwards the first prompt; recent rows are actual persisted sessions.
 - Enter sends; Shift+Enter inserts a newline. Drafts are retained per conversation.
   Stop cancels an active run. Failed prompts restore their draft; explicitly
   resending an unchanged failed prompt reuses the original acceptance key.
 - Streams assistant/thinking/tool events, replays saved history on selection and
   reconnect, and presents real Allow once / Deny permission decisions.
-- Model and mode controls use advertised options for idle sessions. Provider
-  selection for a new conversation uses available providers. Model selection
-  becomes available after the first message creates the session.
+- Model controls use advertised options for idle sessions. Opening the picker in a
+  new conversation discovers Talos models without creating a session. The unsent
+  prompt, images, and selected routing ID remain a local draft. Send creates the
+  conversation, applies the chosen model, waits for acknowledgement, then submits
+  the prompt. A model-change failure keeps the prompt editable. Drafts are currently
+  in-memory and are not crash-persistent.
+  The picker opens above the composer and follows multiline growth. Its search bar
+  filters names and model IDs within the selected inference provider. The icon-only
+  rail groups the catalogue by model-ID provider (Codex, DeepSeek, etc.). OpenAI
+  and Codex IDs share one Codex group using the OpenAI icon. Groups are
+  not ACP agent backends: Talos is never shown as a model provider. Hover icons
+  for provider names. Unknown providers use a generic icon rather than a guessed
+  brand. Switching groups preserves the session and full routing IDs; the model
+  list marks the current choice. Escape closes the picker and restores composer focus.
 - Image selection goes through shared validation; click an image chip to remove it.
 - `/new` starts a fresh conversation; `/workspace` opens the folder picker.
-  The gear opens appearance controls and connection diagnostics.
+  Settings opens appearance controls and connection diagnostics.
 
 ## Frosted appearance
 
@@ -60,7 +71,7 @@ Floating menus paint after the conversation, with blur and sharp controls kept
 inside one scene layer. Opaque mode disables both transparent window appearance
 and the app's backdrop-blur passes.
 
-Use **Appearance & diagnostics** at the bottom of the sidebar to switch modes
+Use **Settings** at the bottom of the sidebar to switch appearance modes
 for the current run, or choose the initial mode:
 
 ```sh
