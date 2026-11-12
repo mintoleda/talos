@@ -70,14 +70,33 @@ fn daemon_workflow() {
     }));
     wait(&mut backend, &wakes, |b| b.created_session.is_some());
     let session = backend.created_session.take().unwrap();
+    // The cold-start catalogue is available from session creation, with no prompt.
+    assert!(backend.submit(Action::Refresh));
+    wait(&mut backend, &wakes, |b| {
+        b.view
+            .provider("talos")
+            .is_some_and(|p| p.models.iter().any(|m| m.id == "vendor/model"))
+    });
+    assert!(!backend.view.running(&session));
+    assert!(
+        !backend
+            .view
+            .entries
+            .get(&session)
+            .into_iter()
+            .flatten()
+            .any(|e| matches!(e.kind, EntryKind::User { .. }))
+    );
     assert!(backend.submit(Action::SetModel {
         session: session.clone(),
         model: "vendor/model".into()
     }));
+    assert!(backend.setting_models.contains(&session));
     wait(&mut backend, &wakes, |b| {
-        b.view
-            .session(&session)
-            .is_some_and(|s| s.model.as_deref() == Some("vendor/model"))
+        !b.setting_models.contains(&session)
+            && b.view
+                .session(&session)
+                .is_some_and(|s| s.model.as_deref() == Some("vendor/model"))
     });
     assert!(backend.submit(Action::Rpc(talos_ipc::Command::SetMode {
         session_id: session.clone(),

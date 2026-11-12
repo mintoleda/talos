@@ -2094,7 +2094,8 @@ impl AppService {
         Ok(summaries)
     }
 
-    /// Aggregate the rich model catalogue for a provider from its loaded sessions.
+    /// Discover provider models independently where supported, then merge in
+    /// session-advertised metadata for providers that expose only session lists.
     pub async fn list_models(&self, provider_id: &ProviderId) -> CoreResult<Vec<ProviderModel>> {
         self.ensure_running()?;
         let provider = self.require_provider(provider_id).await?;
@@ -2111,6 +2112,28 @@ impl AppService {
             }
             .into());
         }
+        let mut models = match provider.discover_models().await {
+            Ok(models) => models,
+            Err(ProviderError::Unsupported { .. }) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let mut seen: HashSet<String> = models.iter().map(|model| model.id.clone()).collect();
+        for model in self.list_session_models(provider_id).await? {
+            if seen.insert(model.id.clone()) {
+                models.push(model);
+            }
+        }
+        models.sort_by_key(|model| model.id.clone());
+        Ok(models)
+    }
+
+    /// Return model metadata already available from live sessions without
+    /// starting provider discovery or allocating another session.
+    pub async fn list_session_models(
+        &self,
+        provider_id: &ProviderId,
+    ) -> CoreResult<Vec<ProviderModel>> {
+        self.ensure_running()?;
         let mut models = Vec::new();
         let mut seen = HashSet::new();
         for runtime in self.inner.sessions.read().await.values() {

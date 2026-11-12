@@ -29,7 +29,7 @@ talos-acp/
 talos-process/       shared child supervision and process-tree shutdown
 ```
 
-Define an async provider-neutral `Provider`/`AgentSession` port (for example `capabilities`, `list_models`, `start_session`, `prompt`, mode/config update, cancel, and event stream) for the application layer. The ACP implementation owns protocol details; the UI should not branch on raw JSON. A provider configuration entry selects `{provider_id, kind, command, args, env, host, enabled, default}`. Talos uses `talos acp`; Claude Code uses the official `@agentclientprotocol/claude-agent-acp` adapter. Keep raw provider/model identifiers separate: `provider_id = "talos"` is not the same thing as Talos' ACP model ID such as `openai/deepseek-chat`. Treat `provider_id = "claude"` similarly.
+Define an async provider-neutral `Provider`/`AgentSession` port (for example `capabilities`, `list_models`, `start_session`, `prompt`, mode/config update, cancel, and event stream) for the application layer. The ACP implementation owns protocol details; the UI should not branch on raw JSON. A provider configuration entry selects `{provider_id, kind, command, args, env, host, enabled, default}`. Talos uses `talos acp`; Claude Code uses the official `@agentclientprotocol/claude-agent-acp` adapter. Keep raw provider/model identifiers separate: `provider_id = "talos"` is not the same thing as Talos' ACP model ID such as `deepseek/deepseek-chat`. Treat `provider_id = "claude"` similarly.
 
 Core records should include:
 
@@ -66,17 +66,31 @@ Send `initialize` once per process. Talos' accepted request shape is:
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}
 ```
 
-Only advertise client FS/terminal capabilities that Paseo actually implements. Talos does not require filesystem callbacks. Validate the returned protocol version and retain the full capabilities and `agentInfo`. Current Talos response advertises `loadSession: true`, prompt `image: true`, `audio: false`, `embeddedContext: true`, MCP `http: true` and `sse: true`, plus session `list` and `close`; `authMethods` is `[]`, and `authenticate` is a no-op. Its handler tolerates `$/...` extension notifications. Send the ACP initialized notification if required by the negotiated ACP version; an unknown notification is harmless to this Talos handler, but do not treat that as a general ACP guarantee.
+Only advertise client FS/terminal capabilities that Paseo actually implements. Talos does not require filesystem callbacks. Validate the returned protocol version and retain the full capabilities and `agentInfo`. Current Talos response advertises `loadSession: true`, prompt `image: true`, `audio: false`, `embeddedContext: true`, MCP `http: true` and `sse: true`, plus session `list` and `close`; `authMethods` is `[]`, and `authenticate` is a no-op. Talos also advertises `agentCapabilities.extensions.talos.modelCatalog: "talos/list_models"`; this optional extension returns models without allocating a user session. Its handler tolerates `$/...` extension notifications. Send the ACP initialized notification if required by the negotiated ACP version; an unknown notification is harmless to this Talos handler, but do not treat that as a general ACP guarantee.
 
 Gate optional calls by capabilities: do not call load/list/close if the agent did not advertise them; do not offer image/audio/config/mode controls the agent cannot accept. For unknown `session/update` variants, preserve and forward an `AgentEvent::Extension`/diagnostic rather than crashing the reader or dropping the process. An empty `authMethods` means Paseo should not invent a Talos ACP login flow; authentication belongs to Talos config/environment.
 
 ## 5. Session creation, persistence, resume, and close
 
+### Model catalogue and draft lifecycle
+
+For Talos, call the advertised `talos/list_models` extension to populate a new-conversation picker. It returns `{models:[{modelId,name,description?}]}` from Talos' configured catalogue without `session/new`, a transcript, or a persisted Paseo conversation. Do not create an empty session merely to browse models. Providers that do not advertise independent discovery may contribute catalogues from already-open sessions; absence of a catalogue must not trigger throwaway session creation.
+
+Keep an unsent prompt, image attachments, and selected full model-routing ID in local draft state. On Send, create the provider session, apply the selected model and wait for acknowledgement, then submit the prompt. Preserve the draft on creation/model-selection failure; do not submit before model acknowledgement or create a second session on retry. Show the conversation in Recent only as a result of the user's explicit Send, never as a side effect of opening the picker.
+
 ### Create
 
 Call `session/new` with the workspace cwd and an explicit `mcpServers` array (empty when none). The Paseo platform MCP endpoint should be included here when enabled; details are in §9. Talos validates the cwd as an existing directory, finds the repository root, allocates its own random native session ID, and returns that ID plus modes, models, and config options. Save the Paseo/native mapping as soon as the response arrives and before sending the first prompt. If persistence fails, best-effort `session/close` the returned native session and surface the error.
 
-Talos deliberately builds the runtime lazily: `session/new` creates no transcript, MCP connection, inference request, or checkpoint until first prompt. It does obtain the model catalogue while returning session state, which can make bounded provider model-list API calls. Do not equate a successful ACP session allocation with a transcript already existing. Talos sends `available_commands_update` **after** the `session/new` response, so register the returned native ID before routing that notification.
+There is no implicit model/provider/endpoint default. An unconfigured session
+returns an empty `currentModelId` and only discovered `availableModels`, without a
+synthetic default entry. A prompt requires an explicit model selection
+(`session/set_model`) and otherwise fails with a no-model-selected error. Explicit
+configuration and saved-session selections are preserved. `session/new` still
+returns model state for newly created sessions, but model browsing uses the
+session-independent extension above.
+
+Talos deliberately builds the runtime lazily: `session/new` creates no transcript, MCP connection, inference request, or checkpoint until first prompt. It does obtain model state while returning a new session, which can make bounded provider model-list API calls. Do not equate a successful ACP session allocation with a transcript already existing. Talos sends `available_commands_update` **after** the `session/new` response, so register the returned native ID before routing that notification.
 
 ### Resume/load
 

@@ -67,6 +67,8 @@ func (a *Agent) handle(ctx context.Context, method string, params json.RawMessag
 	switch method {
 	case "initialize":
 		return a.initialize(params)
+	case "talos/list_models":
+		return a.listModelCatalog(ctx), nil
 	case "authenticate":
 		return struct{}{}, nil
 	case "session/new":
@@ -148,7 +150,11 @@ func (a *Agent) initialize(params json.RawMessage) (any, error) {
 				List:  &struct{}{},
 				Close: &struct{}{},
 			},
+			Extensions: map[string]any{
+				"talos": map[string]any{"modelCatalog": "talos/list_models"},
+			},
 		},
+
 		AuthMethods: []any{},
 		AgentInfo:   &Implementation{Name: "talos", Title: "Talos", Version: version.VERSION},
 	}, nil
@@ -304,6 +310,17 @@ func (a *Agent) listSessions(params json.RawMessage) (any, error) {
 		})
 	}
 	return resp, nil
+}
+
+// listModelCatalog exposes configured models without allocating an ACP session.
+func (a *Agent) listModelCatalog(ctx context.Context) ModelCatalogResponse {
+	entries := a.modelCatalog(ctx)
+	response := ModelCatalogResponse{Models: make([]ModelInfo, 0, len(entries))}
+	for _, entry := range entries {
+		full := entry.Full()
+		response.Models = append(response.Models, ModelInfo{ModelID: full, Name: full})
+	}
+	return response
 }
 
 // modelCatalog lists models once per process; it hits provider APIs, so the

@@ -74,9 +74,8 @@ func Load() (*Config, error) {
 		baseDir = configuredBaseDir
 	}
 	cfg := &Config{
-		BaseURL:                   "https://api.deepseek.com",
-		Model:                     "deepseek-chat",
-		Provider:                  "openai",
+		// Provider, model, and endpoint are selected explicitly; no legacy
+		// OpenAI-compatible DeepSeek fallback is installed for new homes.
 		PermissionMode:            safety.ModeAuto,
 		BashTimeout:               120 * time.Second,
 		BashMaxTimeout:            600 * time.Second,

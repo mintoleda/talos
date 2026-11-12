@@ -135,6 +135,10 @@ func Build(ctx context.Context, o BuildOpts) (*Built, error) {
 		cfg.Override("", o.Model, "")
 	}
 
+	if cfg.Provider == "" || cfg.Model == "" {
+		return nil, fmt.Errorf("no model selected: set provider and model in config.toml or use --provider and --model")
+	}
+
 	if _, statErr := os.Stat(sess.Path); statErr == nil {
 		tx, err = session.Load(sess.Path)
 	} else {

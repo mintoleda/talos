@@ -19,9 +19,9 @@ managed via `/login` in the tui, or edit directly:
 ## config file (`~/.talos/config.toml`)
 
 ```toml
-base_url               = "https://api.deepseek.com"
-model                  = "deepseek-chat"
-provider               = "openai"
+base_url               = ""
+model                  = "gpt-6.1-sol"
+provider               = "openai-codex"
 permission_mode        = "auto"
 bash_timeout_seconds   = 120
 bash_max_timeout_seconds = 600
@@ -29,6 +29,12 @@ bash_max_output        = 30720
 thinking_level         = "off"
 search_url             = ""
 ```
+
+The provider/model above is an explicit example, not an implicit default. New
+homes have no provider, model, or endpoint selected. Configure them here, use
+`--provider` and `--model`, or select a model through ACP before prompting.
+Registered providers resolve their own endpoint when `base_url` is empty.
+Existing explicit configuration and saved-session model selections are preserved.
 
 `permission_mode` options: `plan`, `prompt`, `auto`, `headless`.
 

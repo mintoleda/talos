@@ -9,11 +9,12 @@
 #[cfg(test)]
 mod acceptance;
 mod glass;
+mod model_picker;
 mod workflow;
 use glass::{GlassMode, GlassSettings, frosted};
 use talos_ui_core::{
     backend::{Action, Backend},
-    state::{self, EntryKind, PendingState},
+    state::{self, EntryKind, PendingState, SessionStatus},
 };
 
 use std::{
@@ -37,8 +38,8 @@ const SECONDARY: u32 = 0xB4BDB7;
 const MUTED: u32 = 0x89958D;
 const PAPER: u32 = 0x080B09;
 const BORDER: u32 = 0x29322C;
-const BLUE: u32 = 0x8EB5D2;
-const BLUE_WASH: u32 = 0x1B2A33;
+const ACCENT: u32 = 0xC9D5A8;
+const ACCENT_WASH: u32 = 0x303A2A;
 const ORANGE: u32 = 0xD69A6C;
 const GREEN: u32 = 0x79B68C;
 const DANGER: u32 = 0xD98078;
@@ -59,6 +60,11 @@ impl AssetSource for Assets {
             "icons/chevron-down.svg" => Some(include_bytes!("../assets/icons/chevron-down.svg")),
             "icons/sparkles.svg" => Some(include_bytes!("../assets/icons/sparkles.svg")),
             "icons/openai.svg" => Some(include_bytes!("../assets/icons/openai.svg")),
+            "icons/anthropic.svg" => Some(include_bytes!("../assets/icons/anthropic.svg")),
+            "icons/claude-mark.svg" => Some(include_bytes!("../assets/icons/claude-mark.svg")),
+            "icons/gemini.svg" => Some(include_bytes!("../assets/icons/gemini.svg")),
+            "icons/deepseek.svg" => Some(include_bytes!("../assets/icons/deepseek.svg")),
+            "icons/mistral.svg" => Some(include_bytes!("../assets/icons/mistral.svg")),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
@@ -76,6 +82,11 @@ impl AssetSource for Assets {
             "icons/chevron-down.svg",
             "icons/sparkles.svg",
             "icons/openai.svg",
+            "icons/anthropic.svg",
+            "icons/claude-mark.svg",
+            "icons/gemini.svg",
+            "icons/deepseek.svg",
+            "icons/mistral.svg",
         ];
         Ok(ASSETS
             .iter()
@@ -100,11 +111,20 @@ struct AppView {
     sidebar_open: bool,
     editor: Entity<TextareaState>,
     _editor_events: gpui::Subscription,
+    model_search: Entity<TextareaState>,
+    _model_search_events: gpui::Subscription,
+    picker_provider: Option<String>,
+    picker_group: Option<String>,
+    picker_show_all: bool,
+    picker_load_attempted: bool,
+    viewport_height: f32,
     _backend_task: gpui::Task<()>,
     drafts: HashMap<String, String>,
     images: HashMap<String, Vec<String>>,
     configured_model: Option<String>,
+    draft_model: Option<String>,
     pending: Option<PendingPrompt>,
+    pending_model_session: Option<String>,
     sending: HashSet<String>,
     menu: Option<Menu>,
     notice: Option<String>,
@@ -115,7 +135,7 @@ impl AppView {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Ask...")
+                .placeholder("Describe a task, ask a question, or paste an error…")
                 .auto_grow(1, 7)
                 .submit_on_enter(true)
         });
@@ -125,8 +145,8 @@ impl AppView {
                 muted_foreground: rgb(MUTED).into(),
                 background: hsla(0., 0., 0., 0.),
                 border: rgb(BORDER).into(),
-                selection: rgb(BLUE_WASH).into(),
-                caret: rgb(BLUE).into(),
+                selection: rgb(ACCENT_WASH).into(),
+                caret: rgb(ACCENT).into(),
                 ..Default::default()
             });
             state.focus(window, cx);
@@ -143,6 +163,26 @@ impl AppView {
                 }
                 _ => {}
             });
+        let model_search = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Search models…")
+                .auto_grow(1, 1)
+                .submit_on_enter(true)
+        });
+        model_search.update(cx, |state, _| {
+            state.set_editor_style(InputEditorStyle {
+                foreground: rgb(INK).into(),
+                muted_foreground: rgb(MUTED).into(),
+                background: hsla(0., 0., 0., 0.),
+                border: hsla(0., 0., 0., 0.),
+                selection: rgb(ACCENT_WASH).into(),
+                caret: rgb(INK).into(),
+                ..Default::default()
+            });
+        });
+        let model_search_events = cx.subscribe_in(&model_search, window, |_, _, _, _, cx| {
+            cx.notify();
+        });
         // Coalesce wakeups, but drain every queued batch before sleeping. No idle polling.
         let (wake, wakes) = async_channel::bounded(1);
         let backend = Backend::new(
@@ -158,6 +198,7 @@ impl AppView {
                 }
             }
         });
+        let configured_model = configured_model();
         Self {
             backend,
             selected: None,
@@ -166,11 +207,20 @@ impl AppView {
             sidebar_open: false,
             editor,
             _editor_events: editor_events,
+            model_search,
+            _model_search_events: model_search_events,
+            picker_provider: None,
+            picker_group: None,
+            picker_show_all: false,
+            picker_load_attempted: false,
+            viewport_height: 720.,
             _backend_task: backend_task,
             drafts: HashMap::new(),
             images: HashMap::new(),
-            configured_model: configured_model(),
+            configured_model: configured_model.clone(),
+            draft_model: configured_model,
             pending: None,
+            pending_model_session: None,
             sending: HashSet::new(),
             menu: None,
             notice: None,
@@ -288,28 +338,57 @@ impl AppView {
             self.workspace = Some(id);
             self.backend.submit(Action::Refresh);
         }
-        if let Some(id) = self.backend.created_session.take()
-            && let Some(pending) = self.pending.take()
-        {
+        if let Some(id) = self.backend.created_session.take() {
             self.selected = Some(id.clone());
-            self.drafts.insert(id.clone(), pending.text.clone());
-            self.images.insert(id.clone(), pending.images.clone());
-            if self.backend.send(&id, pending.text, pending.images) {
+            if let Some(pending) = self.pending.clone() {
                 self.drafts.remove(NEW);
+                self.drafts.insert(id.clone(), pending.text);
                 self.images.remove(NEW);
-                self.drafts.remove(&id);
-                self.sending.insert(id);
-                self.set_editor(String::new(), window, cx);
+                if !pending.images.is_empty() {
+                    self.images.insert(id.clone(), pending.images);
+                }
+                if let Some(model) = pending.model {
+                    if self.backend.submit(Action::SetModel {
+                        session: id.clone(),
+                        model,
+                    }) {
+                        self.pending_model_session = Some(id);
+                    } else {
+                        self.pending = None;
+                        let draft = self.drafts.get(&id).cloned().unwrap_or_default();
+                        self.set_editor(draft, window, cx);
+                    }
+                } else {
+                    self.send_pending_prompt(&id, window, cx);
+                }
             }
         }
         for action in std::mem::take(&mut self.backend.completed) {
-            if let Action::Prompt { session, .. } = action {
-                self.sending.remove(&session);
-                self.images.remove(&session);
+            match action {
+                Action::Prompt { session, .. } => {
+                    self.sending.remove(&session);
+                    self.images.remove(&session);
+                }
+                Action::SetModel { session, .. }
+                    if self.pending_model_session.as_deref() == Some(session.as_str()) =>
+                {
+                    self.send_pending_prompt(&session, window, cx);
+                }
+                _ => {}
+            }
+        }
+        if let Some(session) = self.pending_model_session.clone()
+            && !self.backend.setting_models.contains(&session)
+        {
+            // The model update failed; keep the submitted prompt as an editable draft.
+            self.pending_model_session = None;
+            self.pending = None;
+            if self.selected.as_deref() == Some(session.as_str()) {
+                let draft = self.drafts.get(&session).cloned().unwrap_or_default();
+                self.set_editor(draft, window, cx);
             }
         }
         if std::mem::take(&mut self.backend.agent_creation_failed) {
-            // Unrelated failures must not discard an in-flight session creation.
             self.pending = None;
         }
         if let Some(error) = self.backend.view.error.take() {
@@ -318,11 +397,36 @@ impl AppView {
         if let Some(notice) = self.backend.view.notice.take() {
             self.notice = Some(notice);
         }
+        self.ensure_picker_models(cx);
         self.ensure_loaded();
         cx.notify();
     }
+    fn send_pending_prompt(&mut self, session: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.clone() else {
+            return;
+        };
+        if self.backend.send(session, pending.text, pending.images) {
+            self.pending = None;
+            self.pending_model_session = None;
+            self.sending.insert(session.to_owned());
+            self.drafts.remove(session);
+            self.set_editor(String::new(), window, cx);
+        } else {
+            self.pending = None;
+            self.pending_model_session = None;
+            let draft = self.drafts.get(session).cloned().unwrap_or_default();
+            self.set_editor(draft, window, cx);
+        }
+    }
+
     fn send_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending.is_some() || self.running() {
+        if self.pending.is_some()
+            || self.running()
+            || self
+                .selected
+                .as_ref()
+                .is_some_and(|id| self.backend.setting_models.contains(id))
+        {
             return;
         }
         let text = self.editor.read(cx).value().trim().to_owned();
@@ -353,6 +457,22 @@ impl AppView {
             cx.notify();
             return;
         }
+        if self.selected.is_none() && self.draft_model.is_none() {
+            let provider = self.provider_id().to_owned();
+            let must_choose_model =
+                self.backend.view.provider(&provider).is_some_and(|item| {
+                    item.supports("model_selection") && !item.models.is_empty()
+                });
+            if must_choose_model {
+                self.notice = Some("Choose a model before starting this conversation.".into());
+                self.picker_provider = Some(provider);
+                self.picker_load_attempted = false;
+                self.menu = Some(Menu::Models);
+                self.ensure_picker_models(cx);
+                cx.notify();
+                return;
+            }
+        }
         if let Some(id) = self.selected.clone() {
             if self.backend.ready.contains(&id) {
                 // An uncertain acceptance is retried only explicitly, with its original request key.
@@ -380,6 +500,10 @@ impl AppView {
             let pending = PendingPrompt {
                 text: text.clone(),
                 images,
+                model: self
+                    .draft_model
+                    .clone()
+                    .or_else(|| self.configured_model.clone()),
             };
             if self.backend.submit(Action::CreateAgent {
                 workspace,
@@ -484,6 +608,36 @@ impl AppView {
         })
         .detach();
     }
+    fn ensure_picker_models(&mut self, cx: &mut Context<Self>) {
+        if self.menu != Some(Menu::Models)
+            || self.pending.is_some()
+            || self.picker_load_attempted
+            || !self.backend.view.online
+        {
+            return;
+        }
+        let provider = self
+            .picker_provider
+            .as_deref()
+            .unwrap_or_else(|| self.provider_id())
+            .to_owned();
+        if let Some(summary) = self.backend.view.provider(&provider) {
+            if !summary.available {
+                return;
+            }
+            if !summary.models.is_empty() {
+                self.picker_load_attempted = true;
+                return;
+            }
+            // Fetch the advertised catalogue without allocating a conversation.
+            self.picker_load_attempted =
+                self.backend
+                    .submit(Action::Rpc(talos_ipc::Command::ListModels {
+                        provider_id: provider,
+                    }));
+        }
+        cx.notify();
+    }
     fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
         self.menu = if self.menu == Some(menu) {
             None
@@ -495,10 +649,11 @@ impl AppView {
 
     fn shell(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let width = f32::from(window.viewport_size().width);
+        self.viewport_height = f32::from(window.viewport_size().height);
         let glass = *cx.global::<GlassSettings>();
         let title = self
             .session()
-            .map_or("New conversation", |s| s.title.as_str())
+            .map_or("New session", |s| s.title.as_str())
             .to_owned();
         let workspace = self
             .backend
@@ -506,8 +661,10 @@ impl AppView {
             .workspaces
             .iter()
             .find(|w| Some(&w.id) == self.workspace.as_ref())
-            .map_or("Choose workspace", |w| w.name.as_str())
-            .to_owned();
+            .map_or_else(
+                || "Choose a workspace".into(),
+                |workspace| format!("Workspace · {}", workspace.name),
+            );
         div()
             .id("talos-shell")
             .relative()
@@ -564,13 +721,13 @@ impl AppView {
                                                     .gap(px(2.))
                                                     .child(label(
                                                         title,
-                                                        13.,
+                                                        14.,
                                                         INK,
                                                         FontWeight::MEDIUM,
                                                     ))
                                                     .child(label(
                                                         workspace,
-                                                        10.5,
+                                                        11.5,
                                                         MUTED,
                                                         FontWeight::NORMAL,
                                                     )),
@@ -584,7 +741,9 @@ impl AppView {
                             } else {
                                 self.conversation_surface(cx).into_any_element()
                             })
-                            .when_some(self.menu, |d, menu| d.child(self.menu_surface(menu, cx)))
+                            .when_some(self.menu.filter(|menu| *menu != Menu::Models), |d, menu| {
+                                d.child(self.menu_surface(menu, cx))
+                            })
                             .when_some(
                                 self.notice
                                     .clone()
@@ -660,87 +819,162 @@ impl AppView {
             .view
             .sessions_for(self.workspace.as_deref())
             .into_iter()
-            .filter(|s| !s.archived)
+            .filter(|session| !session.archived)
         {
             let id = session.id.clone();
             let selected = self.selected.as_ref() == Some(&id);
-            list = list.child(
-                div()
-                    .id(SharedString::from(format!("session-{id}")))
-                    .px(px(12.))
-                    .py(px(10.))
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(if selected {
-                        hsla(0.56, 0.34, 0.42, 0.28)
-                    } else {
-                        hsla(0.0, 0.0, 1.0, 0.0)
-                    })
-                    .bg(if selected {
-                        hsla(0.56, 0.28, 0.18, 0.62)
-                    } else {
-                        hsla(0.0, 0.0, 0.0, 0.0)
-                    })
-                    .hover(|s| s.bg(hsla(0.0, 0.0, 1.0, 0.055)))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select(Some(id.clone()), window, cx);
-                    }))
-                    .child(label(session.title.clone(), 12.5, INK, FontWeight::MEDIUM))
-                    .child(label(
-                        format!("{} · {}", session.provider, session.status.label()),
-                        10.5,
-                        MUTED,
-                        FontWeight::NORMAL,
-                    )),
-            );
+            let detail = if session.status == SessionStatus::Idle {
+                session.time.clone()
+            } else {
+                session.status.label().to_owned()
+            };
+            let mut row = div()
+                .id(SharedString::from(format!("session-{id}")))
+                .w_full()
+                .min_w_0()
+                .px(px(12.))
+                .py(px(10.))
+                .rounded(px(10.))
+                .border_1()
+                .border_color(if selected {
+                    hsla(0.24, 0.22, 0.56, 0.32)
+                } else {
+                    hsla(0.0, 0.0, 1.0, 0.0)
+                })
+                .bg(if selected {
+                    hsla(0.24, 0.12, 0.18, 0.72)
+                } else {
+                    hsla(0.0, 0.0, 0.0, 0.0)
+                })
+                .hover(|style| style.bg(hsla(0.0, 0.0, 1.0, 0.055)))
+                .cursor_pointer()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select(Some(id.clone()), window, cx);
+                }))
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .font_family("Inter")
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_size(px(13.))
+                        .text_color(rgb(INK))
+                        .child(session.title.clone()),
+                );
+            if !detail.is_empty() {
+                row = row.child(label(detail, 11., MUTED, FontWeight::NORMAL));
+            }
+            list = list.child(row);
         }
         if self.backend.view.sessions.is_empty() {
             list = list.child(label(
                 if self.backend.view.online {
-                    "No conversations yet"
+                    "No sessions yet"
                 } else {
-                    "Connecting to talosd…"
+                    "Connecting…"
                 },
-                11.,
+                12.,
                 MUTED,
                 FontWeight::NORMAL,
             ));
         }
+        let workspace = self
+            .backend
+            .view
+            .workspaces
+            .iter()
+            .find(|workspace| Some(&workspace.id) == self.workspace.as_ref())
+            .map_or_else(
+                || "Choose workspace".into(),
+                |workspace| workspace.name.clone(),
+            );
         div()
-            .w(px(272.))
+            .w(px(264.))
             .flex_shrink_0()
             .h_full()
             .flex()
             .flex_col()
             .p(px(16.))
-            .gap(px(14.))
+            .gap(px(8.))
             .bg(cx.global::<GlassSettings>().wash(0.30))
             .border_r_1()
             .border_color(hsla(0.0, 0.0, 1.0, 0.07))
             .child(sidebar_action(
                 "new-conversation",
                 "icons/plus.svg",
-                "New conversation",
+                "New session",
                 cx.listener(|this, _, window, cx| this.select(None, window, cx)),
             ))
             .child(sidebar_action(
                 "workspace-picker",
                 "icons/folder.svg",
-                "Choose workspace",
+                workspace,
                 cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Workspaces, cx)),
             ))
-            .child(div().h(px(4.)))
-            .child(label("RECENT", 9.5, MUTED, FontWeight::BOLD))
+            .child(div().h(px(8.)))
+            .child(label("SESSIONS", 10., MUTED, FontWeight::BOLD))
             .child(list)
             .child(sidebar_action(
                 "appearance",
                 "icons/settings.svg",
-                "Appearance & diagnostics",
+                "Settings",
                 cx.listener(|this, _, _, cx| this.toggle_menu(Menu::Diagnostics, cx)),
             ))
     }
     fn new_surface(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let workspace = self
+            .backend
+            .view
+            .workspaces
+            .iter()
+            .find(|workspace| Some(&workspace.id) == self.workspace.as_ref())
+            .map_or_else(
+                || "Choose a workspace".into(),
+                |workspace| workspace.name.clone(),
+            );
+        let mut starters = div().w_full().flex().flex_wrap().gap(px(8.));
+        for (id, title, prompt) in [
+            (
+                "starter-review",
+                "Review code",
+                "Review this workspace for correctness, regressions, and missing tests.",
+            ),
+            (
+                "starter-debug",
+                "Investigate a bug",
+                "Help me investigate this issue and identify likely root causes.",
+            ),
+            (
+                "starter-plan",
+                "Plan a change",
+                "Help me plan this change before making any edits.",
+            ),
+        ] {
+            let prompt = prompt.to_owned();
+            starters = starters.child(
+                div()
+                    .id(id)
+                    .px(px(11.))
+                    .py(px(8.))
+                    .rounded(px(9.))
+                    .border_1()
+                    .border_color(hsla(0.0, 0.0, 1.0, 0.08))
+                    .bg(hsla(0.0, 0.0, 1.0, 0.025))
+                    .hover(|style| style.bg(hsla(0.0, 0.0, 1.0, 0.07)))
+                    .cursor_pointer()
+                    .child(label(title, 12., SECONDARY, FontWeight::MEDIUM))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let key = this.draft_key().to_owned();
+                        this.drafts.insert(key, prompt.clone());
+                        this.set_editor(prompt.clone(), window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
         div()
             .flex_1()
             .min_h_0()
@@ -757,17 +991,62 @@ impl AppView {
                     .max_w(px(760.))
                     .flex()
                     .flex_col()
-                    .items_center()
-                    .gap(px(16.))
-                    .child(label("Start a new session", 16., INK, FontWeight::MEDIUM))
-                    .child(label(
-                        "What would you like Talos to work on?",
-                        12.,
-                        MUTED,
-                        FontWeight::NORMAL,
-                    ))
-                    .child(div().h(px(8.)))
-                    .child(self.composer(cx)),
+                    .gap(px(18.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(7.))
+                            .child(label("A fresh start", 12., MUTED, FontWeight::MEDIUM))
+                            .child(
+                                div()
+                                    .font_family("Inter")
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(34.))
+                                    .line_height(px(42.))
+                                    .text_color(rgb(INK))
+                                    .child("What are you working on?"),
+                            )
+                            .child(label(
+                                "Start with a goal, a question, or a rough idea.",
+                                14.,
+                                SECONDARY,
+                                FontWeight::NORMAL,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("active-workspace")
+                            .w_full()
+                            .px(px(10.))
+                            .py(px(7.))
+                            .rounded(px(8.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .hover(|style| style.bg(hsla(0.0, 0.0, 1.0, 0.06)))
+                            .cursor_pointer()
+                            .child(icon("icons/folder.svg", 14., MUTED))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .font_family("Inter")
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(12.))
+                                    .text_color(rgb(SECONDARY))
+                                    .child(workspace),
+                            )
+                            .child(icon("icons/chevron-down.svg", 12., MUTED))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_menu(Menu::Workspaces, cx);
+                            })),
+                    )
+                    .child(self.composer(cx))
+                    .child(starters),
             )
     }
     fn conversation_surface(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -794,7 +1073,7 @@ impl AppView {
             messages = messages.child(self.timeline_entry(entry, cx));
         }
         if self.running() {
-            messages = messages.child(label("Talos is working…", 12., BLUE, FontWeight::MEDIUM));
+            messages = messages.child(label("Working…", 12., ACCENT, FontWeight::MEDIUM));
         }
         div()
             .flex_1()
@@ -849,12 +1128,12 @@ impl AppView {
                 .gap(px(8.))
                 .child(label(
                     if *streaming {
-                        "●  Talos is responding"
+                        "●  Assistant is responding"
                     } else {
-                        "Talos"
+                        "Assistant"
                     },
                     11.,
-                    if *streaming { GREEN } else { BLUE },
+                    if *streaming { GREEN } else { ACCENT },
                     FontWeight::MEDIUM,
                 ))
                 .child(label(text.clone(), 14., INK, FontWeight::NORMAL))
@@ -935,43 +1214,35 @@ impl AppView {
     }
     fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.running();
+        let preparing = self.pending.is_some()
+            || self
+                .selected
+                .as_ref()
+                .is_some_and(|id| self.backend.setting_models.contains(id));
         let session = self.session();
         let model_id = session
             .and_then(|session| session.model.as_deref())
             .or_else(|| {
                 session
                     .is_none_or(|session| session.provider == "talos")
-                    .then_some(self.configured_model.as_deref())
+                    .then(|| {
+                        self.draft_model
+                            .as_deref()
+                            .or(self.configured_model.as_deref())
+                    })
                     .flatten()
             });
-        let model = session.map_or_else(
-            || {
-                self.configured_model
-                    .clone()
-                    .unwrap_or_else(|| "Default model".into())
-            },
-            |session| {
+        let backend_id = session.map_or_else(|| self.provider_id(), |session| &session.provider);
+        let model = model_id
+            .and_then(|id| {
                 self.backend
                     .view
-                    .provider(&session.provider)
-                    .and_then(|provider| {
-                        provider
-                            .models
-                            .iter()
-                            .find(|model| Some(model.id.as_str()) == model_id)
-                    })
-                    .map_or_else(
-                        || {
-                            session
-                                .model
-                                .clone()
-                                .or_else(|| self.configured_model.clone())
-                                .unwrap_or_else(|| "Default model".into())
-                        },
-                        |model| model.label.clone(),
-                    )
-            },
-        );
+                    .provider(backend_id)
+                    .and_then(|provider| provider.models.iter().find(|model| model.id == id))
+                    .map(|model| model.label.clone())
+            })
+            .or_else(|| model_id.map(str::to_owned))
+            .unwrap_or_else(|| "Default model".into());
         let (model_label, is_openai_model) = model_picker_label(&model, model_id);
         let mut chips = div().flex().flex_wrap().gap(px(6.));
         for (index, path) in self
@@ -999,100 +1270,161 @@ impl AppView {
                 }),
             ));
         }
-        frosted(
-            24.0,
-            18.0,
-            div()
-                .w_full()
-                .min_h(px(56.))
-                .rounded(px(24.))
-                .bg(cx.global::<GlassSettings>().wash(0.30))
-                .border_1()
-                .border_color(hsla(0.0, 0.0, 1.0, 0.12))
-                .shadow_lg()
-                .px(px(15.))
-                .py(px(8.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .child(icon_button(
-                    "attach",
-                    "icons/paperclip.svg",
-                    "Attach images",
-                    cx.listener(|this, _, window, cx| {
-                        this.attach_images(window, cx);
-                    }),
-                ))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .text_color(rgb(INK))
-                        .justify_center()
-                        .font_family("Inter")
-                        .text_size(px(14.))
-                        .line_height(px(22.))
-                        .child(
-                            div()
-                                .w_full()
-                                .max_h(px(176.))
-                                .flex()
-                                .items_center()
-                                .text_color(rgb(0xF4F6F5))
-                                .child(Textarea::new(&self.editor)),
-                        )
-                        .child(chips),
-                )
-                .child(
-                    div()
-                        .id("models")
-                        .px(px(9.))
-                        .py(px(2.))
-                        .rounded(px(8.))
-                        .flex()
-                        .items_center()
-                        .gap(px(7.))
-                        .hover(|s| s.bg(hsla(0.0, 0.0, 1.0, 0.07)))
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.toggle_menu(Menu::Models, cx);
-                        }))
-                        .when(is_openai_model, |element| {
-                            element.child(icon("icons/openai.svg", 24., SECONDARY))
-                        })
-                        .child(label(model_label, 14., SECONDARY, FontWeight::MEDIUM))
-                        .child(icon("icons/chevron-down.svg", 12., MUTED)),
-                )
-                .child(composer_action_button(
-                    "send",
-                    if running {
-                        "icons/stop.svg"
-                    } else {
-                        "icons/arrow-up.svg"
-                    },
-                    if running {
-                        "Stop response"
-                    } else if self.pending.is_some() {
-                        "Creating conversation"
-                    } else {
-                        "Send message"
-                    },
-                    running,
-                    self.pending.is_some(),
-                    cx.listener(move |this, _, window, cx| {
-                        if running {
-                            if let Some(id) = this.selected.clone() {
-                                this.backend.submit(Action::Cancel(id));
-                                cx.notify();
-                            }
-                        } else {
-                            this.send_prompt(window, cx);
-                        }
-                    }),
-                )),
-        )
+        let has_content = !self.editor.read(cx).value().trim().is_empty()
+            || self
+                .images
+                .get(self.draft_key())
+                .is_some_and(|images| !images.is_empty());
+        let send_disabled = preparing || (!running && !has_content);
+        // Keep the model popover anchored to the composer as it grows with text.
+        div()
+            .relative()
+            .w_full()
+            .child(frosted(
+                18.0,
+                18.0,
+                div()
+                    .w_full()
+                    .min_h(px(132.))
+                    .rounded(px(18.))
+                    .bg(cx.global::<GlassSettings>().wash(0.48))
+                    .border_1()
+                    .border_color(hsla(0.0, 0.0, 1.0, 0.14))
+                    .shadow_lg()
+                    .px(px(14.))
+                    .py(px(12.))
+                    .flex()
+                    .flex_col()
+                    .justify_between()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex_1()
+                            .min_h(px(52.))
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .justify_center()
+                                    .text_color(rgb(INK))
+                                    .font_family("Inter")
+                                    .text_size(px(14.))
+                                    .line_height(px(22.))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .max_h(px(176.))
+                                            .flex()
+                                            .items_center()
+                                            .text_color(rgb(0xF4F6F5))
+                                            .child(Textarea::new(&self.editor)),
+                                    )
+                                    .child(chips),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(icon_button(
+                                "attach",
+                                "icons/paperclip.svg",
+                                "Attach images",
+                                cx.listener(|this, _, window, cx| {
+                                    this.attach_images(window, cx);
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .id("models")
+                                            .px(px(9.))
+                                            .py(px(6.))
+                                            .rounded(px(8.))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(7.))
+                                            .hover(|style| style.bg(hsla(0.0, 0.0, 1.0, 0.07)))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                let opening = this.menu != Some(Menu::Models);
+                                                this.toggle_menu(Menu::Models, cx);
+                                                if opening {
+                                                    this.picker_provider =
+                                                        Some(this.provider_id().to_owned());
+                                                    this.picker_load_attempted = false;
+                                                    this.picker_group = None;
+                                                    this.picker_show_all = false;
+                                                    this.ensure_picker_models(cx);
+                                                    this.model_search.update(cx, |search, cx| {
+                                                        search.set_value(String::new(), window, cx);
+                                                        search.focus(window, cx);
+                                                    });
+                                                } else {
+                                                    this.editor.update(cx, |editor, cx| {
+                                                        editor.focus(window, cx);
+                                                    });
+                                                }
+                                            }))
+                                            .when(is_openai_model, |element| {
+                                                element.child(icon(
+                                                    "icons/openai.svg",
+                                                    24.,
+                                                    SECONDARY,
+                                                ))
+                                            })
+                                            .child(label(
+                                                model_label,
+                                                13.,
+                                                SECONDARY,
+                                                FontWeight::MEDIUM,
+                                            ))
+                                            .child(icon("icons/chevron-down.svg", 12., MUTED)),
+                                    )
+                                    .child(composer_action_button(
+                                        "send",
+                                        if running {
+                                            "icons/stop.svg"
+                                        } else {
+                                            "icons/arrow-up.svg"
+                                        },
+                                        if running {
+                                            "Stop response"
+                                        } else if preparing {
+                                            "Starting conversation"
+                                        } else {
+                                            "Send message"
+                                        },
+                                        running,
+                                        send_disabled,
+                                        cx.listener(move |this, _, window, cx| {
+                                            if running {
+                                                if let Some(id) = this.selected.clone() {
+                                                    this.backend.submit(Action::Cancel(id));
+                                                    cx.notify();
+                                                }
+                                            } else {
+                                                this.send_prompt(window, cx);
+                                            }
+                                        }),
+                                    )),
+                            ),
+                    ),
+            ))
+            .when(self.menu == Some(Menu::Models), |d| {
+                d.child(self.model_picker_surface(cx))
+            })
     }
     fn menu_surface(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
         let mut content = div()
@@ -1110,6 +1442,9 @@ impl AppView {
                         SharedString::from(format!("workspace-{id}")),
                         format!("{} · {}", workspace.name, workspace.path),
                         cx.listener(move |this, _, window, cx| {
+                            if this.pending.is_some() {
+                                return;
+                            }
                             this.select(None, window, cx);
                             this.workspace = Some(id.clone());
                             cx.notify();
@@ -1122,57 +1457,7 @@ impl AppView {
                     cx.listener(|this, _, window, cx| this.pick_workspace(window, cx)),
                 ));
             }
-            Menu::Models => {
-                if let Some(session) = self.session() {
-                    if let Some(provider) = self.backend.view.provider(&session.provider) {
-                        for model in &provider.models {
-                            let id = model.id.clone();
-                            let session = session.id.clone();
-                            content = content.child(button(
-                                SharedString::from(format!("model-{id}")),
-                                model.label.clone(),
-                                cx.listener(move |this, _, _, cx| {
-                                    if !this.running() && this.pending.is_none() {
-                                        this.backend.submit(Action::SetModel {
-                                            session: session.clone(),
-                                            model: id.clone(),
-                                        });
-                                        this.menu = None;
-                                        cx.notify();
-                                    }
-                                }),
-                            ));
-                        }
-                        if provider.models.is_empty() {
-                            content = content.child(label(
-                                "No models advertised by this provider.",
-                                12.,
-                                MUTED,
-                                FontWeight::NORMAL,
-                            ));
-                        }
-                    }
-                } else {
-                    content = content.child(label(
-                        "Choose provider. Model selection is available after the first message.",
-                        12.,
-                        MUTED,
-                        FontWeight::NORMAL,
-                    ));
-                    for provider in self.backend.view.providers.iter().filter(|p| p.available) {
-                        let id = provider.id.clone();
-                        content = content.child(button(
-                            SharedString::from(format!("provider-{id}")),
-                            provider.name.clone(),
-                            cx.listener(move |this, _, _, cx| {
-                                this.provider = Some(id.clone());
-                                this.menu = None;
-                                cx.notify();
-                            }),
-                        ));
-                    }
-                }
-            }
+            Menu::Models => {} // Rendered beside its composer anchor instead.
             Menu::Diagnostics => {
                 content = content.child(label(format!("{}\nEndpoint: {}\n{}", self.backend.view.status, self.backend.endpoint,
                     self.backend.connection_error.as_deref().unwrap_or("No connection error")), 12., SECONDARY, FontWeight::NORMAL))
@@ -1204,7 +1489,7 @@ impl AppView {
                 .top(px(76.))
                 .right(px(22.))
                 .w(px(370.))
-                .max_w(px(370.))
+                .max_w_full()
                 .p(px(14.))
                 .rounded(px(14.))
                 .bg(cx.global::<GlassSettings>().wash(0.42))
@@ -1258,39 +1543,99 @@ fn config_value(config: &str, wanted: &str) -> Option<String> {
 }
 
 fn model_picker_label(model: &str, model_id: Option<&str>) -> (String, bool) {
-    let is_openai = model_id.is_some_and(|id| id.to_ascii_lowercase().contains("openai"))
-        || model.to_ascii_lowercase().starts_with("gpt");
-    if !is_openai {
-        return (model.to_owned(), false);
+    let lower_label = model.to_ascii_lowercase();
+    let lower_id = model_id.unwrap_or_default().to_ascii_lowercase();
+    let is_openai = lower_id.contains("openai")
+        || lower_label.starts_with("gpt")
+        || lower_label.contains("openai codex/");
+    if is_openai {
+        // Prefer the routing ID over labels that append the provider and full
+        // qualified ID (e.g. "Luna openai codex/gpt 5.6").
+        let model = model_id
+            .and_then(|id| id.rsplit('/').next())
+            .filter(|id| !id.is_empty())
+            .unwrap_or(model);
+        let normalized = model.replace(['-', '_'], " ");
+        let mut parts: Vec<_> = normalized.split_whitespace().collect();
+        if parts
+            .first()
+            .is_some_and(|part| part.eq_ignore_ascii_case("gpt"))
+        {
+            parts.remove(0);
+        }
+        let label = if parts.is_empty() {
+            model.to_owned()
+        } else {
+            let version = parts.remove(0);
+            let suffix = parts
+                .iter()
+                .map(|part| capitalize_model_words(part))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if suffix.is_empty() {
+                format!("GPT-{version}")
+            } else {
+                format!("GPT-{version} {suffix}")
+            }
+        };
+        return (capitalize_model_words(&label), true);
     }
 
-    let model = model.strip_prefix("openai/").unwrap_or(model);
-    let normalized = model.replace(['-', '_'], " ");
-    let mut parts: Vec<_> = normalized.split_whitespace().collect();
-    if parts
-        .first()
-        .is_some_and(|part| part.eq_ignore_ascii_case("gpt"))
-    {
-        parts.remove(0);
+    let mut display = model.trim();
+    if let Some(provider) = model_id.and_then(|id| id.split_once('/').map(|(p, _)| p)) {
+        // Model labels frequently repeat their provider namespace (e.g.
+        // "deepseek/deepseek-flash"); the provider rail already identifies it.
+        if let Some(rest) = strip_model_prefix(display, provider) {
+            display = rest;
+        }
+        let provider_words = provider.replace(['-', '_'], " ");
+        if let Some(rest) = strip_model_prefix(display, &provider_words) {
+            display = rest;
+        }
+        if let Some(rest) = strip_model_prefix(display, provider) {
+            display = rest;
+        }
     }
-    if parts.len() > 1
-        && parts
-            .last()
-            .is_some_and(|part| part.chars().any(char::is_alphabetic))
+    let display = display.replace(['/', '-', '_'], " ");
+    let display = if model_id
+        .and_then(|id| id.split_once('/').map(|(provider, _)| provider))
+        .is_some_and(|provider| provider.eq_ignore_ascii_case("deepseek"))
     {
-        let name = parts.pop().unwrap_or_default();
-        parts.insert(0, name);
-    }
-    let label = if parts.is_empty() {
-        model.to_owned()
+        format!("Deepseek {display}")
     } else {
-        parts.join(" ")
+        display
     };
-    let mut characters = label.chars();
-    let label = characters.next().map_or(label.clone(), |first| {
-        first.to_uppercase().collect::<String>() + characters.as_str()
+    (capitalize_model_words(&display), false)
+}
+
+fn strip_model_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let matched = value.get(..prefix.len())?;
+    if !matched.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    let rest = value[prefix.len()..].trim_start_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '/' | '-' | '_' | ':')
     });
-    (label, true)
+    (!rest.is_empty()).then_some(rest)
+}
+
+fn capitalize_model_words(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|word| {
+            if word.eq_ignore_ascii_case("gpt") {
+                return "GPT".to_owned();
+            }
+            if word.chars().any(char::is_uppercase) {
+                return word.to_owned();
+            }
+            let mut characters = word.chars();
+            characters.next().map_or_else(String::new, |first| {
+                first.to_uppercase().collect::<String>() + characters.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn label(
@@ -1346,23 +1691,36 @@ fn icon_button(
 fn sidebar_action(
     id: impl Into<gpui::ElementId>,
     path: &'static str,
-    title: &'static str,
+    title: impl Into<SharedString>,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
+    let title = title.into();
     div()
         .id(id)
-        .h(px(38.))
+        .h(px(40.))
         .w_full()
         .px(px(10.))
         .flex()
         .items_center()
         .gap(px(10.))
         .rounded(px(10.))
-        .hover(|s| s.bg(hsla(0.0, 0.0, 1.0, 0.06)))
+        .hover(|style| style.bg(hsla(0.0, 0.0, 1.0, 0.06)))
         .cursor_pointer()
         .on_click(on_click)
         .child(icon(path, 16., MUTED))
-        .child(label(title, 11.5, SECONDARY, FontWeight::MEDIUM))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .font_family("Inter")
+                .font_weight(FontWeight::MEDIUM)
+                .text_size(px(13.))
+                .text_color(rgb(SECONDARY))
+                .child(title),
+        )
 }
 fn composer_action_button(
     id: impl Into<gpui::ElementId>,
@@ -1379,12 +1737,26 @@ fn composer_action_button(
         .items_center()
         .justify_center()
         .rounded_full()
-        .bg(rgb(if destructive { DANGER } else { BLUE }))
-        .opacity(if disabled { 0.55 } else { 1.0 })
-        .hover(|s| s.opacity(0.88))
+        .bg(rgb(if destructive {
+            DANGER
+        } else if disabled {
+            0x465047
+        } else {
+            ACCENT
+        }))
+        .opacity(if disabled && !destructive { 0.72 } else { 1.0 })
+        .hover(|style| style.opacity(if disabled { 0.72 } else { 0.88 }))
         .cursor_pointer()
         .on_click(on_click)
-        .child(icon(path, 17., PAPER))
+        .child(icon(
+            path,
+            17.,
+            if disabled && !destructive {
+                SECONDARY
+            } else {
+                PAPER
+            },
+        ))
 }
 fn panel(title: &str, text: &str, color: u32) -> gpui::Div {
     div()
@@ -1476,14 +1848,33 @@ mod composer_tests {
     }
 
     #[test]
-    fn openai_models_show_brand_and_compact_name() {
+    fn openai_models_show_brand_and_slug_name() {
         assert_eq!(
             model_picker_label("GPT 5.6 Luna", Some("openai/gpt-5.6-luna")),
-            ("Luna 5.6".into(), true)
+            ("GPT-5.6 Luna".into(), true)
         );
         assert_eq!(
             model_picker_label("openai/gpt-5.6-luna", Some("openai/gpt-5.6-luna")),
-            ("Luna 5.6".into(), true)
+            ("GPT-5.6 Luna".into(), true)
+        );
+    }
+
+    #[test]
+    fn picker_labels_hide_provider_namespaces_and_fix_slug_capitalization() {
+        assert_eq!(
+            model_picker_label(
+                "Luna openai codex/gpt 5.6",
+                Some("openai-codex/gpt-5.6-luna")
+            ),
+            ("GPT-5.6 Luna".into(), true)
+        );
+        assert_eq!(
+            model_picker_label("deepseek/deepseek-flash", Some("deepseek/deepseek-flash")),
+            ("Deepseek Flash".into(), false)
+        );
+        assert_eq!(
+            model_picker_label("deepseek/deepseek-v4-pro", Some("deepseek/deepseek-v4-pro")),
+            ("Deepseek V4 Pro".into(), false)
         );
     }
 
@@ -1491,7 +1882,7 @@ mod composer_tests {
     fn configured_openai_model_name_is_capitalized() {
         assert_eq!(
             model_picker_label("gpt-6.1-sol", Some("gpt-6.1-sol")),
-            ("Sol 6.1".into(), true)
+            ("GPT-6.1 Sol".into(), true)
         );
     }
 

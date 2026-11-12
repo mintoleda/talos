@@ -257,8 +257,9 @@ The runtime constructor now lives in `internal/stack` (`stack.Build`, `stack.Swi
 
 | ACP surface | Talos behavior |
 | --- | --- |
-| `initialize` | `loadSession`, `sessionCapabilities.list/close`, image + embedded-context prompts, MCP over stdio/HTTP/SSE |
-| `session/new` | Allocates a session id and returns models and a `thought_level` option (no permission-mode capability). The runtime is built lazily on first use, so Paseo's probe sessions create no transcript, MCP connection or checkpoint. Talos uses the supplied `cwd` as-is and never creates a worktree. |
+| `initialize` | `loadSession`, `sessionCapabilities.list/close`, image + embedded-context prompts, MCP over stdio/HTTP/SSE, and the advertised Talos model-catalog extension |
+| `talos/list_models` | Returns the configured model catalogue without allocating a session. The desktop uses this to populate a new-conversation picker; it is not a generic ACP method. |
+| `session/new` | Allocates a session id and returns current models and a `thought_level` option (no permission-mode capability). The runtime is built lazily on first use, so session creation creates no transcript, MCP connection or checkpoint. Talos uses the supplied `cwd` as-is and never creates a worktree. The desktop creates a session only when the user sends the first prompt. |
 | `session/load` | Replays the Talos transcript as `user_message_chunk` / `agent_message_chunk` / `tool_call` / `tool_call_update`, then resumes on the same transcript |
 | `session/list`, `session/close` | Backed by session meta sidecars; close cancels any turn and releases the runtime |
 | `session/prompt` | One turn of the Talos loop. Text and thinking stream as message/thought chunks; tools stream as `tool_call` → `tool_call_update` with ACP kinds (`read`, `edit` with diffs, `search`, `execute`, `fetch`, `think`); context occupancy streams as `usage_update`; the response carries `stopReason` and token usage |
@@ -266,6 +267,15 @@ The runtime constructor now lives in `internal/stack` (`stack.Build`, `stack.Swi
 | `session/request_permission` | Emitted when the safety policy prompts. Options: allow once, always allow (remembered per session, per command), reject |
 | `session/set_model`, `session/set_config_option` | `provider/model` switching and thinking level, per session |
 | Slash commands | `/compact [focus]`, `/model [provider/model]`, `/mcp`, `/subagents`, plus each skill (rewritten to `skill:<name>`) via `available_commands_update` |
+
+Talos has no implicit model/provider/endpoint default. Without a complete explicit
+selection, ACP returns an empty `currentModelId` and only the discovered
+`availableModels`; it does not invent `openai/deepseek-chat` (or `/`). The
+`talos/list_models` extension exposes that catalogue without a session. The desktop
+keeps the selected model ID and prompt as a draft, then creates a session on Send,
+acknowledges `session/set_model`, and only then submits the prompt. Without a model,
+a Talos prompt fails with a clear no-model-selected error. Existing configured
+models and saved-session selections remain valid.
 
 Paseo's platform tools arrive through `mcpServers` on `session/new`/`session/load` as a streamable-HTTP server with a bearer header; `internal/mcp/http.go` supports that transport. Permission prompts are now answered asynchronously by the frontend (`internal/executor`) instead of failing closed when no reply is immediately available; the engine queues concurrent prompts from parallel subagents. Relative `path` arguments to `read`/`write`/`edit`/`ls` resolve against the session cwd rather than the process cwd, which matters because Paseo spawns Talos from the daemon's directory.
 

@@ -51,15 +51,18 @@ func (s *acpSession) update(u SessionUpdate) {
 func (s *acpSession) state(catalog []models.Entry) (*SessionModes, *SessionModels, []ConfigOption) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	current := s.provider + "/" + s.model
-	ms := &SessionModels{CurrentModelID: current}
+	current := ""
+	if s.provider != "" && s.model != "" {
+		current = s.provider + "/" + s.model
+	}
+	ms := &SessionModels{CurrentModelID: current, AvailableModels: []ModelInfo{}}
 	seen := false
 	for _, e := range catalog {
 		full := e.Full()
 		seen = seen || full == current
 		ms.AvailableModels = append(ms.AvailableModels, ModelInfo{ModelID: full, Name: full})
 	}
-	if !seen {
+	if current != "" && !seen {
 		ms.AvailableModels = append([]ModelInfo{{ModelID: current, Name: current}}, ms.AvailableModels...)
 	}
 	return nil, ms, []ConfigOption{thinkingOption(s.model, s.thinking)}
@@ -73,6 +76,10 @@ func (s *acpSession) ensureBuilt(ctx context.Context) (*stack.Built, error) {
 	if s.closed {
 		s.mu.Unlock()
 		return nil, errSessionClosed
+	}
+	if s.provider == "" || s.model == "" {
+		s.mu.Unlock()
+		return nil, errors.New("no model selected: choose a provider/model before sending a prompt")
 	}
 	if b := s.built; b != nil {
 		s.mu.Unlock()

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/mintoleda/talos/internal/config"
+	"github.com/mintoleda/talos/internal/models"
 	"github.com/mintoleda/talos/internal/provider"
 	"github.com/mintoleda/talos/internal/safety"
 )
@@ -477,6 +478,9 @@ func TestInitializeCapabilities(t *testing.T) {
 	if !resp.AgentCapabilities.MCPCapabilities.HTTP {
 		t.Error("mcpCapabilities.http = false")
 	}
+	if resp.AgentCapabilities.Extensions["talos"] == nil {
+		t.Error("Talos model-catalog extension was not advertised")
+	}
 	if resp.AgentInfo == nil || resp.AgentInfo.Name != "talos" {
 		t.Errorf("agentInfo = %+v", resp.AgentInfo)
 	}
@@ -488,6 +492,33 @@ func TestInitializeCapabilities(t *testing.T) {
 	}
 	if string(raw["authMethods"]) != "[]" {
 		t.Errorf("authMethods = %s, want []", raw["authMethods"])
+	}
+}
+
+func TestListModelsDoesNotCreateSessionOrTranscript(t *testing.T) {
+	agent := &Agent{
+		sessions: make(map[string]*acpSession),
+		listModels: func(context.Context) []models.Entry {
+			return nil
+		},
+	}
+	if _, err := agent.handle(context.Background(), "talos/list_models", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(agent.sessions) != 0 {
+		t.Fatalf("model catalogue allocated %d ACP sessions", len(agent.sessions))
+	}
+
+	e := setup(t, func(int, http.ResponseWriter, *http.Request) {
+		t.Error("model discovery must not call the LLM")
+	})
+	result := e.c.call("talos/list_models", map[string]any{})
+	response := decode[ModelCatalogResponse](t, result.Result)
+	if response.Models == nil {
+		t.Fatal("model catalogue must be an empty or populated array, not null")
+	}
+	if files := transcripts(t, e.home); len(files) != 0 {
+		t.Fatalf("model discovery created transcripts: %v", files)
 	}
 }
 

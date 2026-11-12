@@ -18,10 +18,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ACP_PROTOCOL_VERSION, AcpError, ConfigOption, InitializeRequest, InitializeResponse, McpServer,
-    McpTransport, PermissionDecision, PermissionRequest, ProcessConfig, ProcessStatus,
-    PromptRequest, PromptResponse, RpcErrorObject, RpcId, SessionIdRequest, SessionListRequest,
-    SessionListResponse, SessionLoadState, SessionState, SessionUpdateNotification,
-    SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest, SetModelRequest,
+    McpTransport, ModelCatalogResponse, PermissionDecision, PermissionRequest, ProcessConfig,
+    ProcessStatus, PromptRequest, PromptResponse, RpcErrorObject, RpcId, SessionIdRequest,
+    SessionListRequest, SessionListResponse, SessionLoadState, SessionState,
+    SessionUpdateNotification, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
+    SetModelRequest,
     process::{ProcessIo, WriterCommand, spawn_process, wait_for_exit},
 };
 
@@ -513,6 +514,26 @@ impl AcpClient {
         }
         self.call("session/list", &SessionListRequest { cwd, cursor })
             .await
+    }
+
+    /// Fetch Talos' session-independent model catalogue when the agent advertises it.
+    pub async fn list_models(&self) -> Result<ModelCatalogResponse, AcpError> {
+        self.ensure_initialized().await?;
+        let capabilities = self.capabilities().expect("initialized capabilities");
+        let supports_catalog = capabilities
+            .agent_capabilities
+            .extra
+            .get("extensions")
+            .and_then(|extensions| extensions.get("talos"))
+            .and_then(|talos| talos.get("modelCatalog"))
+            .and_then(Value::as_str)
+            .is_some_and(|method| method == "talos/list_models");
+        if !supports_catalog {
+            return Err(AcpError::UnsupportedCapability(
+                "independent model catalogue",
+            ));
+        }
+        self.call("talos/list_models", &serde_json::json!({})).await
     }
 
     pub async fn close_session(&self, session_id: &str) -> Result<(), AcpError> {

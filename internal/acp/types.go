@@ -40,6 +40,7 @@ type AgentCapabilities struct {
 	PromptCapabilities  PromptCapabilities   `json:"promptCapabilities"`
 	MCPCapabilities     MCPCapabilities      `json:"mcpCapabilities"`
 	SessionCapabilities *SessionCapabilities `json:"sessionCapabilities,omitempty"`
+	Extensions          map[string]any       `json:"extensions,omitempty"`
 }
 
 type PromptCapabilities struct {
@@ -146,6 +147,10 @@ type SessionMode struct {
 type SessionModels struct {
 	CurrentModelID  string      `json:"currentModelId"`
 	AvailableModels []ModelInfo `json:"availableModels"`
+}
+
+type ModelCatalogResponse struct {
+	Models []ModelInfo `json:"models"`
 }
 
 type ModelInfo struct {
