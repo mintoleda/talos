@@ -258,10 +258,11 @@ func (m *SessionManager) Delete(id string) error {
 
 	projectKey := session.MetaProjectKey(meta)
 	txPath := filepath.Join(session.SessionsDir(), session.ProjectHash(projectKey), id+".jsonl")
-	_ = os.Remove(txPath)
+	if err := session.DeleteSession(projectKey, id); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	_ = os.Remove(txPath + ".reads.json")
 	_ = os.Remove(MetaPath(txPath))
-	_ = session.DeleteSession(projectKey, id)
 
 	if meta.Isolation == "worktree" && meta.ProjectDir != "" && meta.Dir != "" {
 		if err := gitutil.WorktreeRemove(meta.ProjectDir, meta.Dir); err != nil {

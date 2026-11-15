@@ -96,7 +96,17 @@ func LatestSession(projectRoot string) (Session, error) {
 func DeleteSession(projectRoot, id string) error {
 	pid := ProjectHash(projectRoot)
 	path := filepath.Join(SessionsDir(), pid, id+".jsonl")
-	return os.Remove(path)
+	// Persist explicit deletion evidence for other frontends before unlinking.
+	// Readers ignore the marker while the transcript still exists.
+	marker := filepath.Join(SessionsDir(), pid, id+".deleted")
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		_ = os.Remove(marker)
+		return err
+	}
+	return nil
 }
 
 func ListSessions(projectRoot string) ([]Session, error) {

@@ -67,6 +67,8 @@ func (a *Agent) handle(ctx context.Context, method string, params json.RawMessag
 	switch method {
 	case "initialize":
 		return a.initialize(params)
+	case "talos/list_deleted_sessions":
+		return session.ListSessionDeletions()
 	case "talos/list_models":
 		return a.listModelCatalog(ctx), nil
 	case "authenticate":
@@ -151,7 +153,10 @@ func (a *Agent) initialize(params json.RawMessage) (any, error) {
 				Close: &struct{}{},
 			},
 			Extensions: map[string]any{
-				"talos": map[string]any{"modelCatalog": "talos/list_models"},
+				"talos": map[string]any{
+					"modelCatalog":     "talos/list_models",
+					"sessionDeletions": "talos/list_deleted_sessions",
+				},
 			},
 		},
 

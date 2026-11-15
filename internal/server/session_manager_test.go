@@ -171,6 +171,10 @@ func TestSessionManagerCreateListStopResumeDelete(t *testing.T) {
 	if len(m.List()) != 0 {
 		t.Fatalf("expected empty list, got %+v", m.List())
 	}
+	deletions, err := session.ListSessionDeletions()
+	if err != nil || len(deletions.DeletedSessionIDs) != 1 || deletions.DeletedSessionIDs[0] != info.ID {
+		t.Fatalf("expected deletion evidence after manager cleanup, got %+v, %v", deletions, err)
+	}
 }
 
 func TestSessionManagerResumeRequiresID(t *testing.T) {
