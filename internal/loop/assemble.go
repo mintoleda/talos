@@ -77,16 +77,16 @@ func (l *Loop) streamAndAssemble(ctx context.Context, req protocol.Request, emit
 	}
 
 	var (
-		textSB    strings.Builder
-		thinkSB   strings.Builder
-		toolUses  []protocol.ContentBlock
-		usage     protocol.Usage
-		stop      string
+		textSB   strings.Builder
+		thinkSB  strings.Builder
+		toolUses []protocol.ContentBlock
+		usage    protocol.Usage
+		stop     string
 	)
 
 	// emitThinking flushes the accumulated thinking text as a single block.
-	// Called just before the first text delta so it appears before the response
-	// regardless of whether the provider streams one chunk or many per block.
+	// Prefer the provider's explicit boundary, with text/tool/end-of-stream
+	// fallbacks for providers that cannot report one. Each block completes once.
 	thinkEmitted := false
 	emitThinking := func() {
 		if !thinkEmitted && thinkSB.Len() > 0 {
@@ -103,9 +103,16 @@ func (l *Loop) streamAndAssemble(ctx context.Context, req protocol.Request, emit
 			textSB.WriteString(normalized)
 			emit(protocol.TextDelta{Text: normalized})
 		case protocol.PEThinking:
+			if thinkEmitted {
+				thinkSB.Reset()
+				thinkEmitted = false
+			}
 			thinkSB.WriteString(e.Text)
 			emit(protocol.ThinkingDelta{Text: e.Text})
+		case protocol.PEThinkingDone:
+			emitThinking()
 		case protocol.PEToolCall:
+			emitThinking()
 			tu := e.ToolUse
 			toolUses = append(toolUses, protocol.ContentBlock{
 				Type: protocol.BlockToolUse, ToolUse: &tu,

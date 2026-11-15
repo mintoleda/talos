@@ -48,7 +48,8 @@ func parseSSE(body io.ReadCloser, out chan<- protocol.ProviderEvent) {
 			}
 			out <- protocol.PEToolCall{ToolUse: protocol.ToolUse{ID: bs.id, Name: bs.name, Args: args}}
 		case "thinking":
-			// Deltas were already emitted as PEThinking events; nothing to flush.
+			// Preserve the boundary even while the following tool arguments stream.
+			out <- protocol.PEThinkingDone{}
 		}
 		delete(blocks, idx)
 	}

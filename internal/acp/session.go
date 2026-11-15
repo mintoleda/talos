@@ -505,6 +505,13 @@ func (t *turn) emit(ev protocol.Event) {
 		s.update(SessionUpdate{SessionUpdate: "agent_message_chunk", Content: ptr(textContent(e.Text))})
 	case protocol.ThinkingDelta:
 		s.update(SessionUpdate{SessionUpdate: "agent_thought_chunk", Content: ptr(textContent(e.Text))})
+	case protocol.ThinkingBlock:
+		// The completed block repeats the streamed text. Send only a boundary,
+		// so clients can show Thought before the next tool without duplicating it.
+		s.update(SessionUpdate{
+			SessionUpdate: "agent_thought_chunk", Content: ptr(textContent("")),
+			Meta: map[string]any{"talos": map[string]any{"thoughtComplete": true}},
+		})
 	case protocol.ToolStarted:
 		t.mu.Lock()
 		t.tools[e.ID] = &toolState{name: e.Name, args: e.Args}

@@ -24,6 +24,13 @@ func parseSSE(body io.ReadCloser, out chan<- protocol.ProviderEvent) {
 	partials := map[int]*partial{}
 	var order []int
 	stopReason := "stop"
+	thinking := false
+	finishThinking := func() {
+		if thinking {
+			out <- protocol.PEThinkingDone{}
+			thinking = false
+		}
+	}
 
 	flushToolCalls := func() {
 		for _, idx := range order {
@@ -48,6 +55,7 @@ func parseSSE(body io.ReadCloser, out chan<- protocol.ProviderEvent) {
 			if line == "" || strings.HasPrefix(line, ":") {
 			} else if data, ok := strings.CutPrefix(line, "data: "); ok {
 				if data == "[DONE]" {
+					finishThinking()
 					flushToolCalls()
 					out <- protocol.PEDone{StopReason: stopReason}
 					return
@@ -74,11 +82,15 @@ func parseSSE(body io.ReadCloser, out chan<- protocol.ProviderEvent) {
 					if ch.FinishReason != nil && *ch.FinishReason != "" {
 						stopReason = *ch.FinishReason
 					}
+					if ch.Delta.ReasoningContent != "" {
+						thinking = true
+						out <- protocol.PEThinking{Text: ch.Delta.ReasoningContent}
+					}
+					if ch.Delta.Content != "" || len(ch.Delta.ToolCalls) > 0 || (ch.FinishReason != nil && *ch.FinishReason != "") {
+						finishThinking()
+					}
 					if ch.Delta.Content != "" {
 						out <- protocol.PEText{Text: ch.Delta.Content}
-					}
-					if ch.Delta.ReasoningContent != "" {
-						out <- protocol.PEThinking{Text: ch.Delta.ReasoningContent}
 					}
 					for _, tc := range ch.Delta.ToolCalls {
 						p := partials[tc.Index]
@@ -99,6 +111,7 @@ func parseSSE(body io.ReadCloser, out chan<- protocol.ProviderEvent) {
 			}
 		}
 		if err == io.EOF {
+			finishThinking()
 			flushToolCalls()
 			out <- protocol.PEDone{StopReason: stopReason}
 			return

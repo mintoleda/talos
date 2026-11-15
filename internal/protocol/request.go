@@ -3,12 +3,12 @@ package protocol
 import "encoding/json"
 
 type Request struct {
-	System        string         `json:"system"`
-	Tools         []ToolSchema   `json:"tools"`
+	System        string          `json:"system"`
+	Tools         []ToolSchema    `json:"tools"`
 	Messages      []FrozenMessage `json:"messages"`
 	Volatile      []ContentBlock  `json:"volatile,omitempty"`
-	Model         string         `json:"model"`
-	ThinkingLevel string         `json:"thinking_level,omitempty"`
+	Model         string          `json:"model"`
+	ThinkingLevel string          `json:"thinking_level,omitempty"`
 }
 
 type FrozenMessage struct {
@@ -34,9 +34,14 @@ type PEDone struct{ StopReason string }
 // Anthropic). It is display-only and must not be stored in the transcript.
 type PEThinking struct{ Text string }
 
-func (PEText) isProviderEvent()     {}
-func (PEToolCall) isProviderEvent() {}
-func (PEUsage) isProviderEvent()    {}
-func (PEError) isProviderEvent()    {}
-func (PEDone) isProviderEvent()     {}
-func (PEThinking) isProviderEvent() {}
+// PEThinkingDone marks a provider-observed reasoning boundary, independently
+// of tool-argument assembly or the end of the whole response stream.
+type PEThinkingDone struct{}
+
+func (PEText) isProviderEvent()         {}
+func (PEToolCall) isProviderEvent()     {}
+func (PEUsage) isProviderEvent()        {}
+func (PEError) isProviderEvent()        {}
+func (PEDone) isProviderEvent()         {}
+func (PEThinking) isProviderEvent()     {}
+func (PEThinkingDone) isProviderEvent() {}

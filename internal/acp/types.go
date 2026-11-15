@@ -231,6 +231,19 @@ type ContentBlock struct {
 	Resource *EmbeddedResource `json:"resource,omitempty"`
 }
 
+// MarshalJSON keeps the required text field even for an empty text chunk
+// (used by metadata-only thought completion). Other content variants omit it.
+func (b ContentBlock) MarshalJSON() ([]byte, error) {
+	type alias ContentBlock
+	if b.Type == "text" {
+		return json.Marshal(struct {
+			alias
+			Text string `json:"text"`
+		}{alias: alias(b), Text: b.Text})
+	}
+	return json.Marshal(alias(b))
+}
+
 type EmbeddedResource struct {
 	URI      string `json:"uri"`
 	MimeType string `json:"mimeType,omitempty"`
@@ -249,7 +262,8 @@ type SessionNotification struct {
 
 // SessionUpdate is the session/update union, discriminated by SessionUpdate.
 type SessionUpdate struct {
-	SessionUpdate string `json:"sessionUpdate"`
+	SessionUpdate string         `json:"sessionUpdate"`
+	Meta          map[string]any `json:"_meta,omitempty"`
 
 	// agent_message_chunk / agent_thought_chunk / user_message_chunk
 	Content *ContentBlock `json:"content,omitempty"`

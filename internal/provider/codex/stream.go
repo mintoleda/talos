@@ -226,6 +226,7 @@ func (p *streamParser) finishItem(idx int, item *outputItem) error {
 				p.send(protocol.PEThinking{Text: text})
 			}
 		}
+		p.send(protocol.PEThinkingDone{})
 	case "message":
 		if !s.emitted {
 			var sb strings.Builder
