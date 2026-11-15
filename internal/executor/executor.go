@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/mintoleda/talos/internal/protocol"
 	"github.com/mintoleda/talos/internal/safety"
@@ -19,13 +20,34 @@ type Executor interface {
 }
 
 type InProcExecutor struct {
-	registry *tools.Registry
-	policy   *safety.Policy
-	permMu   sync.Mutex // serializes interactive permission prompts
+	registry  *tools.Registry
+	policy    *safety.Policy
+	permMu    sync.Mutex // serializes interactive permission prompts
+	nestedSeq atomic.Uint64
 }
 
 func New(registry *tools.Registry, policy *safety.Policy) *InProcExecutor {
-	return &InProcExecutor{registry: registry, policy: policy}
+	e := &InProcExecutor{registry: registry, policy: policy}
+	if tool, ok := registry.Get("codemode"); ok {
+		if setter, ok := tool.(interface{ SetToolCaller(tools.ToolCaller) }); ok {
+			setter.SetToolCaller(func(ctx context.Context, name string, args map[string]any, emit protocol.EmitFunc) protocol.ToolResult {
+				if name == "codemode" {
+					return protocol.ToolResult{IsError: true, Content: "codemode cannot call itself"}
+				}
+				id := fmt.Sprintf("codemode-%d", e.nestedSeq.Add(1))
+				tu := protocol.ToolUse{ID: id, Name: name, Args: args}
+				if emit != nil {
+					emit(protocol.ToolStarted{ID: id, Name: name, Args: args})
+				}
+				res := e.run(ctx, tu, emit)
+				if emit != nil {
+					emit(protocol.ToolFinished{ID: id, Result: res})
+				}
+				return res
+			})
+		}
+	}
+	return e
 }
 
 func (e *InProcExecutor) Policy() *safety.Policy {
@@ -45,6 +67,10 @@ func (e *InProcExecutor) Close() {
 }
 
 func (e *InProcExecutor) Run(ctx context.Context, tu protocol.ToolUse, emit protocol.EmitFunc) protocol.ToolResult {
+	return e.run(ctx, tu, emit)
+}
+
+func (e *InProcExecutor) run(ctx context.Context, tu protocol.ToolUse, emit protocol.EmitFunc) protocol.ToolResult {
 	tu = resolvePaths(tu, e.policy.WorkDir())
 	switch d, reason := e.policy.Check(tu); d {
 	case safety.Block:
@@ -64,7 +90,7 @@ func (e *InProcExecutor) Run(ctx context.Context, tu protocol.ToolUse, emit prot
 	var toolEmit protocol.EmitFunc
 	if emit != nil {
 		toolEmit = func(ev protocol.Event) {
-			if delta, ok := ev.(protocol.ToolOutputDelta); ok {
+			if delta, ok := ev.(protocol.ToolOutputDelta); ok && delta.ID == "" {
 				delta.ID = tu.ID
 			}
 			emit(ev)

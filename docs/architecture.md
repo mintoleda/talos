@@ -93,7 +93,7 @@
 | `internal/protocol` | value-typed seam types (Event, Message, Request) |
 | `internal/provider` | Provider interface + OpenAI + Anthropic + routing |
 | `internal/loop` | turn loop, prompt builder, stream assembler |
-| `internal/tools` | tool registry: read, write, edit, bash, grep, glob, ls, find, search, fff, web, memory, skill, background, mcp bridge |
+| `internal/tools` | tool registry: read, write, edit, bash, grep, glob, ls, find, search, fff, web, memory, skill, background, MCP bridge, sandboxed JavaScript codemode |
 | `internal/safety` | checkpointer, dangerous-command classifier, policy |
 | `internal/session` | append-only JSONL transcript, compaction, session paths |
 | `internal/executor` | tool execution + permission gating |

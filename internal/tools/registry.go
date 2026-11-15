@@ -23,7 +23,7 @@ type BashConfig struct {
 func DefaultRegistry(cwd string, reads *ReadSet, bash BashConfig, searchURL string) *Registry {
 	bg := NewBackgroundRegistry(cwd)
 	idx := ensureFFFIndex(cwd)
-	return &Registry{
+	reg := &Registry{
 		tools: []Tool{
 			NewRead(reads, idx),
 			NewWrite(reads),
@@ -40,6 +40,8 @@ func DefaultRegistry(cwd string, reads *ReadSet, bash BashConfig, searchURL stri
 		},
 		bg: bg,
 	}
+	reg.Add(NewCodeMode(reg))
+	return reg
 }
 
 func (r *Registry) KillBg() {
@@ -76,7 +78,7 @@ func (r *Registry) Add(extra ...Tool) {
 func (r *Registry) Filter(allow []string) *Registry {
 	for _, a := range allow {
 		if a == "*" || a == "all" {
-			return &Registry{tools: append([]Tool(nil), r.tools...), bg: r.bg}
+			return r.bindRegistryTools(&Registry{tools: append([]Tool(nil), r.tools...), bg: r.bg})
 		}
 	}
 	want := make(map[string]bool, len(allow))
@@ -89,7 +91,19 @@ func (r *Registry) Filter(allow []string) *Registry {
 			kept = append(kept, t)
 		}
 	}
-	return &Registry{tools: kept, bg: r.bg}
+	return r.bindRegistryTools(&Registry{tools: kept, bg: r.bg})
+}
+
+// bindRegistryTools gives registry-aware tools the filtered registry they will
+// actually run with. In particular, codemode must not retain access to tools
+// excluded by a subagent's allowlist.
+func (r *Registry) bindRegistryTools(filtered *Registry) *Registry {
+	for i, tool := range filtered.tools {
+		if bound, ok := tool.(interface{ WithRegistry(*Registry) Tool }); ok {
+			filtered.tools[i] = bound.WithRegistry(filtered)
+		}
+	}
+	return filtered
 }
 
 func (r *Registry) Get(name string) (Tool, bool) {

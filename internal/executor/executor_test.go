@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"os/exec"
 	"testing"
 
 	"github.com/mintoleda/talos/internal/protocol"
@@ -61,6 +62,56 @@ func (f *fakeBash) Schema() json.RawMessage { return tools.EmptySchema() }
 func (f *fakeBash) Execute(ctx context.Context, args map[string]any) (protocol.ToolResult, error) {
 	f.ran = true
 	return protocol.ToolResult{Content: "ran"}, nil
+}
+
+func TestCodeModeNestedCallsKeepExecutorPolicy(t *testing.T) {
+	if _, err := exec.LookPath("deno"); err != nil {
+		t.Skip("Deno is not installed")
+	}
+
+	reg := tools.EmptyRegistry()
+	fb := &fakeBash{}
+	reg.Add(fb)
+	reg.Add(tools.NewCodeMode(reg))
+	e := New(reg, safety.NewPolicy(safety.ModeAsk, ".", safety.NewClassifier(), true))
+
+	var events []protocol.Event
+	res := e.Run(context.Background(), protocol.ToolUse{
+		ID:   "outer",
+		Name: "codemode",
+		Args: map[string]any{"code": `const results = await Promise.allSettled([tools.bash({command: "sudo true"})]); return results[0].reason.message;`},
+	}, func(ev protocol.Event) {
+		events = append(events, ev)
+		if request, ok := ev.(protocol.PermissionRequested); ok {
+			request.ReplyCh <- false
+		}
+	})
+	if res.IsError {
+		t.Fatalf("codemode returned error: %s", res.Content)
+	}
+	if res.Content != "denied by user" {
+		t.Fatalf("nested tool result = %q", res.Content)
+	}
+	if fb.ran {
+		t.Fatal("nested bash call bypassed the executor policy")
+	}
+	nestedID := ""
+	finished := false
+	for _, ev := range events {
+		switch event := ev.(type) {
+		case protocol.ToolStarted:
+			if event.Name == "bash" {
+				nestedID = event.ID
+			}
+		case protocol.ToolFinished:
+			if nestedID != "" && event.ID == nestedID && event.Result.ToolUseID == nestedID {
+				finished = true
+			}
+		}
+	}
+	if nestedID == "" || !finished {
+		t.Fatalf("nested tool events missing: started=%v finished=%v", nestedID != "", finished)
+	}
 }
 
 // Frontends (TUI dialog, daemon clients, ACP) answer permission prompts
