@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 use talos_ui_core::{
+    activity::{TimelineItem, timeline},
     backend::{Action, Backend},
     state::EntryKind,
 };
@@ -107,10 +108,61 @@ fn daemon_workflow() {
             .session(&session)
             .is_some_and(|s| s.mode.as_deref() == Some("ask"))
     });
+    // Thinking is a real acknowledged provider preference, not static UI text.
+    wait(&mut backend, &wakes, |b| {
+        b.view.session_thinking(&session).is_some()
+    });
+    let thinking = backend.view.session_thinking(&session).unwrap();
+    assert_eq!(thinking.current.as_deref(), Some("off"));
+    assert_eq!(thinking.options, vec![("off".into(), "off".into())]);
+    assert!(backend.submit(Action::Rpc(talos_ipc::Command::SetThinking {
+        session_id: session.clone(),
+        thinking_option_id: "off".into(),
+    })));
+    assert!(backend.setting_thinking.contains(&session));
+    wait(&mut backend, &wakes, |b| {
+        !b.setting_thinking.contains(&session)
+            && b.view
+                .session_thinking(&session)
+                .is_some_and(|t| t.current.as_deref() == Some("off"))
+    });
     assert!(backend.send(&session, "hello".into(), vec![]));
     wait(&mut backend, &wakes, |b| {
         assistant_contains(b, &session, "hello") && !b.view.running(&session)
     });
+    assert!(backend.send(&session, "activity".into(), vec![]));
+    wait(&mut backend, &wakes, |b| {
+        assistant_contains(b, &session, "activity complete") && !b.view.running(&session)
+    });
+    let activity_steps = |backend: &Backend| {
+        timeline(
+            &backend.view.entries[&session],
+            backend.view.running(&session),
+        )
+        .into_iter()
+        .filter_map(|item| match item {
+            TimelineItem::Activity(group)
+                if group.label() == "Thought 1 time, edited 1 file, and read 1 file" =>
+            {
+                Some(
+                    group
+                        .steps
+                        .iter()
+                        .map(|step| (step.id.clone(), step.kind.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+    };
+    let saved_steps = activity_steps(&backend);
+    assert_eq!(saved_steps.len(), 1);
+    assert_eq!(saved_steps[0].len(), 3);
+    assert!(
+        matches!(&saved_steps[0][0].1, EntryKind::Thought { text, streaming: false } if text == "Inspect then edit")
+    );
+
     assert!(backend.send(&session, "permission".into(), vec![]));
     wait(&mut backend, &wakes, |b| {
         b.view
@@ -154,4 +206,5 @@ fn daemon_workflow() {
     assert!(backend.submit(Action::Load(session.clone())));
     wait(&mut backend, &wakes, |b| b.ready.contains(&session));
     assert!(assistant_contains(&backend, &session, "permission denied"));
+    assert_eq!(activity_steps(&backend), saved_steps);
 }

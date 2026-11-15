@@ -128,6 +128,22 @@ async fn streaming_session_methods_and_string_rpc_ids() {
         .expect("close session");
 }
 
+#[tokio::test]
+async fn deletion_inventory_is_capability_gated() {
+    let client = initialized("deletions").await;
+    let evidence = client.session_deletions().await.expect("deletion evidence");
+    assert_eq!(evidence.deleted_session_ids, ["removed"]);
+    assert_eq!(evidence.missing_session_ids, ["legacy"]);
+    client.shutdown(Duration::from_millis(250)).await;
+
+    let old_client = initialized("stream").await;
+    assert!(matches!(
+        old_client.session_deletions().await,
+        Err(AcpError::UnsupportedCapability("session deletions"))
+    ));
+    old_client.shutdown(Duration::from_millis(250)).await;
+}
+
 struct AllowPermission(Arc<AtomicUsize>);
 
 impl PermissionHandler for AllowPermission {

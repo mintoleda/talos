@@ -1031,6 +1031,10 @@ impl Daemon {
     }
 
     async fn list_sessions(&self, workspace_id: Option<&str>) -> Result<Vec<Session>, RpcError> {
+        self.service
+            .reconcile_deleted_sessions()
+            .await
+            .map_err(core_error)?;
         let workspace_ids = if let Some(workspace_id) = workspace_id {
             let id = parse_id::<WorkspaceId>(workspace_id)?;
             self.service.workspace(id).await.map_err(core_error)?;

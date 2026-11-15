@@ -516,6 +516,21 @@ impl AcpClient {
             .await
     }
 
+    /// Read explicit deletion evidence; absence from session/list is not enough.
+    pub async fn session_deletions(&self) -> Result<crate::SessionDeletions, AcpError> {
+        self.ensure_initialized().await?;
+        let supported = self
+            .capabilities()
+            .and_then(|caps| caps.agent_capabilities.extra.get("extensions").cloned())
+            .and_then(|extensions| extensions.get("talos").cloned())
+            .and_then(|talos| talos.get("sessionDeletions").cloned())
+            .is_some_and(|method| method == "talos/list_deleted_sessions");
+        if !supported {
+            return Err(AcpError::UnsupportedCapability("session deletions"));
+        }
+        self.call("talos/list_deleted_sessions", &json!({})).await
+    }
+
     /// Fetch Talos' session-independent model catalogue when the agent advertises it.
     pub async fn list_models(&self) -> Result<ModelCatalogResponse, AcpError> {
         self.ensure_initialized().await?;

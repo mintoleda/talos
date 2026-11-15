@@ -10,7 +10,19 @@ impl AppView {
             .unwrap_or_else(|| self.provider_id());
         let backend = self.backend.view.provider(backend_id);
         let session = self.session();
-        let groups = backend.map_or_else(Vec::new, |p| model_groups(&p.models, backend_id));
+        let mut groups = backend.map_or_else(Vec::new, |p| model_groups(&p.models, backend_id));
+        let provider_order = self.model_preferences.ordered_provider_keys(
+            groups
+                .iter()
+                .map(|group| group.provider.key.clone())
+                .collect(),
+        );
+        groups.sort_by_key(|group| {
+            provider_order
+                .iter()
+                .position(|key| key == &group.provider.key)
+                .unwrap_or(usize::MAX)
+        });
         let current_model = session.and_then(|s| s.model.as_deref()).or_else(|| {
             session
                 .is_none()
@@ -31,10 +43,10 @@ impl AppView {
         let query = self.model_search.read(cx).value().to_string();
         let blocked = self.running()
             || self.pending.is_some()
-            || session.is_some_and(|s| self.backend.setting_models.contains(&s.id));
+            || session.is_some_and(|s| self.backend.preferences_pending(&s.id));
         let mut providers = div()
             .id("model-providers")
-            .w(px(48.))
+            .w(px(56.))
             .flex_shrink_0()
             .h_full()
             .overflow_y_scroll()
@@ -49,33 +61,55 @@ impl AppView {
             let id = group.provider.key.clone();
             let name = group.provider.name.clone();
             let selected = active.is_some_and(|g| g.provider.key == id);
+            let drop_target = id.clone();
+            let available_providers = provider_order.clone();
             providers = providers.child(
                 div()
                     .id(SharedString::from(format!("picker-provider-{id}")))
                     .w_full()
-                    .h(px(38.))
+                    .h(px(44.))
                     .flex_shrink_0()
-                    .rounded(px(7.))
+                    .rounded(px(10.))
                     .flex()
                     .items_center()
                     .justify_center()
+                    .cursor(gpui::CursorStyle::OpenHand)
+                    .drag_over::<ProviderDrag>(|style, _, _, _| style.bg(hsla(0., 0., 1., 0.16)))
+                    .on_drop(cx.listener(move |this, dragged: &ProviderDrag, _, cx| {
+                        this.reorder_model_providers(
+                            &available_providers,
+                            &dragged.key,
+                            &drop_target,
+                            cx,
+                        );
+                    }))
+                    .on_drag(
+                        ProviderDrag {
+                            key: id.clone(),
+                            label: name.clone(),
+                        },
+                        move |dragged: &ProviderDrag, _, _, cx| {
+                            cx.new(|_| ProviderTooltip(dragged.label.clone()))
+                        },
+                    )
                     .when(selected, |d| d.bg(hsla(0., 0., 1., 0.09)))
                     .hover(|s| s.bg(hsla(0., 0., 1., 0.075)))
-                    .cursor_pointer()
                     .child(icon(
                         group.provider.icon,
-                        24.,
+                        28.,
                         if selected { INK } else { MUTED },
                     ))
-                    .tooltip(move |_, cx| cx.new(|_| ProviderTooltip(name.clone())).into())
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| ProviderTooltip(format!("{name} · Drag to reorder")))
+                            .into()
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.picker_group = Some(id.clone());
-                        this.picker_show_all = false;
                         cx.notify();
                     })),
             );
         }
-        let models: Vec<_> = active
+        let mut models: Vec<_> = active
             .into_iter()
             .flat_map(|g| g.models.iter().copied())
             .filter(|m| {
@@ -86,6 +120,8 @@ impl AppView {
             })
             .filter(|m| workflow::matches_model_query(&query, &m.label, &m.id))
             .collect();
+        let now = model_preferences::unix_now();
+        sort_models_by_frecency(&mut models, &self.model_preferences, now);
         let total = active.map_or(0, |g| {
             g.models
                 .iter()
@@ -98,12 +134,6 @@ impl AppView {
                 .count()
         });
         let noun = if total == 1 { "model" } else { "models" };
-        let reveal_all = self.picker_show_all || !query.trim().is_empty();
-        let visible_count = if reveal_all {
-            models.len()
-        } else {
-            models.len().min(4)
-        };
         let count = if query.trim().is_empty() {
             format!("{total} {noun}")
         } else {
@@ -128,7 +158,9 @@ impl AppView {
                         .as_deref()
                         .unwrap_or("Provider unavailable."),
                 ));
-            } else if self.backend.model_catalog_loading.contains(backend_id) {
+            } else if provider.models.is_empty()
+                && self.backend.model_catalog_loading.contains(backend_id)
+            {
                 list = list.child(picker_message("Loading model catalogue…"));
             } else if models.is_empty() {
                 if let Some(error) = self.backend.model_catalog_errors.get(backend_id) {
@@ -153,7 +185,7 @@ impl AppView {
                 } else {
                     SECONDARY
                 };
-                for model in models.iter().take(visible_count).copied() {
+                for model in models.iter().copied() {
                     let id = model.id.clone();
                     let tooltip_id = id.clone();
                     let session_id = session.map(|session| session.id.clone());
@@ -164,20 +196,20 @@ impl AppView {
                             .id(SharedString::from(format!("picker-model-{id}")))
                             .w_full()
                             .min_w_0()
-                            .h(px(48.))
+                            .h(px(30.))
                             .flex_shrink_0()
-                            .px(px(12.))
+                            .px(px(8.))
                             .rounded(px(7.))
                             .flex()
                             .items_center()
-                            .gap(px(9.))
+                            .gap(px(6.))
                             .cursor_pointer()
                             .when(chosen, |d| d.bg(hsla(0., 0., 1., 0.075)))
                             .when(blocked, |d| d.opacity(0.5))
                             .hover(|s| s.bg(hsla(0., 0., 1., 0.065)))
-                            .child(div().w(px(28.)).flex_shrink_0().child(icon(
+                            .child(div().w(px(20.)).flex_shrink_0().child(icon(
                                 model_icon,
-                                24.,
+                                18.,
                                 model_icon_color,
                             )))
                             .child(
@@ -185,14 +217,14 @@ impl AppView {
                                     .flex_1()
                                     .min_w_0()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_size(px(16.))
+                                    .text_size(px(13.))
                                     .text_color(rgb(INK))
                                     .text_ellipsis()
                                     .child(name),
                             )
                             .child(
-                                picker_text(if chosen { "✓" } else { "" }, 16., INK)
-                                    .w(px(18.))
+                                picker_text(if chosen { "✓" } else { "" }, 13., INK)
+                                    .w(px(14.))
                                     .flex_shrink_0(),
                             )
                             .tooltip(move |_, cx| {
@@ -202,7 +234,7 @@ impl AppView {
                                 if this.running()
                                     || this.pending.is_some()
                                     || session_id.as_ref().is_some_and(|session| {
-                                        this.backend.setting_models.contains(session)
+                                        this.backend.preferences_pending(session)
                                     })
                                 {
                                     return;
@@ -222,32 +254,6 @@ impl AppView {
                                     this.editor
                                         .update(cx, |editor, cx| editor.focus(window, cx));
                                 }
-                                cx.notify();
-                            })),
-                    );
-                }
-                if models.len() > visible_count {
-                    let expanded = self.picker_show_all;
-                    list = list.child(
-                        div()
-                            .id("picker-show-more")
-                            .w_full()
-                            .h(px(44.))
-                            .flex_shrink_0()
-                            .pl(px(51.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(7.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(hsla(0., 0., 1., 0.055)))
-                            .child(label(
-                                if expanded { "Show less" } else { "Show more" },
-                                14.,
-                                SECONDARY,
-                                FontWeight::MEDIUM,
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.picker_show_all = !this.picker_show_all;
                                 cx.notify();
                             })),
                     );
@@ -274,23 +280,12 @@ impl AppView {
                     .flex_col()
                     .child(
                         div()
-                            .h(px(48.))
+                            .h(px(36.))
                             .flex_shrink_0()
                             .px(px(16.))
                             .flex()
                             .items_center()
                             .gap(px(10.))
-                            .when_some(active, |d, group| {
-                                let name = group.provider.name.clone();
-                                d.child(
-                                    div()
-                                        .id("active-model-provider")
-                                        .child(icon(group.provider.icon, 22., INK))
-                                        .tooltip(move |_, cx| {
-                                            cx.new(|_| ProviderTooltip(name.clone())).into()
-                                        }),
-                                )
-                            })
                             .child(picker_text(count, 12., MUTED)),
                     )
                     .child(list),
@@ -333,7 +328,7 @@ impl AppView {
                 }))
                 .child(
                     div()
-                        .h(px(48.))
+                        .h(px(40.))
                         .w_full()
                         .px(px(15.))
                         .flex()
@@ -361,6 +356,11 @@ struct ProviderGroup<'a> {
     models: Vec<&'a state::ModelSummary>,
 }
 
+struct ProviderDrag {
+    key: String,
+    label: String,
+}
+
 fn model_groups<'a>(models: &'a [state::ModelSummary], backend: &str) -> Vec<ProviderGroup<'a>> {
     let mut groups = std::collections::BTreeMap::new();
     for model in models {
@@ -375,6 +375,18 @@ fn model_groups<'a>(models: &'a [state::ModelSummary], backend: &str) -> Vec<Pro
             .push(model);
     }
     groups.into_values().collect()
+}
+
+fn sort_models_by_frecency(
+    models: &mut [&state::ModelSummary],
+    preferences: &ModelPreferences,
+    now: i64,
+) {
+    models.sort_by(|left, right| {
+        preferences
+            .frecency_score(&right.id, now)
+            .cmp(&preferences.frecency_score(&left.id, now))
+    });
 }
 
 struct ProviderTooltip(String);
@@ -414,6 +426,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn models_sort_by_global_frecency_with_catalogue_order_as_the_tie_breaker() {
+        let catalogue: Vec<_> = ["vendor/first", "vendor/second", "vendor/third"]
+            .into_iter()
+            .map(|id| state::ModelSummary {
+                id: id.into(),
+                label: id.into(),
+                ..Default::default()
+            })
+            .collect();
+        let mut preferences = ModelPreferences::default();
+        preferences.record_model_use("vendor/second", 10_000);
+        preferences.record_model_use("vendor/third", 10_000);
+        preferences.record_model_use("vendor/third", 10_000);
+        let mut models: Vec<_> = catalogue.iter().collect();
+
+        sort_models_by_frecency(&mut models, &preferences, 10_000);
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["vendor/third", "vendor/second", "vendor/first"]
+        );
+    }
+
+    #[test]
     fn groups_catalogue_by_inference_provider_without_changing_routing_ids() {
         let models: Vec<_> = [
             "openai/gpt-sol",
@@ -426,6 +465,7 @@ mod tests {
             id: id.into(),
             label: id.into(),
             default: false,
+            ..Default::default()
         })
         .collect();
         let groups = model_groups(&models, "talos");

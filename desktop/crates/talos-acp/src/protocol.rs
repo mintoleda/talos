@@ -7,6 +7,15 @@ use serde_json::{Map, Value};
 
 pub const ACP_PROTOCOL_VERSION: u32 = 1;
 
+/// Explicit provider deletions, plus legacy orphaned sidecars that need local
+/// evidence of a previously materialized transcript before they can be hidden.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDeletions {
+    pub deleted_session_ids: Vec<String>,
+    pub missing_session_ids: Vec<String>,
+}
+
 /// JSON-RPC request identifiers supported by ACP peers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]

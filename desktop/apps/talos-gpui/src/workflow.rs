@@ -5,6 +5,7 @@ pub struct PendingPrompt {
     pub text: String,
     pub images: Vec<String>,
     pub model: Option<String>,
+    pub thinking: Option<String>,
 }
 
 pub fn prompt_title(text: &str) -> String {

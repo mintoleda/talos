@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -313,6 +313,7 @@ struct Inner {
     /// `ShuttingDown` and the taken set is drained before the store closes.
     lifecycle_tasks: Mutex<Option<JoinSet<()>>>,
     run_start_gate: Mutex<()>,
+    last_deletion_check: Mutex<Option<Instant>>,
     worktree_gate: Mutex<()>,
     #[cfg(test)]
     worktree_fault: StdMutex<Option<&'static str>>,
@@ -362,6 +363,7 @@ impl AppService {
                 run_tasks: Mutex::new(HashMap::new()),
                 lifecycle_tasks: Mutex::new(Some(JoinSet::new())),
                 run_start_gate: Mutex::new(()),
+                last_deletion_check: Mutex::new(None),
                 worktree_gate: Mutex::new(()),
                 #[cfg(test)]
                 worktree_fault: StdMutex::new(None),
@@ -774,6 +776,83 @@ impl AppService {
             .run(move |store| store.list_sessions(agent_id))
             .await
             .map_err(CoreError::Store)
+    }
+
+    /// Reconcile external deletions without treating discovery failures or
+    /// omissions from a best-effort provider session list as deletion.
+    pub async fn reconcile_deleted_sessions(&self) -> CoreResult<()> {
+        self.ensure_running()?;
+        let Ok(mut last_check) = self.inner.last_deletion_check.try_lock() else {
+            return Ok(());
+        };
+        if last_check.is_some_and(|last| last.elapsed() < Duration::from_secs(5)) {
+            return Ok(());
+        }
+        *last_check = Some(Instant::now());
+        let mut by_provider: HashMap<String, (ProviderId, Vec<Session>)> = HashMap::new();
+        for session in self.all_sessions().await? {
+            if session.lifecycle != SessionLifecycle::Archived
+                && session.provider_session_id.is_some()
+            {
+                let agent = self.agent(session.agent_id).await?;
+                by_provider
+                    .entry(agent.provider.to_string())
+                    .or_insert_with(|| (agent.provider, Vec::new()))
+                    .1
+                    .push(session);
+            }
+        }
+        for (provider_id, sessions) in by_provider.into_values() {
+            let Ok(provider) = self.require_provider(&provider_id).await else {
+                continue;
+            };
+            let Ok(evidence) = provider.session_deletions().await else {
+                // Unavailable/old/secondary providers must not erase UI history.
+                continue;
+            };
+            let deleted: HashSet<_> = evidence.deleted.into_iter().collect();
+            let missing: HashSet<_> = evidence.missing.into_iter().collect();
+            for session in sessions {
+                let Some(native_id) = session.provider_session_id.as_ref() else {
+                    continue;
+                };
+                let confirmed = deleted.contains(native_id)
+                    || (missing.contains(native_id)
+                        && self.has_provider_history(session.id).await?);
+                if confirmed {
+                    // Archiving retains the local history and closes idle ACP
+                    // handles. Busy sessions are retried on the next check.
+                    match self.archive_session(session.id).await {
+                        Ok(_) | Err(CoreError::SessionBusy) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn has_provider_history(&self, session_id: SessionId) -> CoreResult<bool> {
+        let mut cursor = None;
+        loop {
+            let page = self.replay_events(session_id, cursor, 10_000).await?;
+            if page.iter().any(|event| {
+                matches!(
+                    event.kind,
+                    TimelineEventKind::AssistantText { .. }
+                        | TimelineEventKind::Tool(_)
+                        | TimelineEventKind::Usage(_)
+                )
+            }) {
+                return Ok(true);
+            }
+            if page.len() < 10_000 {
+                return Ok(false);
+            }
+            cursor = page.last().map(|event| EventCursor {
+                sequence: event.sequence,
+            });
+        }
     }
 
     pub async fn create_agent(
@@ -3147,6 +3226,20 @@ async fn publish_acp_update(
     };
     let kind = match update.session_update.as_str() {
         "agent_message_chunk" => Some(TimelineEventKind::AssistantText { text: text() }),
+        "agent_thought_chunk"
+            if update
+                .extra
+                .get("_meta")
+                .and_then(|meta| meta.pointer("/talos/thoughtComplete"))
+                .and_then(Value::as_bool)
+                == Some(true)
+                && text().is_empty() =>
+        {
+            Some(TimelineEventKind::Extension {
+                kind: "thought_complete".into(),
+                payload: Value::Null,
+            })
+        }
         "agent_thought_chunk" => Some(TimelineEventKind::Thought { text: text() }),
         // The daemon already records the live submitted user message; ACP replay must not duplicate it.
         "user_message_chunk" => None,
@@ -3565,7 +3658,7 @@ async fn set_private_file_permissions(_path: &Path) -> Result<(), std::io::Error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ProviderPermissionOption;
+    use crate::provider::{ProviderPermissionOption, SessionDeletions};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use talos_domain::{Capabilities, ProviderDescriptor, WorkspaceKind};
     use uuid::Uuid;
@@ -3602,6 +3695,8 @@ mod tests {
         prompts: Arc<AtomicUsize>,
         received_images: Arc<AtomicUsize>,
         image_support: bool,
+        deletions: StdMutex<Option<SessionDeletions>>,
+        deletion_checks: AtomicUsize,
     }
 
     impl FixtureProvider {
@@ -3612,6 +3707,8 @@ mod tests {
                 prompts: Arc::new(AtomicUsize::new(0)),
                 received_images: Arc::new(AtomicUsize::new(0)),
                 image_support: false,
+                deletions: StdMutex::new(None),
+                deletion_checks: AtomicUsize::new(0),
             }
         }
 
@@ -3646,6 +3743,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentProvider for FixtureProvider {
+        async fn session_deletions(&self) -> Result<SessionDeletions, ProviderError> {
+            self.deletion_checks.fetch_add(1, AtomicOrdering::Relaxed);
+            self.deletions
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| ProviderError::Other("provider unavailable".into()))
+        }
+
         fn id(&self) -> &ProviderId {
             &self.id
         }
@@ -3877,6 +3983,136 @@ mod tests {
             .await
             .unwrap();
         (service, created.session.id, provider)
+    }
+
+    #[tokio::test]
+    async fn external_deletions_archive_but_preserve_lazy_sessions_and_history() {
+        let home = TestHome::new();
+        let (service, session_id, provider) = fixture_service_with_provider(&home).await;
+        let session = service
+            .inner
+            .store
+            .run(move |store| store.session(session_id))
+            .await
+            .unwrap()
+            .unwrap();
+        let native_id = session.provider_session_id.clone().unwrap();
+
+        // A failed probe must not change the local inventory.
+        service.reconcile_deleted_sessions().await.unwrap();
+        assert_eq!(
+            service.list_sessions(session.agent_id).await.unwrap()[0].lifecycle,
+            SessionLifecycle::Active
+        );
+        *service.inner.last_deletion_check.lock().await = None;
+
+        // A legacy sidecar without a transcript is not sufficient by itself.
+        *provider.deletions.lock().unwrap() = Some(SessionDeletions {
+            deleted: vec![],
+            missing: vec![native_id],
+        });
+        service
+            .emit(
+                session_id,
+                None,
+                TimelineEventKind::UserText {
+                    text: "failed before runtime started".into(),
+                },
+            )
+            .await
+            .unwrap();
+        service.reconcile_deleted_sessions().await.unwrap();
+        assert_eq!(
+            service.list_sessions(session.agent_id).await.unwrap()[0].lifecycle,
+            SessionLifecycle::Active
+        );
+
+        // Even a successful check is rate limited while clients refresh.
+        service.reconcile_deleted_sessions().await.unwrap();
+        assert_eq!(provider.deletion_checks.load(AtomicOrdering::Relaxed), 2);
+
+        // Old TUI deletes left their sidecar behind. Provider-originated history
+        // proves that this session was materialized rather than merely lazy.
+        service
+            .emit(
+                session_id,
+                None,
+                TimelineEventKind::AssistantText {
+                    text: "saved answer".into(),
+                },
+            )
+            .await
+            .unwrap();
+        *service.inner.last_deletion_check.lock().await = None;
+        service.reconcile_deleted_sessions().await.unwrap();
+        let archived = &service.list_sessions(session.agent_id).await.unwrap()[0];
+        assert_eq!(archived.lifecycle, SessionLifecycle::Archived);
+        assert_eq!(archived.provider_session_id, session.provider_session_id);
+        assert_eq!(
+            service
+                .replay_events(session_id, None, 100)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            !service
+                .inner
+                .sessions
+                .read()
+                .await
+                .contains_key(&session_id)
+        );
+        service.shutdown().await;
+
+        let reopened = AppService::open_at(home.home()).await.unwrap();
+        assert_eq!(
+            reopened.list_sessions(session.agent_id).await.unwrap()[0].lifecycle,
+            SessionLifecycle::Archived
+        );
+        assert_eq!(
+            reopened
+                .replay_events(session_id, None, 100)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_deletions_wait_for_busy_sessions_and_do_not_require_history() {
+        let home = TestHome::new();
+        let (service, session_id, provider) = fixture_service_with_provider(&home).await;
+        let runtime = service
+            .inner
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap();
+        *provider.deletions.lock().unwrap() = Some(SessionDeletions {
+            deleted: vec![runtime.session.provider_session_id.clone().unwrap()],
+            missing: vec![],
+        });
+        *runtime.active_run.lock().unwrap() = Some(RunId::new());
+        service.reconcile_deleted_sessions().await.unwrap();
+        assert_eq!(
+            service.list_sessions(runtime.agent.id).await.unwrap()[0].lifecycle,
+            SessionLifecycle::Active
+        );
+
+        *runtime.active_run.lock().unwrap() = None;
+        *service.inner.last_deletion_check.lock().await = None;
+        service.reconcile_deleted_sessions().await.unwrap();
+        assert_eq!(
+            service.list_sessions(runtime.agent.id).await.unwrap()[0].lifecycle,
+            SessionLifecycle::Archived
+        );
+        service.shutdown().await;
     }
 
     fn fixture_png() -> Vec<u8> {
@@ -4753,6 +4989,32 @@ mod tests {
             .await
             .unwrap();
         (service, created.session.id, provider)
+    }
+
+    #[tokio::test]
+    async fn thought_completion_metadata_is_durable_without_repeating_the_thought() {
+        let home = TestHome::new();
+        let (service, session_id, _) = fixture_barrier_service(&home).await;
+        for update in [
+            json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"plan"}}),
+            json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":""},"_meta":{"talos":{"thoughtComplete":true}}}),
+        ] {
+            let notification =
+                serde_json::from_value(json!({"sessionId":"native","update":update})).unwrap();
+            publish_acp_update(&service, session_id, None, notification).await;
+        }
+        let events = service.replay_events(session_id, None, 100).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0].kind, TimelineEventKind::Thought { text } if text == "plan"));
+        assert!(
+            matches!(&events[1].kind, TimelineEventKind::Extension { kind, .. } if kind == "thought_complete")
+        );
+        drop(service);
+        let reopened = AppService::open_at(home.home()).await.unwrap();
+        assert_eq!(
+            reopened.replay_events(session_id, None, 100).await.unwrap(),
+            events
+        );
     }
 
     struct CancelProbeProvider {

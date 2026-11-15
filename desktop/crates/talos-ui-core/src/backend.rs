@@ -188,6 +188,7 @@ pub struct Backend {
     pub ready: HashSet<String>,
     /// Sessions whose model change has not yet been acknowledged.
     pub setting_models: HashSet<String>,
+    pub setting_thinking: HashSet<String>,
     pub load_errors: std::collections::HashMap<String, String>,
     pub model_catalog_loading: HashSet<String>,
     pub model_catalog_errors: std::collections::HashMap<String, String>,
@@ -260,6 +261,7 @@ impl Backend {
             loading: HashSet::new(),
             ready: HashSet::new(),
             setting_models: HashSet::new(),
+            setting_thinking: HashSet::new(),
             load_errors: std::collections::HashMap::new(),
             model_catalog_loading: HashSet::new(),
             model_catalog_errors: std::collections::HashMap::new(),
@@ -268,6 +270,24 @@ impl Backend {
             connection_error: None,
         }
     }
+    #[must_use]
+    pub fn preferences_pending(&self, session: &str) -> bool {
+        self.setting_models.contains(session) || self.setting_thinking.contains(session)
+    }
+
+    /// Share one discovery between the draft composer and the open picker.
+    /// An explicit `ListModels` action can still refresh a successful catalogue.
+    pub fn ensure_model_catalog(&mut self, provider_id: &str) -> bool {
+        if self.view.model_catalogs.contains_key(provider_id)
+            || self.model_catalog_loading.contains(provider_id)
+        {
+            return true;
+        }
+        self.submit(Action::Rpc(Command::ListModels {
+            provider_id: provider_id.into(),
+        }))
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     pub fn submit(&mut self, action: Action) -> bool {
         if !self.view.online && !matches!(action, Action::Refresh | Action::ValidateImages { .. }) {
@@ -276,10 +296,15 @@ impl Backend {
             );
             return false;
         }
-        if matches!(&action, Action::Prompt { session, .. } if self.setting_models.contains(session))
-        {
-            self.view.error = Some("Wait for the model change to finish before sending.".into());
+        if matches!(&action, Action::Prompt { session, .. } if self.preferences_pending(session)) {
+            self.view.error =
+                Some("Wait for model and thinking changes to finish before sending.".into());
             return false;
+        }
+        if matches!(&action, Action::Rpc(Command::ListModels { provider_id })
+            if self.model_catalog_loading.contains(provider_id))
+        {
+            return true;
         }
         if self.sender.try_send(action.clone()).is_err() {
             self.view.error =
@@ -298,6 +323,9 @@ impl Backend {
             }
             Action::LoadTimeline { session, .. } => {
                 self.loading.insert(session.clone());
+            }
+            Action::Rpc(Command::SetThinking { session_id, .. }) => {
+                self.setting_thinking.insert(session_id.clone());
             }
             Action::Rpc(Command::ListModels { provider_id }) => {
                 self.model_catalog_loading.insert(provider_id.clone());
@@ -340,6 +368,7 @@ impl Backend {
                 self.loading.clear();
                 self.load_errors.clear();
                 self.connection_error = None;
+                self.view.notice = None;
                 apply_snapshot(&mut self.view, &snapshot, true);
             }
             Update::Snapshot(snapshot) => apply_snapshot(&mut self.view, &snapshot, true),
@@ -450,6 +479,7 @@ impl Backend {
             }
             Action::SetModel { session, model } => {
                 self.setting_models.remove(&session);
+                self.view.thinking_levels.remove(&session);
                 if let Some(item) = self.view.session_mut(&session) {
                     item.model = Some(model);
                 }
@@ -480,20 +510,32 @@ impl Backend {
                 }
             }
             Action::Rpc(command) => match command {
+                Command::SetThinking {
+                    session_id,
+                    thinking_option_id,
+                } => {
+                    self.setting_thinking.remove(&session_id);
+                    self.view
+                        .thinking_levels
+                        .insert(session_id, thinking_option_id);
+                }
                 Command::ListProjects => {
                     self.view.projects = value.as_array().cloned().unwrap_or_default();
                 }
                 Command::ListModels { provider_id } => {
                     self.model_catalog_loading.remove(&provider_id);
                     self.model_catalog_errors.remove(&provider_id);
+                    let models = parse_model_summaries(value.as_array().map(Vec::as_slice));
+                    self.view
+                        .model_catalogs
+                        .insert(provider_id.clone(), models.clone());
                     if let Some(provider) = self
                         .view
                         .providers
                         .iter_mut()
                         .find(|provider| provider.id == provider_id)
                     {
-                        provider.models =
-                            parse_model_summaries(value.as_array().map(Vec::as_slice));
+                        provider.models = models;
                     }
                 }
                 Command::SearchTimeline { .. } => self.view.search = value,
@@ -559,6 +601,9 @@ impl Backend {
             Action::SetModel { session, .. } => {
                 self.setting_models.remove(session);
             }
+            Action::Rpc(Command::SetThinking { session_id, .. }) => {
+                self.setting_thinking.remove(session_id);
+            }
             Action::Load(session) | Action::LoadTimeline { session, .. } => {
                 self.loading.remove(session);
                 self.ready.remove(session);
@@ -602,6 +647,13 @@ fn apply_snapshot(view: &mut ViewModel, snapshot: &Value, _preserve_entries: boo
                 id: item["id"].as_str()?.into(),
                 name: item["name"].as_str()?.into(),
                 path: item["path"].as_str().unwrap_or_default().into(),
+                branch: item
+                    .get("git_branch")
+                    .unwrap_or(&item["metadata"]["branch"])
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|branch| !branch.is_empty())
+                    .map(str::to_owned),
                 project: item["project_id"].as_str().map(str::to_owned),
                 archived: item["lifecycle"] == "Archived",
                 managed: item["kind"] == "Worktree"
@@ -610,6 +662,25 @@ fn apply_snapshot(view: &mut ViewModel, snapshot: &Value, _preserve_entries: boo
         })
         .collect();
     view.providers = parse_providers(snapshot.get("providers"));
+    for provider in &mut view.providers {
+        if let Some(catalogue) = view.model_catalogs.get(&provider.id) {
+            // Inventory snapshots only describe models known to live sessions.
+            // They cannot invalidate independent discovery. Retain session-only
+            // models and enrich missing thinking metadata without losing the catalogue.
+            let mut models = catalogue.clone();
+            for session_model in std::mem::take(&mut provider.models) {
+                if let Some(model) = models.iter_mut().find(|m| m.id == session_model.id) {
+                    if model.thinking.options.is_empty() {
+                        model.thinking = session_model.thinking;
+                    }
+                    model.default |= session_model.default;
+                } else {
+                    models.push(session_model);
+                }
+            }
+            provider.models = models;
+        }
+    }
     view.sessions = parse_sessions(
         snapshot.get("sessions"),
         snapshot.get("agents"),
@@ -730,6 +801,22 @@ fn parse_model_summaries(models: Option<&[Value]>) -> Vec<crate::state::ModelSum
                     .get("is_default")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                thinking: crate::state::ThinkingState {
+                    current: model["default_thinking_option_id"]
+                        .as_str()
+                        .map(str::to_owned),
+                    options: model["thinking_options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|option| {
+                            Some((
+                                option["id"].as_str()?.to_owned(),
+                                option["label"].as_str()?.to_owned(),
+                            ))
+                        })
+                        .collect(),
+                },
             })
         })
         .collect()
@@ -886,13 +973,18 @@ async fn publish(
 
 type LocalClient = talos_ipc::Client<tokio::net::UnixStream>;
 async fn rpc(client: &mut LocalClient, command: Command) -> Result<Value, String> {
-    tokio::time::timeout(Duration::from_secs(45), client.call(command))
+    let snapshot = matches!(command, Command::Snapshot);
+    let mut value = tokio::time::timeout(Duration::from_secs(45), client.call(command))
         .await
         .map_err(|_| {
             "Request timed out; outcome may be unknown. Reconnecting before further requests."
                 .to_owned()
         })?
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if snapshot {
+        crate::workspace_git::enrich_snapshot(&mut value).await;
+    }
+    Ok(value)
 }
 async fn connect() -> Result<LocalClient, String> {
     let mut client = tokio::time::timeout(
@@ -978,7 +1070,22 @@ async fn command_loop(
     actions: &mut mpsc::Receiver<Action>,
     updates: &mpsc::Sender<Update>,
 ) -> Result<bool, String> {
-    while let Some(action) = actions.recv().await {
+    loop {
+        let action = tokio::select! {
+            action = actions.recv() => match action {
+                Some(action) => action,
+                None => return Ok(false),
+            },
+            // The daemon broadcasts on every connection, including this RPC
+            // socket. Drain it while idle so streaming replies cannot fill its
+            // send buffer and trip the slow-reader deadline. Only event_loop
+            // projects/replays these duplicate events. next_frame preserves a
+            // partial frame when an action wins this cancellation-safe select.
+            frame = client.next_frame() => {
+                frame.map_err(|error| error.to_string())?;
+                continue;
+            }
+        };
         let Some(command) = action.command() else {
             if let Action::ValidateImages { paths, .. } = &action {
                 let paths = paths.clone();
@@ -1023,6 +1130,7 @@ async fn command_loop(
                     | Command::ListTerminals { .. }
                     | Command::SearchTimeline { .. }
                     | Command::ListProjects
+                    | Command::ListModels { .. }
                     | Command::UsageSummary { .. }
                     | Command::ProviderDiagnostics { .. }
             )
@@ -1031,7 +1139,6 @@ async fn command_loop(
             publish(ctx, updates, Update::Snapshot(snapshot)).await?;
         }
     }
-    Ok(false)
 }
 async fn replay(
     ctx: &UiWake,
@@ -1096,8 +1203,20 @@ async fn event_loop(
     replay(ctx, client, updates, cursors).await?;
     let snapshot = rpc(client, Command::Snapshot).await?;
     publish(ctx, updates, Update::Connected(snapshot)).await?;
+    // External frontends (notably the Talos TUI) can delete sessions without a
+    // desktop timeline event. Refresh the inventory even while this UI is idle.
+    let mut refresh = tokio::time::interval(Duration::from_secs(5));
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    refresh.tick().await;
     loop {
-        let frame = client.next_frame().await.map_err(|e| e.to_string())?;
+        let frame = tokio::select! {
+            frame = client.next_frame() => frame.map_err(|e| e.to_string())?,
+            _ = refresh.tick() => {
+                let snapshot = rpc(client, Command::Snapshot).await?;
+                publish(ctx, updates, Update::Snapshot(snapshot)).await?;
+                continue;
+            }
+        };
         if let ServerFrame::Event(event) = frame {
             if event.event.kind == "replay_required" {
                 replay(ctx, client, updates, cursors).await?;
@@ -1294,12 +1413,449 @@ mod tests {
     use super::*;
     use crate::state::EntryKind;
 
+    #[test]
+    fn workspace_branches_project_metadata_but_explicit_detached_head_clears_it() {
+        let mut view = ViewModel::default();
+        let mut snapshot = serde_json::json!({"workspaces": [
+            {"id": "repo", "name": "Repo", "path": "/repo", "metadata": {"branch": "main"}},
+            {"id": "plain", "name": "Plain", "path": "/plain"},
+            {"id": "blank", "name": "Blank", "metadata": {"branch": "  "}}
+        ]});
+        apply_snapshot(&mut view, &snapshot, false);
+        assert_eq!(view.workspaces[0].branch.as_deref(), Some("main"));
+        assert!(view.workspaces[1].branch.is_none());
+        assert!(view.workspaces[2].branch.is_none());
+        snapshot["workspaces"][0]["git_branch"] = Value::Null;
+        apply_snapshot(&mut view, &snapshot, false);
+        assert!(view.workspaces[0].branch.is_none());
+        snapshot["workspaces"][0]["git_branch"] = Value::String("feature/sidebar".into());
+        apply_snapshot(&mut view, &snapshot, false);
+        assert_eq!(
+            view.workspaces[0].branch.as_deref(),
+            Some("feature/sidebar")
+        );
+    }
+
     fn isolated_backend() -> (Backend, mpsc::Receiver<Action>) {
         let (sender, actions) = mpsc::channel(16);
         let (_updates, receiver) = mpsc::channel(16);
         let mut backend = Backend::disconnected(sender, receiver, "Test".into());
         backend.view.online = true;
         (backend, actions)
+    }
+
+    #[test]
+    fn connection_notice_clears_after_success_even_across_separate_drains() {
+        let (sender, _actions) = mpsc::channel(16);
+        let (updates, receiver) = mpsc::channel(16);
+        let mut backend = Backend::disconnected(sender, receiver, "Connecting".into());
+        // User-facing errors are independent of connection progress.
+        backend.view.error = Some("Keep this draft error".into());
+        for message in [
+            "Starting local daemon…",
+            "Could not start talosd: unavailable",
+        ] {
+            updates.try_send(Update::Notice(message.into())).unwrap();
+            backend.drain();
+            assert_eq!(backend.view.notice.as_deref(), Some(message));
+
+            updates
+                .try_send(Update::Connected(serde_json::json!({})))
+                .unwrap();
+            backend.drain();
+            assert!(backend.view.online);
+            assert!(backend.view.notice.is_none());
+            assert_eq!(backend.view.error.as_deref(), Some("Keep this draft error"));
+        }
+    }
+
+    #[test]
+    fn coalesced_startup_and_snapshot_leave_no_connection_notice() {
+        let (sender, _actions) = mpsc::channel(16);
+        let (updates, receiver) = mpsc::channel(16);
+        let mut backend = Backend::disconnected(sender, receiver, "Connecting".into());
+        updates
+            .try_send(Update::Notice("Starting local daemon…".into()))
+            .unwrap();
+        updates
+            .try_send(Update::Connected(serde_json::json!({})))
+            .unwrap();
+        updates
+            .try_send(Update::Snapshot(serde_json::json!({})))
+            .unwrap();
+        backend.drain();
+        assert!(backend.view.online);
+        assert!(backend.view.notice.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_command_connection_drains_events_and_accepts_next_request() {
+        use std::sync::Arc;
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let (events, receiver) = tokio::sync::broadcast::channel(32);
+        let server = tokio::spawn(async move {
+            talos_ipc::serve_connection_with_events(
+                server_stream,
+                None,
+                |_| async { Ok(serde_json::json!({"ok": true})) },
+                receiver,
+            )
+            .await
+        });
+        let mut client = talos_ipc::Client::new(client_stream, None);
+        client.negotiate().await.unwrap();
+        let (actions, mut action_rx) = mpsc::channel(16);
+        let (updates, mut update_rx) = mpsc::channel(16);
+        let commands = tokio::spawn(async move {
+            command_loop(
+                &UiWake(Arc::new(|| {})),
+                &mut client,
+                &mut action_rx,
+                &updates,
+            )
+            .await
+        });
+        // Both daemon connections subscribe to timeline output. More than a
+        // socket buffer arrives while the user reads a reply, with no RPCs.
+        for cursor in 1..=12 {
+            events
+                .send(EventNotification {
+                    version: talos_ipc::PROTOCOL_VERSION,
+                    cursor,
+                    event_id: cursor.to_string(),
+                    event: WireEvent {
+                        kind: "timeline".into(),
+                        payload: serde_json::json!({"text": "x".repeat(256 * 1024)}),
+                    },
+                })
+                .unwrap();
+        }
+        // Exceed the daemon's five-second slow-reader deadline. Previously it
+        // closed the idle command socket and the next request hit BrokenPipe.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        actions.send(Action::Rpc(Command::Health)).await.unwrap();
+        let update = tokio::time::timeout(Duration::from_secs(3), update_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            update,
+            Update::Result {
+                action: Action::Rpc(Command::Health),
+                result: Ok(_)
+            }
+        ));
+        // Duplicate events belong exclusively to the dedicated replay stream.
+        assert!(update_rx.try_recv().is_err());
+        drop(actions);
+        assert!(!commands.await.unwrap().unwrap());
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_command_loop_detects_disconnect_without_a_user_action() {
+        use std::sync::Arc;
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let mut client = talos_ipc::Client::new(client_stream, None);
+        let (_actions, mut action_rx) = mpsc::channel(1);
+        let (updates, _update_rx) = mpsc::channel(1);
+        drop(server_stream);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            command_loop(
+                &UiWake(Arc::new(|| {})),
+                &mut client,
+                &mut action_rx,
+                &updates,
+            ),
+        )
+        .await
+        .expect("closed command socket must trigger reconnect without an action");
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_event_loop_refreshes_external_session_archives() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let counter = snapshots.clone();
+        let server = tokio::spawn(async move {
+            talos_ipc::serve_connection(server_stream, None, move |command| {
+                let counter = counter.clone();
+                async move {
+                    Ok(match command {
+                        Command::Snapshot => {
+                            let archived = counter.fetch_add(1, Ordering::Relaxed) > 0;
+                            serde_json::json!({
+                                "sessions": [{"id":"s1", "agent_id":"a1", "lifecycle": if archived { "Archived" } else { "Active" }}],
+                                "agents": [{"id":"a1", "provider":"talos", "lifecycle":"Ready"}]
+                            })
+                        }
+                        _ => serde_json::json!({"events":[], "has_more":false}),
+                    })
+                }
+            }).await
+        });
+        let mut client = talos_ipc::Client::new(client_stream, None);
+        client.negotiate().await.unwrap();
+        let (updates, mut receiver) = mpsc::channel(16);
+        let events = tokio::spawn(async move {
+            event_loop(
+                &UiWake(Arc::new(|| {})),
+                &mut client,
+                &updates,
+                &mut BTreeMap::new(),
+            )
+            .await
+        });
+        let mut view = ViewModel::default();
+        let snapshot = loop {
+            match receiver.recv().await.unwrap() {
+                Update::Connected(snapshot) => break snapshot,
+                Update::Events(events) => assert_eq!(events, []),
+                _ => panic!("expected initial replay or snapshot"),
+            }
+        };
+        apply_snapshot(&mut view, &snapshot, false);
+        assert!(!view.session("s1").unwrap().archived);
+        // No user actions or timeline events: the inventory timer alone must
+        // deliver an externally archived session to the sidebar projection.
+        let refresh = tokio::time::timeout(Duration::from_secs(8), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Update::Snapshot(snapshot) = refresh else {
+            panic!("expected idle refresh")
+        };
+        apply_snapshot(&mut view, &snapshot, true);
+        assert!(view.session("s1").unwrap().archived);
+        events.abort();
+        server.abort();
+    }
+
+    #[test]
+    fn catalogue_discovery_is_single_flight_and_survives_inventory_snapshots() {
+        let (mut backend, mut actions) = isolated_backend();
+        let snapshot = serde_json::json!({"providers": [{
+            "id": "talos", "available": true, "model_options": []
+        }]});
+        backend.apply(Update::Connected(snapshot.clone()));
+        let discover = Action::Rpc(Command::ListModels {
+            provider_id: "talos".into(),
+        });
+        assert!(backend.ensure_model_catalog("talos"));
+        // Draft prefetch, picker open, and explicit duplicate share one request.
+        assert!(backend.ensure_model_catalog("talos"));
+        assert!(backend.submit(discover.clone()));
+        assert_eq!(actions.try_recv().unwrap(), discover);
+        assert!(actions.try_recv().is_err());
+        assert_eq!(backend.busy, 1);
+        backend.apply(Update::Result {
+            action: discover,
+            result: Ok(serde_json::json!([
+                {"id": "vendor/one", "label": "One"},
+                {"id": "vendor/two", "label": "Two"}
+            ])),
+        });
+        for _ in 0..8 {
+            // This used to erase discovery and start the loading loop again.
+            backend.apply(Update::Snapshot(snapshot.clone()));
+            assert!(backend.ensure_model_catalog("talos"));
+            assert_eq!(backend.view.provider("talos").unwrap().models.len(), 2);
+            assert!(!backend.model_catalog_loading.contains("talos"));
+            assert_eq!(backend.busy, 0);
+            assert!(actions.try_recv().is_err());
+        }
+        // Reconnect also keeps the list; unrelated inventory remains authoritative.
+        backend.apply(Update::Connected(serde_json::json!({"providers": [{
+            "id": "talos", "available": false, "message": "Unavailable", "models": []
+        }]})));
+        let provider = backend.view.provider("talos").unwrap();
+        assert!(!provider.available);
+        assert_eq!(provider.models.len(), 2);
+        backend.apply(Update::Snapshot(serde_json::json!({"providers": []})));
+        assert!(backend.view.provider("talos").is_none());
+    }
+
+    #[test]
+    fn catalogue_cache_preserves_metadata_and_session_only_models() {
+        let (mut backend, _) = isolated_backend();
+        backend.apply_success(
+            Action::Rpc(Command::ListModels {
+                provider_id: "talos".into(),
+            }),
+            serde_json::json!([
+                {"id": "vendor/one", "label": "Full label"},
+                {"id": "vendor/two", "label": "Two"}
+            ]),
+        );
+        backend.apply(Update::Snapshot(serde_json::json!({"providers": [{
+            "id": "talos", "model_options": [
+                {"id": "vendor/one", "label": "Session label",
+                 "thinking_options": [{"id": "high", "label": "High"}],
+                 "default_thinking_option_id": "high"},
+                {"id": "vendor/custom", "label": "Custom model"}
+            ]
+        }]})));
+        let models = &backend.view.provider("talos").unwrap().models;
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].label, "Full label");
+        assert_eq!(models[0].thinking.label(), "High");
+        assert_eq!(models[1].id, "vendor/two");
+        assert_eq!(models[2].id, "vendor/custom");
+    }
+
+    #[test]
+    fn empty_catalogues_are_cached_and_explicit_refresh_replaces_the_cache() {
+        let (mut backend, mut actions) = isolated_backend();
+        let snapshot = serde_json::json!({"providers": [{"id": "talos", "models": []}]});
+        backend.apply(Update::Snapshot(snapshot.clone()));
+        let discover = Action::Rpc(Command::ListModels {
+            provider_id: "talos".into(),
+        });
+        assert!(backend.ensure_model_catalog("talos"));
+        actions.try_recv().unwrap();
+        backend.apply(Update::Result {
+            action: discover.clone(),
+            result: Ok(serde_json::json!([])),
+        });
+        backend.apply(Update::Snapshot(snapshot.clone()));
+        assert!(backend.ensure_model_catalog("talos"));
+        assert!(actions.try_recv().is_err());
+        // Only a deliberate refresh retries a successful empty catalogue.
+        assert!(backend.submit(discover.clone()));
+        actions.try_recv().unwrap();
+        backend.apply(Update::Result {
+            action: discover.clone(),
+            result: Ok(serde_json::json!([{"id": "vendor/one"}])),
+        });
+        assert!(backend.submit(discover.clone()));
+        actions.try_recv().unwrap();
+        assert_eq!(backend.view.provider("talos").unwrap().models.len(), 1);
+        backend.apply(Update::Result {
+            action: discover.clone(),
+            result: Err("Refresh failed".into()),
+        });
+        backend.apply(Update::Snapshot(snapshot.clone()));
+        assert_eq!(backend.view.provider("talos").unwrap().models.len(), 1);
+        assert_eq!(backend.model_catalog_errors["talos"], "Refresh failed");
+        assert!(backend.submit(discover.clone()));
+        actions.try_recv().unwrap();
+        backend.apply(Update::Result {
+            action: discover,
+            result: Ok(serde_json::json!([])),
+        });
+        backend.apply(Update::Snapshot(snapshot));
+        assert_eq!(backend.view.provider("talos").unwrap().models.len(), 0);
+        assert!(!backend.model_catalog_errors.contains_key("talos"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_discovery_does_not_request_a_followup_inventory_snapshot() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let counter = snapshots.clone();
+        let server = tokio::spawn(async move {
+            talos_ipc::serve_connection(server_stream, None, move |command| {
+                let counter = counter.clone();
+                async move {
+                    if command == Command::Snapshot {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(serde_json::json!([]))
+                }
+            })
+            .await
+        });
+        let mut client = talos_ipc::Client::new(client_stream, None);
+        client.negotiate().await.unwrap();
+        let (sender, mut actions) = mpsc::channel(16);
+        sender
+            .send(Action::Rpc(Command::ListModels {
+                provider_id: "talos".into(),
+            }))
+            .await
+            .unwrap();
+        drop(sender);
+        let (updates, mut receiver) = mpsc::channel(16);
+        assert!(
+            !command_loop(
+                &UiWake(Arc::new(|| {})),
+                &mut client,
+                &mut actions,
+                &updates
+            )
+            .await
+            .unwrap()
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            Update::Result { result: Ok(_), .. }
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(snapshots.load(Ordering::Relaxed), 0);
+        server.abort();
+    }
+
+    #[test]
+    fn thinking_changes_block_prompts_until_ack_and_preserve_level_on_failure() {
+        let (mut backend, mut actions) = isolated_backend();
+        backend
+            .view
+            .thinking_levels
+            .insert("s1".into(), "low".into());
+        let change = Action::Rpc(Command::SetThinking {
+            session_id: "s1".into(),
+            thinking_option_id: "high".into(),
+        });
+        assert!(backend.submit(change.clone()));
+        assert_eq!(actions.try_recv().unwrap(), change);
+        assert!(backend.preferences_pending("s1"));
+        assert!(!backend.send("s1", "first".into(), vec![]));
+        assert!(actions.try_recv().is_err());
+        backend.apply(Update::Result {
+            action: change.clone(),
+            result: Err("Unsupported level".into()),
+        });
+        assert!(!backend.preferences_pending("s1"));
+        assert_eq!(backend.view.thinking_levels["s1"], "low");
+        assert!(backend.submit(change.clone()));
+        actions.try_recv().unwrap();
+        backend.apply(Update::Result {
+            action: change,
+            result: Ok(serde_json::json!({"updated": true})),
+        });
+        assert!(!backend.preferences_pending("s1"));
+        assert_eq!(backend.view.thinking_levels["s1"], "high");
+        assert!(backend.send("s1", "first".into(), vec![]));
+    }
+
+    #[test]
+    fn model_catalogue_retains_real_thinking_choices_and_default() {
+        let data = serde_json::json!([
+            {"id": "vendor/model", "thinking_options": [
+                {"id": "off", "label": "Off"},
+                {"id": "high", "label": "High"}
+            ], "default_thinking_option_id": "high"},
+            {"id": "vendor/no-thinking"}
+        ]);
+        let models = parse_model_summaries(data.as_array().map(Vec::as_slice));
+        assert_eq!(models[0].thinking.label(), "High");
+        assert_eq!(models[0].thinking.options.len(), 2);
+        assert_eq!(models[1].thinking.options, []);
+        assert!(models[1].thinking.current.is_none());
     }
 
     #[test]

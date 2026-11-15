@@ -48,7 +48,7 @@ fn main() {
         match method {
             "initialize" => {
                 trace("initialize", serde_json::json!({}));
-                let capabilities = if mode == "minimal" {
+                let mut capabilities = if mode == "minimal" {
                     serde_json::json!({
                         "loadSession": false,
                         "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false},
@@ -62,6 +62,11 @@ fn main() {
                         "sessionCapabilities": {"list": {}, "close": {}}
                     })
                 };
+                if mode == "deletions" {
+                    capabilities["extensions"] = serde_json::json!({
+                        "talos": {"sessionDeletions": "talos/list_deleted_sessions"}
+                    });
+                }
                 respond(
                     &mut stdout,
                     &message,
@@ -121,6 +126,13 @@ fn main() {
                     }),
                 );
             }
+            "talos/list_deleted_sessions" => respond(
+                &mut stdout,
+                &message,
+                serde_json::json!({
+                    "deletedSessionIds": ["removed"], "missingSessionIds": ["legacy"]
+                }),
+            ),
             "session/list" => respond(&mut stdout, &message, serde_json::json!({"sessions":[]})),
             "session/close" | "session/set_mode" | "session/set_model" => {
                 respond(&mut stdout, &message, serde_json::json!({}))
@@ -248,6 +260,11 @@ fn scripted_prompt(
         std::process::exit(7);
     }
 
+    if lower == "activity" {
+        scripted_activity_prompt(stdout, message);
+        return;
+    }
+
     if lower.contains("tool") {
         scripted_tool_prompt(stdout, message);
         return;
@@ -335,6 +352,29 @@ fn scripted_prompt(
         stdout,
         message,
         serde_json::json!({"stopReason":"end_turn","usage":{"totalTokens":3,"inputTokens":2,"outputTokens":1}}),
+    );
+}
+
+fn scripted_activity_prompt(stdout: &mut impl Write, message: &serde_json::Value) {
+    for update in [
+        serde_json::json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Inspect then edit"}}),
+        serde_json::json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":""},"_meta":{"talos":{"thoughtComplete":true}}}),
+        serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"activity-read","title":"read: file.rs","kind":"read","status":"in_progress","rawInput":{"path":"file.rs"}}),
+        serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":"activity-read","status":"completed","rawOutput":{"content":"saved file contents"}}),
+        serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"activity-edit","title":"edit: file.rs","kind":"edit","status":"in_progress","rawInput":{"path":"file.rs","old_string":"old","new_string":"new"}}),
+        serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":"activity-edit","status":"completed","rawOutput":{"content":"saved edit result"}}),
+    ] {
+        notify(
+            stdout,
+            "session/update",
+            serde_json::json!({"sessionId":"fixture-session","update":update}),
+        );
+    }
+    emit_text(stdout, "activity complete");
+    respond(
+        stdout,
+        message,
+        serde_json::json!({"stopReason":"end_turn"}),
     );
 }
 

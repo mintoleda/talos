@@ -98,9 +98,30 @@ On Paseo restart or explicit resume, start/initialize the selected ACP provider 
 
 Talos owns the canonical model transcript in `~/.talos/sessions/<project-hash>/<native-id>.jsonl` plus a metadata sidecar. Its `session/load` replay covers stored user/assistant text, images, tool calls, and results; thinking deltas are display-only and are not replayed. Interrupted tool calls replay as failed. The Paseo timeline is a UI projection, not an alternative prompt-history source. On load, use replay as canonical history while retaining Paseo-only metadata (workspace, title overrides, activity, event IDs) and avoid appending the same replay twice.
 
-Talos `session/list` reads metadata sidecars, sorts newest first, filters by cwd/project root, skips meta entries without a transcript, and currently ignores the input cursor (it returns no next cursor). Treat it as best-effort discovery, not an authoritative deletion or pagination API. Keep Paseo's own session list authoritative for UI ownership; use ACP list for Talos-side discovery/recovery and offer an explicit import/resume path. If the stored native ID is missing, preserve the Paseo record/timeline and offer a new/forked Talos session rather than silently discarding it.
+Talos `session/list` reads metadata sidecars, sorts newest first, filters by cwd/project root, skips meta entries without a transcript, and currently ignores the input cursor (it returns no next cursor). Treat it as best-effort discovery, not an authoritative deletion or pagination API. Keep Paseo's own session list authoritative for UI ownership; use ACP list for Talos-side discovery/recovery and offer an explicit import/resume path. Absence from this list alone must not discard the Paseo record/timeline. External deletion synchronization uses the separate capability-gated extension below.
 
 `session/close` cancels a turn, releases the in-process runtime/MCP/transcript handles, and leaves the Talos transcript and metadata on disk. It is **not** a delete API. Separate `detach`, provider shutdown, session close, and Paseo archive/delete. On ordinary UI navigation, do not destroy a resumable session. On process shutdown, cancel turns, close active native sessions best-effort, close stdin, wait for a bounded graceful exit, then terminate the child if needed. Talos closes all remaining sessions when stdio reaches EOF. Do not claim a deleted Paseo record also erases Talos history; ACP has no such operation.
+
+### External deletion synchronization
+
+Talos advertises `agentCapabilities.extensions.talos.sessionDeletions:
+"talos/list_deleted_sessions"`. The read-only request takes `{}` and returns
+`{deletedSessionIds: string[], missingSessionIds: string[]}`. TUI/engine deletion
+writes a private `<native-id>.deleted` marker before unlinking the transcript;
+a marker is ignored while the transcript still exists. `deletedSessionIds`
+contains explicit deletion evidence. `missingSessionIds` contains legacy metadata
+sidecars without transcripts, not authoritative deletions: lazy/unprompted
+sessions must not be hidden on that evidence alone.
+
+The desktop reconciles at most every five seconds when listing/snapshotting
+sessions. It archives matching native IDs from the same provider, closing idle
+ACP runtimes but retaining its local timeline. For legacy missing transcripts it
+requires provider-originated timeline history (assistant/tool/usage), not merely
+an optimistically saved user prompt. Busy sessions are retried after their run
+settles. Missing capabilities, provider failures and unknown native IDs leave
+records unchanged. GPUI refreshes snapshots while idle so a TUI deletion becomes
+visible without restarting the app. This is archive synchronization, not shared
+storage or an ACP delete operation.
 
 ### List and close API shapes
 
@@ -115,7 +136,7 @@ Normalize updates to a provider-neutral event carrying Paseo session ID, turn ID
 | ACP `sessionUpdate` | Paseo event / behavior |
 |---|---|
 | `agent_message_chunk` | append assistant text delta |
-| `agent_thought_chunk` | thought/reasoning channel; respect the UI's visibility policy |
+| `agent_thought_chunk` | thought/reasoning channel; an empty chunk with `_meta.talos.thoughtComplete: true` marks completion without repeating text |
 | `user_message_chunk` | replay-only user content; do not duplicate the live user input already rendered by Paseo |
 | `tool_call` | create tool activity with `toolCallId`, title, kind, status, raw input, locations, and optional diff content |
 | `tool_call_update` | update that activity with status/output/content/diff; preserve `rawOutput` |
@@ -127,6 +148,23 @@ Normalize updates to a provider-neutral event carrying Paseo session ID, turn ID
 Talos maps tools to ACP kinds: read → `read`; edit/write → `edit` with diff; grep/glob/ls/find/fff/search/memory search → `search`; bash/background process tools → `execute`; web search/fetch → `fetch`; memory write/update/delete and skill → `think`; unknown → `other`. Tool completion status is `completed` or `failed`; while running it is `in_progress`. `tool_call_update.content` is an array of ACP tool content (`content` or `diff`), while message chunk `content` is one content object. Keep those different JSON shapes. Tool output deltas are coalesced (about 250 ms) and bounded/truncated to 32 KiB by Talos; do not assume every byte is sent as a separate update.
 
 A live prompt does not emit a `user_message_chunk` for the input; Paseo renders its own submitted user event. A successful prompt response carries `{stopReason, usage?}`. Map `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled` without collapsing them to generic success. Usage totals are accumulated across model calls/tool-loop iterations; `totalTokens = inputTokens + outputTokens`, with cached-read and cached-write counts where available. The separate usage update represents current context occupancy.
+
+The optional `_meta.talos.thoughtComplete` marker is emitted from Talos' completed
+`ThinkingBlock` boundary, before following text/tool activity (or when a pure
+thinking stream ends). The Go providers preserve explicit reasoning-item/block
+completion for Codex/Anthropic; OpenAI-compatible streams end reasoning on the
+first text/tool-argument delta or finish signal. This does not wait for an entire
+tool argument payload or the whole response to finish. The daemon persists it as the provider-neutral
+`thought_complete` extension. GPUI can therefore show `Thought` during a gap before
+the next tool without an inactivity timeout. Unknown metadata remains ignorable;
+providers without the marker finish thoughts on subsequent activity/run completion.
+The desktop groups thought/tool steps by assistant run into one collapsed row with
+an action summary and step count. While active it shows the latest action; after
+completion it summarizes thinking, successful file reads/edits/writes, commands,
+other tools, and any failed/interrupted calls. Expanding reveals a compact list of
+saved steps, each with its own initially collapsed details. User/assistant text
+and permission prompts stay outside. This is a presentation projection, not a
+change to the canonical model transcript or tool execution order.
 
 Talos emits text/thinking deltas, tool lifecycle events, permission requests, notices (non-debug/non-context notices appear as thought chunks), prompt-estimate/final usage updates, and turn completion. Tool calls may be parallel, so correlate every update by `toolCallId`; do not rely on a single global current tool. Preserve event order on each session while allowing updates for other sessions to proceed.
 

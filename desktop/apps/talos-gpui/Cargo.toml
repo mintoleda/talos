@@ -12,13 +12,19 @@ path = "src/main.rs"
 [dependencies]
 # Reuse the frontend-neutral daemon bridge and projection.
 directories.workspace = true
+serde.workspace = true
 toml.workspace = true
+serde_json.workspace = true
 talos-ipc = { path = "../../crates/talos-ipc" }
 talos-ui-core = { path = "../../crates/talos-ui-core" }
 async-channel = "2"
+pulldown-cmark = { version = "0.13", default-features = false }
 gpui = { git = "https://github.com/zeronsh/zui", rev = "15ee7082c4f910618be306166436a6d9fe0451be" }
 gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "15ee7082c4f910618be306166436a6d9fe0451be", default-features = false, features = ["wayland", "x11", "font-kit", "runtime_shaders"] }
 gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "cab50b071497683a119ae0e4038880f195c0f23f" }
+
+[dev-dependencies]
+gpui = { git = "https://github.com/zeronsh/zui", rev = "15ee7082c4f910618be306166436a6d9fe0451be", features = ["test-support"] }
 
 [lints]
 workspace = true

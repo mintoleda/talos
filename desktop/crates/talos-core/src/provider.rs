@@ -194,6 +194,15 @@ pub trait ProviderSession: Send + Sync {
     async fn shutdown(&self, grace: Duration);
 }
 
+/// Provider-neutral evidence of external session deletion.
+#[derive(Clone, Debug, Default)]
+pub struct SessionDeletions {
+    pub deleted: Vec<String>,
+    /// Legacy evidence: only hide these if the local timeline proves that the
+    /// provider had materialized a transcript. Never hide lazy new sessions.
+    pub missing: Vec<String>,
+}
+
 #[async_trait]
 pub trait AgentProvider: Send + Sync {
     fn id(&self) -> &ProviderId;
@@ -203,6 +212,12 @@ pub trait AgentProvider: Send + Sync {
         Err(ProviderError::Unsupported {
             provider: self.id().to_string(),
             feature: "independent model discovery",
+        })
+    }
+    async fn session_deletions(&self) -> Result<SessionDeletions, ProviderError> {
+        Err(ProviderError::Unsupported {
+            provider: self.id().to_string(),
+            feature: "session deletions",
         })
     }
     async fn create_session(
@@ -315,6 +330,18 @@ impl AgentProvider for AcpProvider {
                 available: true,
             })
             .collect())
+    }
+
+    async fn session_deletions(&self) -> Result<SessionDeletions, ProviderError> {
+        let client = AcpClient::spawn(self.process_config()).await?;
+        let result = tokio::time::timeout(Duration::from_secs(3), client.session_deletions()).await;
+        client.shutdown(Duration::from_millis(250)).await;
+        let evidence = result
+            .map_err(|_| ProviderError::Other("session deletion check timed out".into()))??;
+        Ok(SessionDeletions {
+            deleted: evidence.deleted_session_ids,
+            missing: evidence.missing_session_ids,
+        })
     }
 
     async fn create_session(

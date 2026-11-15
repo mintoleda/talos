@@ -50,6 +50,8 @@ pub struct Session {
     pub workspace: String,
     pub cwd: String,
     pub time: String,
+    /// UTC milliseconds, retained separately from the display label for sorting.
+    pub updated_at: Option<i64>,
     pub status: SessionStatus,
     pub archived: bool,
     pub lifecycle: String,
@@ -163,6 +165,7 @@ pub struct Workspace {
     pub id: String,
     pub name: String,
     pub path: String,
+    pub branch: Option<String>,
     pub project: Option<String>,
     pub archived: bool,
     pub managed: bool,
@@ -174,6 +177,9 @@ pub struct ViewModel {
     pub entries: HashMap<String, Vec<Entry>>,
     pub workspaces: Vec<Workspace>,
     pub providers: Vec<ProviderSummary>,
+    /// Independent discovery is not part of the daemon's session inventory.
+    /// Cache successful catalogues (including empty ones) across inventory refreshes.
+    pub(crate) model_catalogs: HashMap<String, Vec<ModelSummary>>,
     pub projects: Vec<Value>,
     pub search: Value,
     pub terminals: Value,
@@ -181,6 +187,7 @@ pub struct ViewModel {
     pub diagnostics: Value,
     pub usage_summary: Value,
     pub config_options: HashMap<String, Value>,
+    pub thinking_levels: HashMap<String, String>,
     pub pending: HashMap<String, PendingState>,
     pub usage: HashMap<String, Usage>,
     pub run: HashMap<String, bool>,
@@ -209,14 +216,81 @@ impl ProviderSummary {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ModelSummary {
     pub id: String,
     pub label: String,
     pub default: bool,
+    pub thinking: ThinkingState,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThinkingState {
+    pub current: Option<String>,
+    pub options: Vec<(String, String)>,
+}
+
+impl ThinkingState {
+    #[must_use]
+    pub fn label(&self) -> &str {
+        self.current
+            .as_ref()
+            .and_then(|current| self.options.iter().find(|(id, _)| id == current))
+            .map_or("Thinking", |(_, label)| label)
+    }
+
+    #[must_use]
+    pub fn from_config(options: &Value) -> Option<Self> {
+        let option = options.as_array()?.iter().find(|option| {
+            option["id"].as_str() == Some("thought_level")
+                || option["category"]
+                    .as_str()
+                    .is_some_and(|category| category.to_ascii_lowercase().contains("thought"))
+                || option["name"]
+                    .as_str()
+                    .is_some_and(|name| name.to_ascii_lowercase().contains("thinking"))
+        })?;
+        let choices = option["options"]
+            .as_array()?
+            .iter()
+            .filter_map(|value| {
+                Some((
+                    value["value"].as_str()?.to_owned(),
+                    value["name"].as_str()?.to_owned(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        (!choices.is_empty()).then(|| Self {
+            current: option["currentValue"].as_str().map(str::to_owned),
+            options: choices,
+        })
+    }
 }
 
 impl ViewModel {
+    #[must_use]
+    pub fn session_thinking(&self, session: &str) -> Option<ThinkingState> {
+        let mut thinking = self
+            .config_options
+            .get(session)
+            .and_then(ThinkingState::from_config)
+            .or_else(|| {
+                let session = self.session(session)?;
+                let model = self
+                    .provider(&session.provider)?
+                    .models
+                    .iter()
+                    .find(|model| Some(&model.id) == session.model.as_ref())?;
+                (!model.thinking.options.is_empty()).then(|| model.thinking.clone())
+            })?;
+        if let Some(current) = self.thinking_levels.get(session)
+            && thinking.options.iter().any(|(id, _)| id == current)
+        {
+            thinking.current = Some(current.clone());
+        }
+        Some(thinking)
+    }
+
     /// Pending-list snapshots carry request identity; resolution events only
     /// carry an outcome and cannot identify simultaneous requests in one run.
     pub fn apply_pending(&mut self, request: &Value) {
@@ -367,6 +441,7 @@ impl ViewModel {
                 );
             }
             "AssistantText" => {
+                self.finish_thoughts(session, run.as_deref());
                 self.append_stream(session, run, at, event_id, &text(), false);
                 self.set_status(session, SessionStatus::Running);
             }
@@ -374,6 +449,7 @@ impl ViewModel {
                 self.append_stream(session, run, at, event_id, &text(), true);
             }
             "Tool" => {
+                self.finish_thoughts(session, run.as_deref());
                 let call_id = content
                     .get("id")
                     .and_then(Value::as_str)
@@ -408,7 +484,7 @@ impl ViewModel {
                 if let Some(entry) = entries
                     .iter_mut()
                     .rev()
-                    .find(|entry| matches!(&entry.kind, EntryKind::Tool { call_id: id, .. } if id == &call_id))
+                    .find(|entry| entry.run == run && matches!(&entry.kind, EntryKind::Tool { call_id: id, .. } if id == &call_id))
                 {
                     if let EntryKind::Tool {
                         name: known_name,
@@ -419,7 +495,11 @@ impl ViewModel {
                         ..
                     } = &mut entry.kind
                     {
-                        *known_name = name;
+                        // Completion-only ACP updates use a generic fallback;
+                        // they must not erase the original tool/action name.
+                        if !matches!(name.to_ascii_lowercase().as_str(), "tool" | "other") {
+                            *known_name = name;
+                        }
                         if !target.is_empty() {
                             *known_target = target;
                         }
@@ -434,7 +514,7 @@ impl ViewModel {
                     entry.at = at;
                 } else {
                     entries.push(Entry {
-                        id: call_id.clone(),
+                        id: event_id.into(),
                         run,
                         at,
                         kind: EntryKind::Tool {
@@ -601,6 +681,11 @@ impl ViewModel {
                 );
                 self.set_status(session, SessionStatus::Error);
             }
+            "Extension"
+                if content.get("kind").and_then(Value::as_str) == Some("thought_complete") =>
+            {
+                self.finish_thoughts(session, run.as_deref());
+            }
             "Extension" => self.apply_extension(session, content),
             _ => {}
         }
@@ -613,10 +698,40 @@ impl ViewModel {
             .unwrap_or_default();
         let payload = content.get("payload").cloned().unwrap_or(Value::Null);
         if kind == "provider_config_options" {
+            if let Some(thinking) = payload.get("options").and_then(ThinkingState::from_config) {
+                if let Some(current) = thinking.current {
+                    self.thinking_levels.insert(session.into(), current);
+                } else {
+                    self.thinking_levels.remove(session);
+                }
+            } else {
+                self.thinking_levels.remove(session);
+            }
             self.config_options.insert(
                 session.into(),
                 payload.get("options").cloned().unwrap_or_default(),
             );
+        } else if kind == "provider_config_option_changed"
+            && let (Some(option), Some(value)) = (
+                payload.get("id").and_then(Value::as_str),
+                payload.get("value").and_then(Value::as_str),
+            )
+            && (option.eq_ignore_ascii_case("thought_level")
+                || self
+                    .config_options
+                    .get(session)
+                    .and_then(ThinkingState::from_config)
+                    .is_some())
+        {
+            self.thinking_levels.insert(session.into(), value.into());
+            if let Some(config) = self
+                .config_options
+                .get_mut(session)
+                .and_then(Value::as_array_mut)
+                .and_then(|options| options.iter_mut().find(|item| item["id"] == option))
+            {
+                config["currentValue"] = Value::String(value.into());
+            }
         } else if kind == "provider_mode_changed"
             && let Some(mode) = payload.get("modeId").and_then(Value::as_str)
             && let Some(item) = self.session_mut(session)
@@ -686,6 +801,18 @@ impl ViewModel {
                 at,
                 kind,
             });
+        }
+    }
+
+    fn finish_thoughts(&mut self, session: &str, run: Option<&str>) {
+        if let Some(entries) = self.entries.get_mut(session) {
+            for entry in entries {
+                if entry.run.as_deref() == run
+                    && let EntryKind::Thought { streaming, .. } = &mut entry.kind
+                {
+                    *streaming = false;
+                }
+            }
         }
     }
 
@@ -835,6 +962,7 @@ impl ViewModel {
                     id: "deepseek-chat".into(),
                     label: "DeepSeek Chat".into(),
                     default: true,
+                    ..Default::default()
                 }],
                 capabilities: serde_json::json!({"images":true,"model_selection":true,"modes":true,"config_options":true}),
                 modes: vec![
@@ -853,6 +981,7 @@ impl ViewModel {
                     id: "claude-sonnet".into(),
                     label: "Claude Sonnet".into(),
                     default: true,
+                    ..Default::default()
                 }],
                 capabilities: Value::Null,
                 modes: Vec::new(),
@@ -1027,6 +1156,10 @@ pub fn parse_session(value: &Value) -> Option<Session> {
             .unwrap_or_default()
             .to_owned(),
         time: relative_time(value.get("updated_at").and_then(Value::as_str)),
+        updated_at: value["updated_at"]
+            .as_str()
+            .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.timestamp_millis()),
         status: SessionStatus::Idle,
         archived: value
             .get("archived_at")
@@ -1111,6 +1244,78 @@ mod tests {
     use serde_json::json;
     use talos_ipc::{EventNotification, WireEvent};
 
+    #[test]
+    fn session_sort_timestamps_are_normalized_and_missing_dates_stay_unknown() {
+        let parse = |date: &str| parse_session(&json!({"id": "s", "updated_at": date})).unwrap();
+        assert_eq!(
+            parse("2026-01-01T12:00:00+02:00").updated_at,
+            parse("2026-01-01T10:00:00Z").updated_at
+        );
+        assert!(parse("invalid").updated_at.is_none());
+        assert!(
+            parse_session(&json!({"id": "s"}))
+                .unwrap()
+                .updated_at
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn thinking_projection_uses_provider_choices_and_follows_live_updates() {
+        let mut view = ViewModel::default();
+        assert!(view.session_thinking("s1").is_none());
+        let options = json!([{
+            "id": "thought_level", "name": "Thinking", "type": "select",
+            "currentValue": "high",
+            "options": [{"value": "off", "name": "Off"}, {"value": "high", "name": "High"}]
+        }]);
+        view.apply_extension(
+            "s1",
+            &json!({
+                "kind": "provider_config_options", "payload": {"options": options}
+            }),
+        );
+        assert_eq!(view.session_thinking("s1").unwrap().label(), "High");
+        view.apply_extension(
+            "s1",
+            &json!({
+                "kind": "provider_config_option_changed",
+                "payload": {"id": "thought_level", "value": "off"}
+            }),
+        );
+        assert_eq!(view.session_thinking("s1").unwrap().label(), "Off");
+        view.apply_extension(
+            "s1",
+            &json!({
+                "kind": "provider_config_options", "payload": {"options": options}
+            }),
+        );
+        assert_eq!(view.session_thinking("s1").unwrap().label(), "High");
+        view.apply_extension(
+            "s1",
+            &json!({
+                "kind": "provider_config_options", "payload": {"options": []}
+            }),
+        );
+        assert!(view.session_thinking("s1").is_none());
+    }
+
+    #[test]
+    fn thinking_does_not_invent_a_current_level_or_treat_other_config_as_thinking() {
+        let unrelated = json!([{
+            "id": "theme", "name": "Theme",
+            "currentValue": "high", "options": [{"value": "high", "name": "High"}]
+        }]);
+        assert!(ThinkingState::from_config(&unrelated).is_none());
+        let no_default = json!([{
+            "id": "thought_level", "options": [{"value": "high", "name": "High"}]
+        }]);
+        assert_eq!(
+            ThinkingState::from_config(&no_default).unwrap().label(),
+            "Thinking"
+        );
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     fn event(id: &str, run: &str, kind: Value) -> EventNotification {
         EventNotification {
@@ -1181,6 +1386,57 @@ mod tests {
     }
 
     #[test]
+    fn thought_completion_is_visible_before_any_next_activity_and_replays() {
+        let events = [
+            event("1", "r1", json!({"Thought": {"text": "plan"}})),
+            event(
+                "2",
+                "r1",
+                json!({"Extension": {"kind": "thought_complete", "payload": null}}),
+            ),
+        ];
+        let mut view = ViewModel::default();
+        view.apply_event(&events[0]);
+        assert!(matches!(
+            view.entries["s"][0].kind,
+            EntryKind::Thought {
+                streaming: true,
+                ..
+            }
+        ));
+        view.apply_event(&events[1]);
+        assert!(
+            matches!(&view.entries["s"][0].kind, EntryKind::Thought { text, streaming: false } if text == "plan")
+        );
+        // Completion changes state, not the step count or the saved thought text.
+        assert_eq!(view.entries["s"].len(), 1);
+        let mut reopened = ViewModel::default();
+        for event in &events {
+            reopened.apply_event(event);
+        }
+        assert_eq!(reopened.entries["s"][0].kind, view.entries["s"][0].kind);
+    }
+
+    #[test]
+    fn partial_tool_completion_preserves_action_and_finishes_thinking() {
+        let mut view = ViewModel::default();
+        view.apply_event(&event("1", "r1", json!({"Thought": {"text": "plan"}})));
+        view.apply_event(&event("2", "r1", json!({"Tool": {"id":"call", "name":"read: file.rs", "title":"read: file.rs", "status":"Running", "input":{"path":"file.rs"}}})));
+        assert!(matches!(
+            view.entries["s"][0].kind,
+            EntryKind::Thought {
+                streaming: false,
+                ..
+            }
+        ));
+        view.apply_event(&event("3", "r1", json!({"Tool": {"id":"call", "name":"tool", "status":"Completed", "output":"contents"}})));
+        assert!(
+            matches!(&view.entries["s"][1].kind, EntryKind::Tool { name, state: ToolState::Completed, input, output, .. } if name == "read: file.rs" && input.contains("file.rs") && output.contains("contents"))
+        );
+        assert_eq!(view.entries["s"].len(), 2);
+    }
+
+    #[test]
     fn run_end_finishes_streams() {
         let mut view = ViewModel::default();
         view.apply_event(&event("1", "r1", json!({"AssistantText": {"text": "hi"}})));
@@ -1218,6 +1474,21 @@ mod tests {
             &entries[0].kind,
             EntryKind::Tool { state: ToolState::Completed, output, .. } if output == "\"ok\""
         ));
+    }
+
+    #[test]
+    fn reused_tool_ids_do_not_merge_different_turns() {
+        let mut view = ViewModel::default();
+        for (id, run) in [("1", "r1"), ("2", "r2")] {
+            view.apply_event(&event(
+                id,
+                run,
+                json!({"Tool": {"id":"reused", "name":"read", "status":"Completed"}}),
+            ));
+        }
+        assert_eq!(view.entries["s"].len(), 2);
+        assert_eq!(view.entries["s"][0].id, "1");
+        assert_eq!(view.entries["s"][1].id, "2");
     }
 
     #[test]
